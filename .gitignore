@@ -1,0 +1,12 @@
+.venv/
+.uv-cache/
+.node/
+.npm-cache/
+node_modules/
+dist/
+build/
+coverage/
+.episode-qc/
+.pytest_cache/
+__pycache__/
+*.pyc

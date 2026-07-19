@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Episode QC</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand-block">
+          <div class="brand-mark">EQ</div>
+          <div>
+            <h1>Episode QC</h1>
+            <p>MCAP stale-region inspection</p>
+          </div>
+        </div>
+        <div class="tool-switch" aria-label="Tool mode">
+          <button class="tool-tab is-active" id="tool-scan" type="button">QC Scan</button>
+          <button class="tool-tab" id="tool-label" type="button">Frame Label</button>
+        </div>
+
+        <section class="control-section">
+          <h2>Episode</h2>
+          <div class="button-row">
+            <button class="primary-button" id="select-file" type="button">
+              <img src="../../node_modules/lucide-static/icons/file-video.svg" alt="" />
+              Select MCAP
+            </button>
+            <button class="secondary-button" id="select-folder" type="button">
+              <img src="../../node_modules/lucide-static/icons/folder-open.svg" alt="" />
+              Select Folder
+            </button>
+          </div>
+          <div class="path-field" id="selected-path">No file selected</div>
+        </section>
+
+        <section class="control-section" id="topic-section">
+          <div class="section-row">
+            <h2>Topics</h2>
+            <button class="icon-button" id="refresh-topics" type="button" title="Refresh topics">
+              <img src="../../node_modules/lucide-static/icons/refresh-cw.svg" alt="" />
+            </button>
+          </div>
+          <div class="topic-list" id="topic-list">
+            <div class="empty-state">Select an MCAP file</div>
+          </div>
+        </section>
+
+        <section class="control-section" id="scan-controls">
+          <h2>Detection</h2>
+          <label class="field">
+            <span>Threshold</span>
+            <input id="threshold" type="range" min="0.35" max="0.98" step="0.01" value="0.72" />
+            <output id="threshold-value">0.72</output>
+          </label>
+          <label class="field">
+            <span>Min region change</span>
+            <input id="min-change" type="number" min="0.01" max="1" step="0.01" value="0.08" />
+          </label>
+          <label class="field">
+            <span>Max stale delta</span>
+            <input id="max-stale-delta" type="number" min="0.001" max="0.5" step="0.005" value="0.035" />
+          </label>
+          <label class="field">
+            <span>History frames</span>
+            <input id="history-size" type="number" min="1" max="10" step="1" value="3" />
+          </label>
+          <label class="field">
+            <span>Persistence frames</span>
+            <input id="max-persistence-frames" type="number" min="0" max="60" step="1" value="12" />
+          </label>
+          <label class="field">
+            <span>Folder jobs</span>
+            <input id="jobs" type="number" min="1" max="8" step="1" value="4" />
+          </label>
+          <label class="field">
+            <span>Frame limit per topic</span>
+            <input id="limit" type="number" min="1" step="1" placeholder="All frames" />
+          </label>
+          <label class="field">
+            <span>Analysis size</span>
+            <select id="resize">
+              <option value="160x90">160 x 90</option>
+              <option value="240x135">240 x 135</option>
+              <option value="320x180">320 x 180</option>
+            </select>
+          </label>
+          <button class="primary-button scan-button" id="scan" type="button" disabled>
+            <img src="../../node_modules/lucide-static/icons/search-check.svg" alt="" />
+            Scan Stale Regions
+          </button>
+        </section>
+
+        <section class="control-section" id="annotation-controls" hidden>
+          <h2>Labeling</h2>
+          <label class="field">
+            <span>Frame index</span>
+            <input id="annotation-frame" type="number" min="0" step="1" value="0" />
+          </label>
+          <div class="annotation-nav">
+            <button class="secondary-button" id="annotation-prev" type="button" disabled>
+              <img src="../../node_modules/lucide-static/icons/chevron-left.svg" alt="" />
+              Previous
+            </button>
+            <button class="secondary-button" id="annotation-next" type="button" disabled>
+              Next
+              <img src="../../node_modules/lucide-static/icons/chevron-right.svg" alt="" />
+            </button>
+          </div>
+          <label class="field">
+            <span>Frame count</span>
+            <output id="annotation-frame-count">0</output>
+          </label>
+        </section>
+      </aside>
+
+      <main class="workspace">
+        <header class="workspace-header">
+          <div>
+            <h2 id="workspace-title">Stale Region Events</h2>
+            <p id="run-summary">Ready</p>
+          </div>
+          <div class="header-actions">
+            <button class="secondary-button" id="save-report" type="button" disabled>
+              <img src="../../node_modules/lucide-static/icons/save.svg" alt="" />
+              Save Report
+            </button>
+            <button class="secondary-button" id="save-annotations" type="button" hidden disabled>
+              <img src="../../node_modules/lucide-static/icons/save.svg" alt="" />
+              Save Labels
+            </button>
+            <div class="status-pill" id="status-pill">Idle</div>
+          </div>
+        </header>
+
+        <section class="metrics" id="scan-metrics" aria-label="Scan metrics">
+          <div>
+            <span>Frames</span>
+            <strong id="metric-frames">0</strong>
+          </div>
+          <div>
+            <span>Events</span>
+            <strong id="metric-candidates">0</strong>
+          </div>
+          <div>
+            <span>Decode Errors</span>
+            <strong id="metric-errors">0</strong>
+          </div>
+          <div>
+            <span>Topics</span>
+            <strong id="metric-topics">0</strong>
+          </div>
+        </section>
+
+        <section class="results-layout" id="scan-results">
+          <div class="results-panel">
+            <div class="table-header">
+              <span>Topic</span>
+              <span>Frames</span>
+              <span>Score</span>
+              <span>Review</span>
+            </div>
+            <div class="candidate-list" id="candidate-list">
+            <div class="empty-state large">No scan results yet</div>
+            </div>
+          </div>
+
+          <aside class="preview-panel">
+            <div class="preview-image-wrap">
+              <img id="preview-image" alt="" />
+              <div class="empty-state preview-empty" id="preview-empty">Select an event</div>
+            </div>
+            <div class="review-actions" id="review-actions">
+              <button class="review-button confirm" type="button" data-review="confirmed">Confirm</button>
+              <button class="review-button false-positive" type="button" data-review="false_positive">False Positive</button>
+              <button class="review-button clear" type="button" data-review="unreviewed">Clear</button>
+            </div>
+            <dl class="candidate-details" id="candidate-details"></dl>
+          </aside>
+        </section>
+
+        <section class="annotation-layout" id="annotation-layout" hidden>
+          <section class="annotation-browser">
+            <div class="annotation-file-header">
+              <span>Episode</span>
+              <span>Topics</span>
+              <span>Frames</span>
+              <span>Labels</span>
+            </div>
+            <div class="annotation-file-list" id="annotation-file-list">
+              <div class="empty-state large">Select a folder to index MCAP files</div>
+            </div>
+          </section>
+
+          <section class="annotation-stage">
+            <div class="annotation-stage-toolbar">
+              <div>
+                <strong id="annotation-current-title">No frame selected</strong>
+                <span id="annotation-current-subtitle">Choose an indexed file and topic</span>
+              </div>
+              <div class="annotation-counter" id="annotation-counter">0 labels</div>
+            </div>
+            <div class="annotation-image-wrap">
+              <img id="annotation-image" alt="" />
+              <div class="empty-state preview-empty" id="annotation-empty">No frame loaded</div>
+            </div>
+            <div class="annotation-actions" id="annotation-actions">
+              <button class="review-button confirm" type="button" data-frame-label="good">Good</button>
+              <button class="review-button false-positive" type="button" data-frame-label="defect">Defect</button>
+              <button class="review-button unsure" type="button" data-frame-label="unsure">Unsure</button>
+              <button class="review-button clear" type="button" data-frame-label="clear">Clear</button>
+            </div>
+            <label class="annotation-note-field">
+              <span>Note</span>
+              <textarea id="annotation-note" rows="3" placeholder="Optional frame note"></textarea>
+            </label>
+            <dl class="candidate-details annotation-details" id="annotation-details"></dl>
+          </section>
+        </section>
+      </main>
+    </div>
+
+    <script src="./renderer.js"></script>
+  </body>
+</html>

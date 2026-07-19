@@ -1,0 +1,19 @@
+{
+  "name": "episode-qc",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Desktop quality-control tool for episode MCAP datasets.",
+  "main": "app/main.js",
+  "scripts": {
+    "dev": "electron .",
+    "start": "electron .",
+    "test": "node --test app/tests/*.test.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "electron": "^43.1.1",
+    "lucide-static": "^0.468.0"
+  }
+}

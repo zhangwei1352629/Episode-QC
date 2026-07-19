@@ -1,0 +1,28 @@
+[project]
+name = "episode-qc"
+version = "0.1.0"
+description = "Quality-control tools for episode MCAP datasets."
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+  "mcap>=1.4.0",
+  "numpy>=2.0",
+  "pillow>=10.0",
+  "pyyaml>=6.0",
+]
+
+[project.scripts]
+episode-qc = "episode_qc.cli:main"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

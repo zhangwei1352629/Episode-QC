@@ -1,0 +1,10 @@
+code,name,group,description,enabled,annotation_scopes,target_types,default_severity,default_action,shortcut,color,applicable_profiles
+extra_foot_adjustment,脚步调整较多,motion_safety,执行任务时出现较多额外脚步或频繁调整站位,true,time_range,global|mocap,minor,keep_with_label,,#EAB308,
+retry_pick_clothes,重新拿取衣物,clothes_handling,首次拿取未成功，需要再次拿取衣物,true,time_range,global|camera,normal,keep_with_label,,#F59E0B,
+clothes_drop,衣物掉落,clothes_handling,衣物在任务执行过程中从手中或目标位置掉落,true,time_point|time_range,global|camera,normal,review,,#F97316,
+retry_open_door,重新打开洗衣机门,task_execution,首次开门未成功，需要重新尝试打开洗衣机门,true,time_range,global|camera,normal,keep_with_label,,#3B82F6,
+retry_place_clothes,重新放入衣物,clothes_handling,首次放置未成功，需要重新尝试将衣物放入洗衣机,true,time_range,global|camera,normal,keep_with_label,,#FB923C,
+clothes_caught_in_door,衣物被门夹住,clothes_handling,关闭洗衣机门时衣物被门体或门缝夹住,true,time_point|time_range,global|camera,critical,review,,#DC2626,
+long_pause_overheat,过热导致长时间停顿,motion_safety,因人员或设备过热，在任务过程中出现明显的较长停顿,true,time_range,global|camera,critical,review,,#B91C1C,
+body_sway,身体明显晃动,motion_safety,执行动作时身体出现明显晃动或稳定性不足,true,time_range,global|mocap,normal,keep_with_label,,#8B5CF6,
+minor_collision,轻微碰撞,motion_safety,身体、衣物或设备与周围物体发生轻微碰撞,true,time_point|time_range,global|camera|mocap,minor,keep_with_label,,#64748B,

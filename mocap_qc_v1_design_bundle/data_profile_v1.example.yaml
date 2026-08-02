@@ -1,0 +1,70 @@
+profile:
+  id: g1_soma_inspire_v1
+  name: G1 + SOMA + Inspire
+  version: "1.0.0"
+
+import:
+  episode_directory_patterns:
+    - "episode_*"
+  mcap_file_patterns:
+    - "episode.mcap"
+    - "*.mcap"
+  sidecar_files:
+    summary:
+      - "summary.yaml"
+      - "episode_summary.yaml"
+    config:
+      - "config_snapshot.yaml"
+      - "config.yaml"
+
+streams:
+  - key: human_motion
+    type: mocap
+    display_name: 人体 Mocap
+    topic_patterns:
+      - "/mocap/human_motion"
+    encoding: json
+    adapter: human_motion_json_v1
+    required: true
+
+  - key: soma_retarget
+    type: retarget
+    display_name: SOMA 重定向
+    topic_patterns:
+      - "/soma/retarget/action"
+    encoding: msgpack
+    adapter: soma_retarget_msgpack_v1
+    required: false
+
+  - key: camera
+    type: camera
+    topic_patterns:
+      - "/camera/*/image/jpeg"
+      - "*image_jpeg*"
+    encoding: jpeg
+    dynamic: true
+    required: false
+
+  - key: inspire_command
+    type: hand
+    display_name: Inspire 命令
+    topic_patterns:
+      - "/inspire/command"
+    encoding: json
+    required: false
+
+  - key: policy_action
+    type: policy
+    display_name: G1 策略动作
+    topic_patterns:
+      - "/g1/policy/final_action"
+    encoding: msgpack
+    required: false
+
+playback:
+  master_clock: episode
+  default_rate: 1.0
+  max_frame_skew_ms:
+    camera: 100
+    mocap: 30
+    retarget: 30

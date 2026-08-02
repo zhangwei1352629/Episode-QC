@@ -5,8 +5,17 @@ const {
   buildAnnotationIndexArgs,
   buildFrameExportArgs,
   buildUvArgs,
+  isImageAnomalyDetectionEnabled,
   normalizeCandidatePaths
 } = require("../services/pythonBackend");
+
+test("image anomaly detection is disabled unless explicitly enabled", () => {
+  assert.equal(isImageAnomalyDetectionEnabled({}), false);
+  assert.equal(isImageAnomalyDetectionEnabled({ EPISODE_QC_ENABLE_IMAGE_DETECTION: "0" }), false);
+  assert.equal(isImageAnomalyDetectionEnabled({ EPISODE_QC_ENABLE_IMAGE_DETECTION: "false" }), false);
+  assert.equal(isImageAnomalyDetectionEnabled({ EPISODE_QC_ENABLE_IMAGE_DETECTION: "1" }), true);
+  assert.equal(isImageAnomalyDetectionEnabled({ EPISODE_QC_ENABLE_IMAGE_DETECTION: "TRUE" }), true);
+});
 
 test("buildUvArgs creates stale-region detect command with repeated topics", () => {
   const args = buildUvArgs({

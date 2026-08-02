@@ -1,0 +1,138 @@
+{
+  "schema": {
+    "schema_type": "annotation_label_schema",
+    "schema_version": "1.0.0",
+    "label_set_id": "washing_machine_task_qc_v1",
+    "label_set_name": "洗衣机任务质检标签 V1",
+    "language": "zh-CN"
+  },
+  "severity_levels": [
+    {"code": "minor", "name": "轻微", "order": 1},
+    {"code": "normal", "name": "一般", "order": 2},
+    {"code": "critical", "name": "严重", "order": 3}
+  ],
+  "actions": [
+    {"code": "keep", "name": "保留"},
+    {"code": "keep_with_label", "name": "保留但标记"},
+    {"code": "trim", "name": "裁剪区间"},
+    {"code": "repair", "name": "需要修复"},
+    {"code": "recollect", "name": "需要重采"},
+    {"code": "reject", "name": "整条废弃"},
+    {"code": "review", "name": "待复核"}
+  ],
+  "groups": [
+    {"code": "task_execution", "name": "任务执行", "order": 1},
+    {"code": "clothes_handling", "name": "衣物处理", "order": 2},
+    {"code": "motion_safety", "name": "动作与安全", "order": 3}
+  ],
+  "labels": [
+    {
+      "code": "extra_foot_adjustment",
+      "name": "脚步调整较多",
+      "group": "motion_safety",
+      "description": "执行任务时出现较多额外脚步或频繁调整站位",
+      "enabled": true,
+      "annotation_scopes": ["time_range"],
+      "target_types": ["global", "mocap"],
+      "default_severity": "minor",
+      "default_action": "keep_with_label",
+      "color": "#EAB308"
+    },
+    {
+      "code": "retry_pick_clothes",
+      "name": "重新拿取衣物",
+      "group": "clothes_handling",
+      "description": "首次拿取未成功，需要再次拿取衣物",
+      "enabled": true,
+      "annotation_scopes": ["time_range"],
+      "target_types": ["global", "camera"],
+      "default_severity": "normal",
+      "default_action": "keep_with_label",
+      "color": "#F59E0B"
+    },
+    {
+      "code": "clothes_drop",
+      "name": "衣物掉落",
+      "group": "clothes_handling",
+      "description": "衣物在任务执行过程中从手中或目标位置掉落",
+      "enabled": true,
+      "annotation_scopes": ["time_point", "time_range"],
+      "target_types": ["global", "camera"],
+      "default_severity": "normal",
+      "default_action": "review",
+      "color": "#F97316"
+    },
+    {
+      "code": "retry_open_door",
+      "name": "重新打开洗衣机门",
+      "group": "task_execution",
+      "description": "首次开门未成功，需要重新尝试打开洗衣机门",
+      "enabled": true,
+      "annotation_scopes": ["time_range"],
+      "target_types": ["global", "camera"],
+      "default_severity": "normal",
+      "default_action": "keep_with_label",
+      "color": "#3B82F6"
+    },
+    {
+      "code": "retry_place_clothes",
+      "name": "重新放入衣物",
+      "group": "clothes_handling",
+      "description": "首次放置未成功，需要重新尝试将衣物放入洗衣机",
+      "enabled": true,
+      "annotation_scopes": ["time_range"],
+      "target_types": ["global", "camera"],
+      "default_severity": "normal",
+      "default_action": "keep_with_label",
+      "color": "#FB923C"
+    },
+    {
+      "code": "clothes_caught_in_door",
+      "name": "衣物被门夹住",
+      "group": "clothes_handling",
+      "description": "关闭洗衣机门时衣物被门体或门缝夹住",
+      "enabled": true,
+      "annotation_scopes": ["time_point", "time_range"],
+      "target_types": ["global", "camera"],
+      "default_severity": "critical",
+      "default_action": "review",
+      "color": "#DC2626"
+    },
+    {
+      "code": "long_pause_overheat",
+      "name": "过热导致长时间停顿",
+      "group": "motion_safety",
+      "description": "因人员或设备过热，在任务过程中出现明显的较长停顿",
+      "enabled": true,
+      "annotation_scopes": ["time_range"],
+      "target_types": ["global", "camera"],
+      "default_severity": "critical",
+      "default_action": "review",
+      "color": "#B91C1C"
+    },
+    {
+      "code": "body_sway",
+      "name": "身体明显晃动",
+      "group": "motion_safety",
+      "description": "执行动作时身体出现明显晃动或稳定性不足",
+      "enabled": true,
+      "annotation_scopes": ["time_range"],
+      "target_types": ["global", "mocap"],
+      "default_severity": "normal",
+      "default_action": "keep_with_label",
+      "color": "#8B5CF6"
+    },
+    {
+      "code": "minor_collision",
+      "name": "轻微碰撞",
+      "group": "motion_safety",
+      "description": "身体、衣物或设备与周围物体发生轻微碰撞",
+      "enabled": true,
+      "annotation_scopes": ["time_point", "time_range"],
+      "target_types": ["global", "camera", "mocap"],
+      "default_severity": "minor",
+      "default_action": "keep_with_label",
+      "color": "#64748B"
+    }
+  ]
+}

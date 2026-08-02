@@ -1,227 +1,181 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Episode QC</title>
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: file: blob:; connect-src 'self'; object-src 'none'; base-uri 'none'" />
+    <title>Mocap QC Annotator</title>
     <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>
     <div class="app-shell">
-      <aside class="sidebar">
-        <div class="brand-block">
-          <div class="brand-mark">EQ</div>
+      <header class="topbar">
+        <div class="brand">
+          <div class="brand-mark">MQ</div>
           <div>
             <h1>Episode QC</h1>
-            <p>MCAP stale-region inspection</p>
+            <p id="workspace-name">正在打开工作区…</p>
           </div>
         </div>
-        <div class="tool-switch" aria-label="Tool mode">
-          <button class="tool-tab is-active" id="tool-scan" type="button">QC Scan</button>
-          <button class="tool-tab" id="tool-label" type="button">Frame Label</button>
+        <div class="top-actions">
+          <label class="reviewer-field">质检员 <input id="reviewer-name" placeholder="输入姓名" /></label>
+          <button class="button secondary" id="import-labels" type="button">导入标签库</button>
+          <button class="button secondary" id="export-results" type="button">导出结果</button>
+          <button class="button primary" id="add-source" type="button">添加数据目录</button>
+          <div class="save-state" id="save-state"><span></span>已保存</div>
         </div>
+      </header>
 
-        <section class="control-section">
-          <h2>Episode</h2>
-          <div class="button-row">
-            <button class="primary-button" id="select-file" type="button">
-              <img src="../../node_modules/lucide-static/icons/file-video.svg" alt="" />
-              Select MCAP
-            </button>
-            <button class="secondary-button" id="select-folder" type="button">
-              <img src="../../node_modules/lucide-static/icons/folder-open.svg" alt="" />
-              Select Folder
-            </button>
-          </div>
-          <div class="path-field" id="selected-path">No file selected</div>
-        </section>
-
-        <section class="control-section" id="topic-section">
-          <div class="section-row">
-            <h2>Topics</h2>
-            <button class="icon-button" id="refresh-topics" type="button" title="Refresh topics">
-              <img src="../../node_modules/lucide-static/icons/refresh-cw.svg" alt="" />
-            </button>
-          </div>
-          <div class="topic-list" id="topic-list">
-            <div class="empty-state">Select an MCAP file</div>
-          </div>
-        </section>
-
-        <section class="control-section" id="scan-controls">
-          <h2>Detection</h2>
-          <label class="field">
-            <span>Threshold</span>
-            <input id="threshold" type="range" min="0.35" max="0.98" step="0.01" value="0.72" />
-            <output id="threshold-value">0.72</output>
-          </label>
-          <label class="field">
-            <span>Min region change</span>
-            <input id="min-change" type="number" min="0.01" max="1" step="0.01" value="0.08" />
-          </label>
-          <label class="field">
-            <span>Max stale delta</span>
-            <input id="max-stale-delta" type="number" min="0.001" max="0.5" step="0.005" value="0.035" />
-          </label>
-          <label class="field">
-            <span>History frames</span>
-            <input id="history-size" type="number" min="1" max="10" step="1" value="3" />
-          </label>
-          <label class="field">
-            <span>Persistence frames</span>
-            <input id="max-persistence-frames" type="number" min="0" max="60" step="1" value="12" />
-          </label>
-          <label class="field">
-            <span>Folder jobs</span>
-            <input id="jobs" type="number" min="1" max="8" step="1" value="4" />
-          </label>
-          <label class="field">
-            <span>Frame limit per topic</span>
-            <input id="limit" type="number" min="1" step="1" placeholder="All frames" />
-          </label>
-          <label class="field">
-            <span>Analysis size</span>
-            <select id="resize">
-              <option value="160x90">160 x 90</option>
-              <option value="240x135">240 x 135</option>
-              <option value="320x180">320 x 180</option>
-            </select>
-          </label>
-          <button class="primary-button scan-button" id="scan" type="button" disabled>
-            <img src="../../node_modules/lucide-static/icons/search-check.svg" alt="" />
-            Scan Stale Regions
-          </button>
-        </section>
-
-        <section class="control-section" id="annotation-controls" hidden>
-          <h2>Labeling</h2>
-          <label class="field">
-            <span>Frame index</span>
-            <input id="annotation-frame" type="number" min="0" step="1" value="0" />
-          </label>
-          <div class="annotation-nav">
-            <button class="secondary-button" id="annotation-prev" type="button" disabled>
-              <img src="../../node_modules/lucide-static/icons/chevron-left.svg" alt="" />
-              Previous
-            </button>
-            <button class="secondary-button" id="annotation-next" type="button" disabled>
-              Next
-              <img src="../../node_modules/lucide-static/icons/chevron-right.svg" alt="" />
-            </button>
-          </div>
-          <label class="field">
-            <span>Frame count</span>
-            <output id="annotation-frame-count">0</output>
-          </label>
-        </section>
+      <aside class="episode-sidebar">
+        <div class="source-summary">
+          <div><strong id="episode-total">0</strong><span>总计</span></div>
+          <div><strong id="episode-done">0</strong><span>已完成</span></div>
+          <div><strong id="episode-errors">0</strong><span>导入异常</span></div>
+        </div>
+        <div class="episode-filters">
+          <input id="episode-search" type="search" placeholder="搜索 Episode…" />
+          <select id="status-filter">
+            <option value="all">全部状态</option>
+            <option value="unreviewed">未开始</option>
+            <option value="in_progress">质检中</option>
+            <option value="completed">已完成</option>
+            <option value="needs_recheck">待复核</option>
+          </select>
+        </div>
+        <div class="episode-list" id="episode-list">
+          <div class="empty-panel">添加数据目录后开始质检</div>
+        </div>
       </aside>
 
-      <main class="workspace">
-        <header class="workspace-header">
-          <div>
-            <h2 id="workspace-title">Stale Region Events</h2>
-            <p id="run-summary">Ready</p>
+      <main class="review-workspace">
+        <div class="playback-toolbar">
+          <div class="episode-title-block">
+            <h2 id="current-episode">未选择 Episode</h2>
+            <p id="episode-meta">请选择左侧数据</p>
           </div>
-          <div class="header-actions">
-            <button class="secondary-button" id="save-report" type="button" disabled>
-              <img src="../../node_modules/lucide-static/icons/save.svg" alt="" />
-              Save Report
-            </button>
-            <button class="secondary-button" id="save-annotations" type="button" hidden disabled>
-              <img src="../../node_modules/lucide-static/icons/save.svg" alt="" />
-              Save Labels
-            </button>
-            <div class="status-pill" id="status-pill">Idle</div>
+          <div class="playback-controls">
+            <button class="icon-button" id="previous-episode" title="上一条 (P)" type="button">‹</button>
+            <button class="play-button" id="toggle-play" title="播放/暂停 (Space)" type="button">▶</button>
+            <button class="icon-button" id="next-episode" title="下一条 (N)" type="button">›</button>
+            <select id="playback-rate" title="播放倍速">
+              <option value="0.25">0.25×</option>
+              <option value="0.5">0.5×</option>
+              <option value="1" selected>1×</option>
+              <option value="1.5">1.5×</option>
+              <option value="2">2×</option>
+            </select>
+            <strong class="clock"><span id="current-time">00:00.000</span> / <span id="duration-time">00:00.000</span></strong>
           </div>
-        </header>
+          <div class="cache-status" id="cache-status">等待载入</div>
+        </div>
 
-        <section class="metrics" id="scan-metrics" aria-label="Scan metrics">
-          <div>
-            <span>Frames</span>
-            <strong id="metric-frames">0</strong>
-          </div>
-          <div>
-            <span>Events</span>
-            <strong id="metric-candidates">0</strong>
-          </div>
-          <div>
-            <span>Decode Errors</span>
-            <strong id="metric-errors">0</strong>
-          </div>
-          <div>
-            <span>Topics</span>
-            <strong id="metric-topics">0</strong>
-          </div>
-        </section>
-
-        <section class="results-layout" id="scan-results">
-          <div class="results-panel">
-            <div class="table-header">
-              <span>Topic</span>
-              <span>Frames</span>
-              <span>Score</span>
-              <span>Review</span>
-            </div>
-            <div class="candidate-list" id="candidate-list">
-            <div class="empty-state large">No scan results yet</div>
-            </div>
-          </div>
-
-          <aside class="preview-panel">
-            <div class="preview-image-wrap">
-              <img id="preview-image" alt="" />
-              <div class="empty-state preview-empty" id="preview-empty">Select an event</div>
-            </div>
-            <div class="review-actions" id="review-actions">
-              <button class="review-button confirm" type="button" data-review="confirmed">Confirm</button>
-              <button class="review-button false-positive" type="button" data-review="false_positive">False Positive</button>
-              <button class="review-button clear" type="button" data-review="unreviewed">Clear</button>
-            </div>
-            <dl class="candidate-details" id="candidate-details"></dl>
-          </aside>
-        </section>
-
-        <section class="annotation-layout" id="annotation-layout" hidden>
-          <section class="annotation-browser">
-            <div class="annotation-file-header">
-              <span>Episode</span>
-              <span>Topics</span>
-              <span>Frames</span>
-              <span>Labels</span>
-            </div>
-            <div class="annotation-file-list" id="annotation-file-list">
-              <div class="empty-state large">Select a folder to index MCAP files</div>
-            </div>
-          </section>
-
-          <section class="annotation-stage">
-            <div class="annotation-stage-toolbar">
-              <div>
-                <strong id="annotation-current-title">No frame selected</strong>
-                <span id="annotation-current-subtitle">Choose an indexed file and topic</span>
+        <section class="viewer-grid">
+          <article class="viewer-card motion-card" id="motion-card">
+            <div class="viewer-heading">
+              <div><span class="status-dot"></span><strong>宇树 G1 29DOF</strong><span class="model-badge">URDF</span></div>
+              <div class="viewer-actions">
+                <label><input id="joint-labels" type="checkbox" /> 关节名</label>
+                <button id="reset-view" type="button">复位视角</button>
               </div>
-              <div class="annotation-counter" id="annotation-counter">0 labels</div>
             </div>
-            <div class="annotation-image-wrap">
-              <img id="annotation-image" alt="" />
-              <div class="empty-state preview-empty" id="annotation-empty">No frame loaded</div>
+            <div class="motion-stage">
+              <canvas id="motion-canvas"></canvas>
+              <div class="motion-control-panel">
+                <label><span>动作源</span><select id="motion-source" title="选择 G1 动作源" aria-label="选择 G1 动作源"><option value="policy">Policy 实际执行姿态（默认）</option><option value="policy_target">Policy 目标姿态</option><option value="soma">SOMA</option></select></label>
+                <label><span>标注范围</span><select id="joint-selector" title="选择标注关节" aria-label="选择标注关节"><option value="">全身（默认）</option></select></label>
+              </div>
+              <div class="joint-label-layer" id="joint-label-layer"></div>
+              <div class="viewer-empty" id="motion-empty">选择 Episode 后显示 G1 机器人</div>
+              <div class="motion-hint">G1 关节角直接驱动 · Policy / SOMA 可切换 · 下拉或点击名称选关节 · 拖动旋转 · 滚轮缩放</div>
+              <div class="selected-joint" id="selected-joint" hidden></div>
             </div>
-            <div class="annotation-actions" id="annotation-actions">
-              <button class="review-button confirm" type="button" data-frame-label="good">Good</button>
-              <button class="review-button false-positive" type="button" data-frame-label="defect">Defect</button>
-              <button class="review-button unsure" type="button" data-frame-label="unsure">Unsure</button>
-              <button class="review-button clear" type="button" data-frame-label="clear">Clear</button>
-            </div>
-            <label class="annotation-note-field">
-              <span>Note</span>
-              <textarea id="annotation-note" rows="3" placeholder="Optional frame note"></textarea>
-            </label>
-            <dl class="candidate-details annotation-details" id="annotation-details"></dl>
+          </article>
+          <section class="camera-grid" id="camera-grid">
+            <div class="empty-panel">当前 Episode 的有效相机会在此动态显示</div>
           </section>
+        </section>
+
+        <section class="timeline-panel">
+          <div class="timeline-heading">
+            <div>
+              <strong>全局时间轴</strong>
+              <span id="selection-label">未选择区间</span>
+            </div>
+            <div class="timeline-actions">
+              <button id="mark-in" type="button">I 设起点</button>
+              <button id="mark-out" type="button">O 设终点</button>
+              <label><input id="loop-selection" type="checkbox" /> 循环选区</label>
+            </div>
+          </div>
+          <div class="coverage-tracks" id="coverage-tracks"></div>
+          <div class="annotation-track" id="annotation-track"></div>
+          <input class="timeline-range" id="timeline-range" type="range" min="0" max="1000000" step="1" value="0" />
+          <div class="timeline-ticks"><span>0:00</span><span>25%</span><span>50%</span><span>75%</span><span id="timeline-end">0:00</span></div>
         </section>
       </main>
+
+      <aside class="label-sidebar">
+        <section class="panel-section label-section">
+          <div class="section-heading">
+            <div class="section-title-copy">
+              <span class="eyebrow">人工标注</span>
+              <div class="section-title-row"><h2>标签</h2><span class="section-count" id="label-count">0 / 0</span></div>
+              <span class="section-meta" id="label-set-meta">正在读取标签库…</span>
+            </div>
+            <div class="undo-actions"><button id="undo" title="撤销 Ctrl+Z">↶</button><button id="redo" title="恢复 Ctrl+Shift+Z">↷</button></div>
+          </div>
+          <div class="scope-tabs" id="scope-tabs">
+            <button class="active" data-scope="time_range" type="button">区间</button>
+            <button data-scope="time_point" type="button">时间点</button>
+            <button data-scope="episode" type="button">整条</button>
+          </div>
+          <div class="label-filter-row">
+            <input id="label-search" type="search" placeholder="搜索标签…" aria-label="搜索标签" />
+            <select id="label-group-filter" aria-label="筛选标签分组"><option value="all">全部分组</option></select>
+          </div>
+          <div class="target-context" id="target-context">目标：全局</div>
+          <div class="label-list" id="label-list">
+            <div class="empty-panel">请先导入标签库</div>
+          </div>
+          <label class="form-field"><span>备注</span><textarea id="annotation-comment" rows="2" placeholder="可选说明"></textarea></label>
+        </section>
+
+        <section class="panel-section annotations-section">
+          <div class="section-heading compact"><h3>当前标注</h3><span id="annotation-count">0</span></div>
+          <div class="annotation-list" id="annotation-list"><div class="empty-panel">暂无标注</div></div>
+        </section>
+
+        <section class="panel-section decision-section">
+          <span class="eyebrow">Episode 结论</span>
+          <div class="decision-grid" id="decision-grid">
+            <button data-decision="pass" type="button" title="通过（Alt 1）"><span>✓</span>通过<kbd>1</kbd></button>
+            <button data-decision="pass_with_labels" type="button" title="有条件通过（Alt 2）"><span>◐</span>有条件<kbd>2</kbd></button>
+            <button data-decision="trim" type="button" title="需裁剪（Alt 3）"><span>✂</span>裁剪<kbd>3</kbd></button>
+            <button data-decision="repair" type="button" title="需修复（Alt 4）"><span>◇</span>修复<kbd>4</kbd></button>
+            <button data-decision="recollect" type="button" title="需重采（Alt 5）"><span>↻</span>重采<kbd>5</kbd></button>
+            <button data-decision="reject" type="button" title="废弃（Alt 6）"><span>×</span>废弃<kbd>6</kbd></button>
+          </div>
+          <button class="needs-recheck" id="needs-recheck" type="button">标记为待复核</button>
+        </section>
+      </aside>
     </div>
 
-    <script src="./renderer.js"></script>
+    <div class="toast-stack" id="toast-stack"></div>
+    <dialog id="annotation-editor">
+      <form method="dialog" id="annotation-edit-form">
+        <div class="dialog-heading"><h3>编辑标注</h3><button value="cancel" type="submit">×</button></div>
+        <input id="edit-id" type="hidden" />
+        <div class="edit-times">
+          <label>起点（秒）<input id="edit-start" type="number" min="0" step="0.001" /></label>
+          <label>终点（秒）<input id="edit-end" type="number" min="0" step="0.001" /></label>
+        </div>
+        <label>严重程度<select id="edit-severity"></select></label>
+        <label>处理建议<select id="edit-action"></select></label>
+        <label>备注<textarea id="edit-comment" rows="3"></textarea></label>
+        <div class="dialog-actions"><button class="danger" id="delete-annotation" type="button">删除</button><span></span><button value="cancel" type="submit">取消</button><button class="primary" id="save-edit" type="button">保存</button></div>
+      </form>
+    </dialog>
+    <script type="module" src="./web-api.js"></script>
+    <script type="module" src="./renderer.js"></script>
   </body>
 </html>

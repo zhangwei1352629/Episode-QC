@@ -1,6 +1,11 @@
 const fs = require("node:fs");
 const path = require("node:path");
 
+function isImageAnomalyDetectionEnabled(environment = process.env) {
+  const value = String(environment?.EPISODE_QC_ENABLE_IMAGE_DETECTION || "").trim().toLowerCase();
+  return ["1", "true", "yes", "on"].includes(value);
+}
+
 function buildUvArgs({
   command,
   mcapPath,
@@ -145,6 +150,7 @@ module.exports = {
   buildAnnotationIndexArgs,
   buildFrameExportArgs,
   buildUvArgs,
+  isImageAnomalyDetectionEnabled,
   findUvExecutable,
   normalizeCandidatePaths
 };

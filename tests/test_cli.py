@@ -1,3 +1,10 @@
+import os
+from pathlib import Path
+import io
+import json
+import subprocess
+import sys
+
 from episode_qc import cli
 
 
@@ -8,6 +15,49 @@ def test_cli_help(capsys):
         assert exc.code == 0
 
     assert "Quality-control helpers" in capsys.readouterr().out
+
+
+def test_cli_does_not_load_image_detection_by_default():
+    source_root = Path(__file__).resolve().parents[1] / "src"
+    environment = os.environ | {"PYTHONPATH": str(source_root)}
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; import episode_qc.cli; "
+                "blocked = {'episode_qc.stale_region', 'episode_qc.flow_verify', 'numpy', 'PIL'}; "
+                "print(','.join(sorted(blocked.intersection(sys.modules))))"
+            ),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert result.stdout.strip() == ""
+
+
+def test_worker_reuses_process_for_multiple_commands(tmp_path):
+    db_path = tmp_path / "workspace.db"
+    requests = io.StringIO(
+        "\n".join(
+            [
+                json.dumps({"id": 1, "args": ["workspace-init", str(db_path)]}),
+                json.dumps({"id": 2, "args": ["workspace-state", str(db_path)]}),
+            ]
+        )
+        + "\n"
+    )
+    responses = io.StringIO()
+
+    assert cli.serve_worker(requests, responses) == 0
+
+    first, second = [json.loads(line) for line in responses.getvalue().splitlines()]
+    assert first["id"] == 1 and first["ok"] is True
+    assert second["id"] == 2 and second["ok"] is True
+    assert json.loads(second["stdout"])["workspace"]["schema_version"] == 1
 
 
 def test_detect_stale_region_defaults_to_ego_head_topic(monkeypatch, capsys):

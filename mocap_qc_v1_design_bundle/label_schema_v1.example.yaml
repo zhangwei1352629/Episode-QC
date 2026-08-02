@@ -1,0 +1,102 @@
+schema:
+  schema_type: annotation_label_schema
+  schema_version: "1.0.0"
+  label_set_id: mocap_qc_v1
+  label_set_name: Mocap 质检标签 V1
+  language: zh-CN
+
+severity_levels:
+  - {code: minor, name: 轻微, order: 1}
+  - {code: normal, name: 一般, order: 2}
+  - {code: critical, name: 严重, order: 3}
+
+actions:
+  - {code: keep, name: 保留}
+  - {code: keep_with_label, name: 保留但标记}
+  - {code: trim, name: 裁剪区间}
+  - {code: repair, name: 需要修复}
+  - {code: recollect, name: 需要重采}
+  - {code: reject, name: 整条废弃}
+  - {code: review, name: 待复核}
+
+groups:
+  - {code: episode, name: 整体问题, order: 1}
+  - {code: mocap, name: Mocap 问题, order: 2}
+  - {code: camera, name: 相机问题, order: 3}
+  - {code: teleoperation, name: 遥操作问题, order: 4}
+  - {code: collection, name: 采集过程问题, order: 5}
+
+labels:
+  - code: task_incomplete
+    name: 动作未完成
+    group: episode
+    description: Episode 未完成任务要求的完整动作
+    enabled: true
+    annotation_scopes: [episode, time_range]
+    target_types: [global]
+    default_severity: critical
+    default_action: recollect
+    shortcut: T
+    color: "#DC2626"
+
+  - code: mocap_joint_jitter
+    name: 关节抖动
+    group: mocap
+    description: 单个或多个关节出现明显高频抖动
+    enabled: true
+    annotation_scopes: [time_range, time_point]
+    target_types: [mocap, joint]
+    default_severity: normal
+    default_action: trim
+    shortcut: Q
+    color: "#F59E0B"
+    fields:
+      - code: affected_joint
+        name: 异常关节
+        type: joint_selector
+        required: true
+        multiple: true
+
+  - code: mocap_tracking_lost
+    name: 追踪丢失
+    group: mocap
+    enabled: true
+    annotation_scopes: [time_range]
+    target_types: [mocap, joint]
+    default_severity: critical
+    default_action: trim
+    shortcut: W
+    color: "#EF4444"
+
+  - code: camera_blur
+    name: 画面模糊
+    group: camera
+    enabled: true
+    annotation_scopes: [episode, time_range]
+    target_types: [camera]
+    default_severity: normal
+    default_action: keep_with_label
+    shortcut: B
+    color: "#8B5CF6"
+
+  - code: camera_freeze
+    name: 画面卡顿或冻结
+    group: camera
+    enabled: true
+    annotation_scopes: [time_range]
+    target_types: [camera]
+    default_severity: normal
+    default_action: trim
+    shortcut: C
+    color: "#6366F1"
+
+  - code: person_interruption
+    name: 人员干扰或进入
+    group: collection
+    enabled: true
+    annotation_scopes: [time_range]
+    target_types: [global, camera]
+    default_severity: normal
+    default_action: trim
+    shortcut: R
+    color: "#64748B"

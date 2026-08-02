@@ -10,3 +10,12 @@ coverage/
 .pytest_cache/
 __pycache__/
 *.pyc
+
+# Machine-local tools and editor state
+.local-tools/
+.vscode/
+
+# Runtime profiling output and source datasets
+performance-results/
+*.mcap
+/20??????_*/

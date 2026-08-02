@@ -2,11 +2,15 @@
   "name": "episode-qc",
   "version": "0.1.0",
   "private": true,
-  "description": "Desktop quality-control tool for episode MCAP datasets.",
+  "description": "Local Web quality-control tool for episode MCAP datasets.",
   "main": "app/main.js",
   "scripts": {
-    "dev": "electron .",
-    "start": "electron .",
+    "build:renderer": "esbuild app/renderer/g1-viewer.js --bundle --format=esm --platform=browser --outfile=app/renderer/g1-viewer.bundle.js",
+    "dev": "npm run build:renderer && uv run episode-qc web",
+    "start": "uv run episode-qc web",
+    "dev:web": "npm run build:renderer && uv run episode-qc web",
+    "web": "uv run episode-qc web",
+    "dev:electron": "npm run build:renderer && electron .",
     "test": "node --test app/tests/*.test.js"
   },
   "engines": {
@@ -14,6 +18,11 @@
   },
   "devDependencies": {
     "electron": "^43.1.1",
+    "esbuild": "^0.28.1",
     "lucide-static": "^0.468.0"
+  },
+  "dependencies": {
+    "three": "^0.185.1",
+    "urdf-loader": "^0.13.1"
   }
 }

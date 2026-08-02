@@ -9,4 +9,5 @@ if [[ -d "${LOCAL_NODE}" ]]; then
 fi
 
 export UV_CACHE_DIR="${PROJECT_ROOT}/.uv-cache"
+unset ELECTRON_RUN_AS_NODE ELECTRON_NO_ATTACH_CONSOLE
 exec npm run dev

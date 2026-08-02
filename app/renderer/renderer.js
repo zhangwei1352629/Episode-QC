@@ -1,1021 +1,1204 @@
-const state = {
-  activeTool: "scan",
-  mcapPath: null,
-  folderPath: null,
-  mode: "file",
-  topics: [],
-  selectedCandidateIndex: -1,
-  lastResult: null,
-  annotations: {},
-  annotation: {
-    rootPath: null,
-    index: null,
-    selectedFileIndex: -1,
-    selectedTopic: null,
-    frameIndex: 0,
-    currentFrame: null,
-    labels: {},
-    loadToken: 0
-  }
-};
+import { G1Viewer } from "./g1-viewer.bundle.js";
 
-const DEFAULT_IMAGE_TOPIC = "/camera/ego_head/image/jpeg";
+const $ = (id) => document.getElementById(id);
 
 const els = {
-  toolScan: document.querySelector("#tool-scan"),
-  toolLabel: document.querySelector("#tool-label"),
-  selectFile: document.querySelector("#select-file"),
-  selectFolder: document.querySelector("#select-folder"),
-  selectedPath: document.querySelector("#selected-path"),
-  refreshTopics: document.querySelector("#refresh-topics"),
-  topicList: document.querySelector("#topic-list"),
-  scanControls: document.querySelector("#scan-controls"),
-  annotationControls: document.querySelector("#annotation-controls"),
-  threshold: document.querySelector("#threshold"),
-  thresholdValue: document.querySelector("#threshold-value"),
-  minChange: document.querySelector("#min-change"),
-  maxStaleDelta: document.querySelector("#max-stale-delta"),
-  historySize: document.querySelector("#history-size"),
-  maxPersistenceFrames: document.querySelector("#max-persistence-frames"),
-  jobs: document.querySelector("#jobs"),
-  limit: document.querySelector("#limit"),
-  resize: document.querySelector("#resize"),
-  scan: document.querySelector("#scan"),
-  saveReport: document.querySelector("#save-report"),
-  saveAnnotations: document.querySelector("#save-annotations"),
-  workspaceTitle: document.querySelector("#workspace-title"),
-  runSummary: document.querySelector("#run-summary"),
-  statusPill: document.querySelector("#status-pill"),
-  scanMetrics: document.querySelector("#scan-metrics"),
-  scanResults: document.querySelector("#scan-results"),
-  metricFrames: document.querySelector("#metric-frames"),
-  metricCandidates: document.querySelector("#metric-candidates"),
-  metricErrors: document.querySelector("#metric-errors"),
-  metricTopics: document.querySelector("#metric-topics"),
-  candidateList: document.querySelector("#candidate-list"),
-  previewImage: document.querySelector("#preview-image"),
-  previewWrap: document.querySelector(".preview-image-wrap"),
-  reviewActions: document.querySelector("#review-actions"),
-  candidateDetails: document.querySelector("#candidate-details"),
-  annotationLayout: document.querySelector("#annotation-layout"),
-  annotationFileList: document.querySelector("#annotation-file-list"),
-  annotationFrame: document.querySelector("#annotation-frame"),
-  annotationFrameCount: document.querySelector("#annotation-frame-count"),
-  annotationPrev: document.querySelector("#annotation-prev"),
-  annotationNext: document.querySelector("#annotation-next"),
-  annotationCurrentTitle: document.querySelector("#annotation-current-title"),
-  annotationCurrentSubtitle: document.querySelector("#annotation-current-subtitle"),
-  annotationCounter: document.querySelector("#annotation-counter"),
-  annotationImage: document.querySelector("#annotation-image"),
-  annotationImageWrap: document.querySelector(".annotation-image-wrap"),
-  annotationActions: document.querySelector("#annotation-actions"),
-  annotationNote: document.querySelector("#annotation-note"),
-  annotationDetails: document.querySelector("#annotation-details")
+  workspaceName: $("workspace-name"), reviewerName: $("reviewer-name"), importLabels: $("import-labels"),
+  exportResults: $("export-results"), addSource: $("add-source"), saveState: $("save-state"),
+  episodeTotal: $("episode-total"), episodeDone: $("episode-done"), episodeErrors: $("episode-errors"),
+  episodeSearch: $("episode-search"), statusFilter: $("status-filter"), episodeList: $("episode-list"),
+  currentEpisode: $("current-episode"), episodeMeta: $("episode-meta"), previousEpisode: $("previous-episode"),
+  nextEpisode: $("next-episode"), togglePlay: $("toggle-play"), playbackRate: $("playback-rate"),
+  currentTime: $("current-time"), durationTime: $("duration-time"), cacheStatus: $("cache-status"),
+  motionCard: $("motion-card"), motionCanvas: $("motion-canvas"), motionEmpty: $("motion-empty"), jointLabelLayer: $("joint-label-layer"),
+  motionSource: $("motion-source"), jointSelector: $("joint-selector"), jointLabels: $("joint-labels"), resetView: $("reset-view"), selectedJoint: $("selected-joint"),
+  cameraGrid: $("camera-grid"), selectionLabel: $("selection-label"), markIn: $("mark-in"), markOut: $("mark-out"),
+  loopSelection: $("loop-selection"), coverageTracks: $("coverage-tracks"), annotationTrack: $("annotation-track"),
+  timelineRange: $("timeline-range"), timelineEnd: $("timeline-end"), scopeTabs: $("scope-tabs"),
+  labelSearch: $("label-search"), labelGroupFilter: $("label-group-filter"), labelCount: $("label-count"),
+  labelSetMeta: $("label-set-meta"), targetContext: $("target-context"), labelList: $("label-list"),
+  annotationComment: $("annotation-comment"), undo: $("undo"), redo: $("redo"),
+  annotationCount: $("annotation-count"), annotationList: $("annotation-list"), decisionGrid: $("decision-grid"),
+  needsRecheck: $("needs-recheck"), toastStack: $("toast-stack"), annotationEditor: $("annotation-editor"),
+  editId: $("edit-id"), editStart: $("edit-start"), editEnd: $("edit-end"), editSeverity: $("edit-severity"),
+  editAction: $("edit-action"), editComment: $("edit-comment"), deleteAnnotation: $("delete-annotation"),
+  saveEdit: $("save-edit")
 };
 
-els.toolScan.addEventListener("click", () => {
-  setActiveTool("scan");
-});
+const state = {
+  workspace: null,
+  episodes: [],
+  filteredEpisodes: [],
+  labelSchema: null,
+  detail: null,
+  cache: null,
+  currentEpisodeId: null,
+  loadToken: 0,
+  playheadNs: 0,
+  durationNs: 0,
+  playing: false,
+  playbackRate: 1,
+  lastTick: performance.now(),
+  lastVisualRequest: 0,
+  visualPending: false,
+  selectionStartNs: null,
+  selectionEndNs: null,
+  scope: "time_range",
+  selectedCameraId: null,
+  selectedJoint: null,
+  motionFrame: null,
+  robotActionFrame: null,
+  motionSource: "policy",
+  projectedJoints: [],
+  cameraYaw: -0.15,
+  cameraPitch: 0.12,
+  cameraZoom: 1,
+  drag: null,
+  timelineSelecting: false,
+  timelineAnchorNs: null,
+  reviewerTimer: null
+};
 
-els.toolLabel.addEventListener("click", () => {
-  setActiveTool("label");
-});
-
-els.selectFile.addEventListener("click", async () => {
-  const filePath = await window.episodeQc.selectMcap();
-  if (!filePath) {
-    return;
-  }
-  if (state.activeTool === "label") {
-    await loadAnnotationRoot(filePath);
-    return;
-  }
-  state.mcapPath = filePath;
-  state.folderPath = null;
-  state.mode = "file";
-  els.selectedPath.textContent = filePath;
-  await loadTopics();
-});
-
-els.selectFolder.addEventListener("click", async () => {
-  const folderPath = await window.episodeQc.selectFolder();
-  if (!folderPath) {
-    return;
-  }
-  if (state.activeTool === "label") {
-    await loadAnnotationRoot(folderPath);
-    return;
-  }
-  state.mcapPath = null;
-  state.folderPath = folderPath;
-  state.mode = "folder";
-  els.selectedPath.textContent = folderPath;
-  renderFolderTopics();
-  resetMetrics();
-  setStatus("Idle", "");
-  els.runSummary.textContent = "Folder ready for recursive MCAP scan";
-});
-
-els.refreshTopics.addEventListener("click", async () => {
-  if (state.activeTool === "label" && state.annotation.rootPath) {
-    await loadAnnotationRoot(state.annotation.rootPath, { preserveLabels: true });
-    return;
-  }
-  if (state.mode === "file" && state.mcapPath) {
-    await loadTopics();
+const g1Viewer = new G1Viewer(els.motionCanvas, (status, error) => {
+  if (status === "ready") {
+    els.motionCard.classList.add("model-ready");
+    if (state.motionFrame?.positions?.length || state.robotActionFrame?.jointPositions?.length) els.motionEmpty.hidden = true;
+    drawMotion();
+  } else if (status === "error") {
+    els.motionEmpty.hidden = false;
+    els.motionEmpty.textContent = "G1 29DOF 模型载入失败";
+    console.error("G1 29DOF model load failed", error);
   }
 });
 
-els.threshold.addEventListener("input", () => {
-  els.thresholdValue.textContent = Number(els.threshold.value).toFixed(2);
-});
+const WHOLE_BODY_JOINT = "whole_body";
 
-els.saveReport.addEventListener("click", async () => {
-  if (!state.lastResult) {
-    return;
-  }
-
+async function initialize() {
+  bindEvents();
+  setSaveState("saving", "打开中…");
   try {
-    const filePath = await window.episodeQc.saveReport(buildReport());
-    if (filePath) {
-      setStatus("Saved", "");
-      els.runSummary.textContent = `Report saved to ${filePath}`;
-    }
+    await refreshWorkspace();
+    setSaveState("saved", "已保存");
+    const recentEpisodeId = state.workspace?.settings?.last_episode_id;
+    if (recentEpisodeId && state.episodes.some((item) => item.id === recentEpisodeId)) openEpisode(recentEpisodeId);
   } catch (error) {
-    setStatus("Error", "error");
-    els.runSummary.textContent = error.message || String(error);
+    setSaveState("error", "打开失败");
+    toast(error.message || String(error), "error", 7000);
   }
-});
+  requestAnimationFrame(playbackLoop);
+}
 
-els.saveAnnotations.addEventListener("click", async () => {
-  try {
-    const filePath = await window.episodeQc.saveAnnotations(buildAnnotationsReport());
-    if (filePath) {
-      setStatus("Saved", "");
-      els.runSummary.textContent = `Labels saved to ${filePath}`;
-    }
-  } catch (error) {
-    setStatus("Error", "error");
-    els.runSummary.textContent = error.message || String(error);
+async function refreshWorkspace({ preserveEpisode = true } = {}) {
+  const payload = await window.episodeQc.getWorkspaceState();
+  state.workspace = payload.workspace;
+  state.episodes = payload.episodes || [];
+  state.labelSchema = payload.label_schema;
+  els.workspaceName.textContent = payload.workspace.name;
+  if (document.activeElement !== els.reviewerName) els.reviewerName.value = payload.workspace.reviewer_name || "";
+  renderEpisodeList();
+  renderLabels();
+  if (!preserveEpisode || !state.episodes.some((item) => item.id === state.currentEpisodeId)) {
+    state.currentEpisodeId = null;
+    clearEpisodeView();
   }
-});
+}
 
-els.reviewActions.addEventListener("click", (event) => {
-  const button = event.target.closest("[data-review]");
-  if (button) {
-    markSelectedCandidate(button.dataset.review);
-  }
-});
+function bindEvents() {
+  window.episodeQc.onEpisodeCacheReady(handleEpisodeCacheReady);
+  els.addSource.addEventListener("click", addSource);
+  els.importLabels.addEventListener("click", importLabels);
+  els.exportResults.addEventListener("click", exportResults);
+  els.episodeSearch.addEventListener("input", renderEpisodeList);
+  els.statusFilter.addEventListener("change", renderEpisodeList);
+  els.episodeList.addEventListener("click", (event) => {
+    const item = event.target.closest("[data-episode-id]");
+    if (item) openEpisode(item.dataset.episodeId);
+  });
+  els.previousEpisode.addEventListener("click", () => moveEpisode(-1));
+  els.nextEpisode.addEventListener("click", () => moveEpisode(1));
+  els.togglePlay.addEventListener("click", togglePlayback);
+  els.playbackRate.addEventListener("change", () => { state.playbackRate = Number(els.playbackRate.value); });
+  els.timelineRange.addEventListener("input", () => seekTo((Number(els.timelineRange.value) / 1_000_000) * state.durationNs));
+  els.markIn.addEventListener("click", markSelectionStart);
+  els.markOut.addEventListener("click", markSelectionEnd);
+  els.scopeTabs.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-scope]");
+    if (!button) return;
+    state.scope = button.dataset.scope;
+    els.scopeTabs.querySelectorAll("button").forEach((item) => item.classList.toggle("active", item === button));
+    renderLabels();
+  });
+  els.labelSearch.addEventListener("input", renderLabels);
+  els.labelGroupFilter.addEventListener("change", renderLabels);
+  els.labelList.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-label-code]");
+    if (button) createAnnotation(button.dataset.labelCode);
+  });
+  els.annotationList.addEventListener("click", (event) => {
+    const item = event.target.closest("[data-annotation-id]");
+    if (item) openAnnotationEditor(item.dataset.annotationId);
+  });
+  els.annotationTrack.addEventListener("click", (event) => {
+    const item = event.target.closest("[data-annotation-id]");
+    if (item) openAnnotationEditor(item.dataset.annotationId);
+  });
+  els.annotationTrack.addEventListener("pointerdown", beginTimelineSelection);
+  window.addEventListener("pointermove", updateTimelineSelection);
+  window.addEventListener("pointerup", endTimelineSelection);
+  els.annotationTrack.addEventListener("dblclick", (event) => {
+    if (event.target.closest("[data-annotation-id]")) return;
+    seekTo(timelineTimeFromPointer(event));
+    state.scope = "time_point";
+    els.scopeTabs.querySelectorAll("button").forEach((button) => button.classList.toggle("active", button.dataset.scope === state.scope));
+    renderLabels();
+  });
+  els.undo.addEventListener("click", undo);
+  els.redo.addEventListener("click", redo);
+  els.decisionGrid.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-decision]");
+    if (button) setDecision(button.dataset.decision);
+  });
+  els.needsRecheck.addEventListener("click", () => setReviewStatus("needs_recheck"));
+  els.resetView.addEventListener("click", resetMotionView);
+  els.motionSource.addEventListener("change", () => {
+    state.motionSource = els.motionSource.value;
+    state.robotActionFrame = null;
+    drawMotion();
+    requestVisualFrames(true);
+  });
+  els.jointSelector.addEventListener("change", () => selectJoint(els.jointSelector.value || null));
+  els.jointLabels.addEventListener("change", drawMotion);
+  els.jointLabelLayer.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-joint-name]");
+    if (button) selectJoint(button.dataset.jointName);
+  });
+  els.motionCanvas.addEventListener("pointerdown", motionPointerDown);
+  window.addEventListener("pointermove", motionPointerMove);
+  window.addEventListener("pointerup", motionPointerUp);
+  els.motionCanvas.addEventListener("wheel", motionWheel, { passive: false });
+  els.motionCanvas.addEventListener("click", selectJointAtPointer);
+  window.addEventListener("resize", drawMotion);
+  document.addEventListener("keydown", handleKeyboard);
+  els.reviewerName.addEventListener("input", scheduleReviewerSave);
+  els.saveEdit.addEventListener("click", saveAnnotationEdit);
+  els.deleteAnnotation.addEventListener("click", deleteCurrentAnnotation);
+  window.addEventListener("beforeunload", () => savePlayhead());
+}
 
-els.annotationPrev.addEventListener("click", () => {
-  goToAnnotationFrame(state.annotation.frameIndex - 1);
-});
-
-els.annotationNext.addEventListener("click", () => {
-  goToAnnotationFrame(state.annotation.frameIndex + 1);
-});
-
-els.annotationFrame.addEventListener("change", () => {
-  goToAnnotationFrame(Number(els.annotationFrame.value));
-});
-
-els.annotationActions.addEventListener("click", (event) => {
-  const button = event.target.closest("[data-frame-label]");
-  if (button) {
-    markAnnotationFrame(button.dataset.frameLabel);
-  }
-});
-
-els.annotationNote.addEventListener("input", () => {
-  syncAnnotationNote();
-});
-
-els.scan.addEventListener("click", async () => {
-  if (!currentInputPath()) {
+function handleEpisodeCacheReady(payload) {
+  if (!payload || payload.episodeId !== state.currentEpisodeId) return;
+  if (payload.error) {
+    setCacheStatus("ready", "优先流可用 · 后台完整缓存失败");
+    toast(`后台缓存失败：${payload.error}`, "error", 7000);
     return;
   }
+  state.cache = payload.cache;
+  renderCameras();
+  renderMotionAvailability();
+  setCacheStatus("ready", "完整播放缓存已就绪");
+  requestVisualFrames(true);
+}
 
-  const topics = selectedTopics();
-  if (topics.length === 0) {
-    setStatus("Select at least one topic", "error");
-    return;
-  }
-
-  setStatus("Scanning", "running");
-  els.scan.disabled = true;
-  els.saveReport.disabled = true;
-  els.runSummary.textContent = "Running Python detector through uv";
-  clearCandidates("Scanning...");
-
+async function addSource() {
+  setBusyButton(els.addSource, true, "索引中…");
   try {
-    const result = await window.episodeQc.scanStaleRegions({
-      mode: state.mode,
-      mcapPath: state.mcapPath,
-      folderPath: state.folderPath,
-      topics,
-      detector: "camera-tearing",
-      threshold: Number(els.threshold.value),
-      limit: parseLimit(els.limit.value),
-      historySize: parseLimit(els.historySize.value) || 3,
-      maxPersistenceFrames: parseLimit(els.maxPersistenceFrames.value) || 12,
-      jobs: parseLimit(els.jobs.value) || 4,
-      minChange: parseOptionalFloat(els.minChange.value) || 0.08,
-      maxStaleDelta: parseOptionalFloat(els.maxStaleDelta.value) || 0.035,
-      resize: els.resize.value
-    });
-    state.lastResult = result;
-    state.selectedCandidateIndex = -1;
-    state.annotations = {};
-    renderResult(result);
-    setStatus("Complete", "");
+    const result = await window.episodeQc.addSource();
+    if (!result) return;
+    toast(`已识别 ${result.ready}/${result.discovered} 条 Episode${result.failed ? `，${result.failed} 条失败` : ""}`, result.failed ? "error" : "success", 5500);
+    await refreshWorkspace();
+    if (!state.currentEpisodeId && state.episodes.length) openEpisode(state.episodes[0].id);
   } catch (error) {
-    setStatus("Error", "error");
-    els.runSummary.textContent = error.message || String(error);
-    clearCandidates("Scan failed");
+    toast(error.message || String(error), "error", 7000);
   } finally {
-    updateScanEnabled();
-  }
-});
-
-function setActiveTool(tool) {
-  state.activeTool = tool;
-  const isLabel = tool === "label";
-
-  els.toolScan.classList.toggle("is-active", !isLabel);
-  els.toolLabel.classList.toggle("is-active", isLabel);
-  els.scanControls.hidden = isLabel;
-  els.annotationControls.hidden = !isLabel;
-  els.scanMetrics.hidden = isLabel;
-  els.scanResults.hidden = isLabel;
-  els.annotationLayout.hidden = !isLabel;
-  els.saveReport.hidden = isLabel;
-  els.saveAnnotations.hidden = !isLabel;
-  els.workspaceTitle.textContent = isLabel ? "Frame Annotation" : "Stale Region Events";
-
-  if (isLabel) {
-    els.selectedPath.textContent = state.annotation.rootPath || "No folder selected";
-    renderAnnotationTopics();
-    renderAnnotationFiles();
-    renderAnnotationFrameState();
-    setStatus("Idle", "");
-    if (!state.annotation.index) {
-      els.runSummary.textContent = "Select a folder to index MCAP files for frame labeling";
-    }
-  } else {
-    els.selectedPath.textContent = currentInputPath() || "No file selected";
-    if (state.mode === "folder" && state.folderPath) {
-      renderFolderTopics();
-    } else if (state.topics.length > 0) {
-      renderTopics();
-    } else {
-      els.topicList.innerHTML = '<div class="empty-state">Select an MCAP file</div>';
-    }
-    setStatus("Idle", "");
-    updateScanEnabled();
+    setBusyButton(els.addSource, false, "添加数据目录");
   }
 }
 
-async function loadAnnotationRoot(rootPath, { preserveLabels = false } = {}) {
-  setStatus("Indexing", "running");
-  els.selectedPath.textContent = rootPath;
-  els.runSummary.textContent = "Reading MCAP summaries for annotation";
-  els.annotationFileList.innerHTML = '<div class="empty-state large">Indexing folder...</div>';
-  clearAnnotationFrame("No frame loaded");
-
+async function importLabels() {
+  setBusyButton(els.importLabels, true, "校验中…");
   try {
-    const index = await window.episodeQc.indexAnnotationFolder(rootPath);
-    const previousLabels = preserveLabels ? state.annotation.labels : {};
-    state.annotation = {
-      rootPath,
-      index,
-      selectedFileIndex: -1,
-      selectedTopic: null,
-      frameIndex: 0,
-      currentFrame: null,
-      labels: previousLabels,
-      loadToken: state.annotation.loadToken + 1
-    };
-    renderAnnotationFiles();
-    selectFirstAnnotationFile();
-    setStatus("Idle", "");
-    const summary = index.summary || {};
-    els.runSummary.textContent = `${formatNumber(summary.scanned_files || 0)} files, ${formatNumber(
-      summary.topics || 0
-    )} topics, ${formatNumber(summary.frames || 0)} frames indexed`;
-  } catch (error) {
-    state.annotation.index = null;
-    setStatus("Error", "error");
-    els.runSummary.textContent = error.message || String(error);
-    renderAnnotationFiles();
-    renderAnnotationTopics();
-    clearAnnotationFrame("Index failed");
-  }
-}
-
-function selectFirstAnnotationFile() {
-  const files = annotationFiles();
-  const index = files.findIndex((file) => file.ok && Array.isArray(file.topics) && file.topics.length > 0);
-  if (index >= 0) {
-    selectAnnotationFile(index);
-  } else {
-    renderAnnotationTopics();
-    clearAnnotationFrame("No image topics found");
-  }
-}
-
-function renderAnnotationFiles() {
-  const files = annotationFiles();
-  if (!state.annotation.index) {
-    els.annotationFileList.innerHTML = '<div class="empty-state large">Select a folder to index MCAP files</div>';
-    updateAnnotationCounter();
-    return;
-  }
-  if (files.length === 0) {
-    els.annotationFileList.innerHTML = '<div class="empty-state large">No MCAP files found</div>';
-    updateAnnotationCounter();
-    return;
-  }
-
-  els.annotationFileList.innerHTML = "";
-  files.forEach((file, index) => {
-    const row = document.createElement("button");
-    row.type = "button";
-    row.className = "annotation-file-row";
-    row.classList.toggle("is-selected", index === state.annotation.selectedFileIndex);
-    const topics = Array.isArray(file.topics) ? file.topics : [];
-    const frameCount = topics.reduce((total, topic) => total + Number(topic.message_count || 0), 0);
-    row.innerHTML = `
-      <span title="${escapeAttribute(file.path || "")}">${escapeHtml(file.episode || file.path || "MCAP")}</span>
-      <span class="annotation-number">${formatNumber(topics.length)}</span>
-      <span class="annotation-number">${formatNumber(frameCount)}</span>
-      <span class="annotation-number">${formatNumber(annotationCountForFile(file.path))}</span>
-    `;
-    row.addEventListener("click", () => selectAnnotationFile(index));
-    els.annotationFileList.append(row);
-  });
-  updateAnnotationCounter();
-}
-
-function selectAnnotationFile(index) {
-  const file = annotationFiles()[index];
-  if (!file || !file.ok) {
-    return;
-  }
-  const topics = Array.isArray(file.topics) ? file.topics.filter((topic) => topic.message_count > 0) : [];
-  state.annotation.selectedFileIndex = index;
-  state.annotation.selectedTopic = preferredAnnotationTopic(topics);
-  state.annotation.frameIndex = 0;
-  state.annotation.currentFrame = null;
-  renderAnnotationFiles();
-  renderAnnotationTopics();
-  loadAnnotationFrame();
-}
-
-function preferredAnnotationTopic(topics) {
-  if (topics.some((topic) => topic.name === state.annotation.selectedTopic)) {
-    return state.annotation.selectedTopic;
-  }
-  const defaultTopic = topics.find((topic) => topic.name === DEFAULT_IMAGE_TOPIC);
-  return (defaultTopic || topics[0] || {}).name || null;
-}
-
-function renderAnnotationTopics() {
-  if (state.activeTool !== "label") {
-    return;
-  }
-  const file = selectedAnnotationFile();
-  const topics = file && Array.isArray(file.topics) ? file.topics.filter((topic) => topic.message_count > 0) : [];
-  if (topics.length === 0) {
-    els.topicList.innerHTML = '<div class="empty-state">No indexed topics</div>';
-    return;
-  }
-
-  els.topicList.innerHTML = "";
-  for (const topic of topics) {
-    const label = document.createElement("label");
-    label.className = "topic-item";
-    const checked = topic.name === state.annotation.selectedTopic ? "checked" : "";
-    label.innerHTML = `
-      <input type="radio" name="annotation-topic" value="${escapeAttribute(topic.name)}" ${checked} />
-      <span class="topic-name" title="${escapeAttribute(topic.name)}">${escapeHtml(topic.name)}</span>
-      <span class="topic-count">${formatNumber(topic.message_count)}</span>
-    `;
-    label.querySelector("input").addEventListener("change", () => {
-      state.annotation.selectedTopic = topic.name;
-      state.annotation.frameIndex = 0;
-      state.annotation.currentFrame = null;
-      loadAnnotationFrame();
-    });
-    els.topicList.append(label);
-  }
-  updateAnnotationNav();
-}
-
-function goToAnnotationFrame(frameIndex) {
-  const topic = currentAnnotationTopic();
-  if (!topic) {
-    return;
-  }
-  const maxIndex = Math.max(0, Number(topic.message_count || 1) - 1);
-  const nextIndex = Math.min(Math.max(0, Math.trunc(frameIndex || 0)), maxIndex);
-  if (nextIndex === state.annotation.frameIndex && state.annotation.currentFrame) {
-    els.annotationFrame.value = String(nextIndex);
-    return;
-  }
-  state.annotation.frameIndex = nextIndex;
-  loadAnnotationFrame();
-}
-
-async function loadAnnotationFrame() {
-  const file = selectedAnnotationFile();
-  const topic = currentAnnotationTopic();
-  if (!file || !topic) {
-    clearAnnotationFrame("No frame loaded");
-    return;
-  }
-
-  const maxIndex = Math.max(0, Number(topic.message_count || 1) - 1);
-  state.annotation.frameIndex = Math.min(Math.max(0, state.annotation.frameIndex), maxIndex);
-  const token = state.annotation.loadToken + 1;
-  state.annotation.loadToken = token;
-  clearAnnotationFrame("Loading frame...");
-  setStatus("Loading", "running");
-  updateAnnotationNav();
-
-  try {
-    const frame = await window.episodeQc.exportAnnotationFrame({
-      mcapPath: file.path,
-      topic: topic.name,
-      frameIndex: state.annotation.frameIndex
-    });
-    if (token !== state.annotation.loadToken) {
+    const result = await window.episodeQc.importLabelSchema();
+    if (!result) return;
+    if (!result.readyToConfirm) {
+      toast(`标签库校验失败：${result.preview.errors.join("；")}`, "error", 8500);
       return;
     }
-    state.annotation.currentFrame = frame;
-    renderAnnotationFrameState();
-    setStatus("Idle", "");
+    const preview = result.preview;
+    const confirmed = window.confirm(
+      `标签库 ${preview.label_set_id} ${preview.version}\n新增 ${preview.added.length}，更新 ${preview.updated.length}，不变 ${preview.unchanged.length}，保留旧标签 ${preview.preserved.length}\n\n确认导入并激活吗？`
+    );
+    if (!confirmed) return;
+    const imported = await window.episodeQc.confirmLabelSchema();
+    toast(`标签库 ${imported.label_set_id} ${imported.version} 已导入：新增 ${imported.added.length}，更新 ${imported.updated.length}`, "success", 6000);
+    await refreshWorkspace();
+    if (state.currentEpisodeId) await reloadCurrentEpisode();
   } catch (error) {
-    if (token !== state.annotation.loadToken) {
-      return;
-    }
-    state.annotation.currentFrame = null;
-    setStatus("Error", "error");
-    els.runSummary.textContent = error.message || String(error);
-    clearAnnotationFrame("Frame load failed");
+    toast(error.message || String(error), "error", 7000);
+  } finally {
+    setBusyButton(els.importLabels, false, "导入标签库");
   }
 }
 
-function renderAnnotationFrameState() {
-  const file = selectedAnnotationFile();
-  const topic = currentAnnotationTopic();
-  const frame = state.annotation.currentFrame;
-  updateAnnotationNav();
-  updateAnnotationCounter();
-
-  if (!file || !topic || !frame) {
-    return;
-  }
-
-  els.annotationCurrentTitle.textContent = `${file.episode || "MCAP"} frame ${frame.frame_index}`;
-  els.annotationCurrentSubtitle.textContent = topic.name;
-  els.annotationImage.src = frame.frame_url;
-  els.annotationImageWrap.classList.add("has-image");
-
-  const annotation = currentFrameAnnotation();
-  els.annotationNote.value = annotation?.note || "";
-  updateAnnotationButtons(annotation?.label || "unlabeled");
-  renderAnnotationDetails(frame, annotation);
-}
-
-function clearAnnotationFrame(message) {
-  state.annotation.currentFrame = null;
-  els.annotationImage.removeAttribute("src");
-  els.annotationImageWrap.classList.remove("has-image");
-  els.annotationCurrentTitle.textContent = "No frame selected";
-  els.annotationCurrentSubtitle.textContent = "Choose an indexed file and topic";
-  els.annotationDetails.innerHTML = "";
-  els.annotationNote.value = "";
-  updateAnnotationButtons("unlabeled");
-  updateAnnotationNav();
-  const empty = document.querySelector("#annotation-empty");
-  if (empty) {
-    empty.textContent = message;
-  }
-}
-
-function markAnnotationFrame(label) {
-  const frame = state.annotation.currentFrame;
-  const file = selectedAnnotationFile();
-  if (!frame || !file) {
-    return;
-  }
-  const key = annotationKey(file.path, frame.topic, frame.frame_index);
-  if (label === "clear") {
-    delete state.annotation.labels[key];
-  } else {
-    state.annotation.labels[key] = annotationRecord(label, els.annotationNote.value);
-  }
-  renderAnnotationFrameState();
-  renderAnnotationFiles();
-}
-
-function syncAnnotationNote() {
-  const frame = state.annotation.currentFrame;
-  const file = selectedAnnotationFile();
-  if (!frame || !file) {
-    return;
-  }
-  const key = annotationKey(file.path, frame.topic, frame.frame_index);
-  const note = els.annotationNote.value;
-  const existing = state.annotation.labels[key];
-  if (!existing && note.trim().length === 0) {
-    return;
-  }
-  state.annotation.labels[key] = annotationRecord(existing?.label || "note", note);
-  updateAnnotationCounter();
-  renderAnnotationFiles();
-}
-
-function annotationRecord(label, note) {
-  const frame = state.annotation.currentFrame;
-  const file = selectedAnnotationFile();
-  return {
-    label,
-    note: note.trim(),
-    mcap_path: file.path,
-    episode: file.episode || "",
-    topic: frame.topic,
-    frame_index: frame.frame_index,
-    log_time_ns: frame.log_time_ns,
-    publish_time_ns: frame.publish_time_ns,
-    sequence: frame.sequence,
-    timestamp_ns: frame.timestamp_ns,
-    frame_id: frame.frame_id,
-    updated_at: new Date().toISOString()
-  };
-}
-
-function renderAnnotationDetails(frame, annotation) {
-  const file = selectedAnnotationFile();
-  const details = [
-    ["Label", formatFrameLabelStatus(annotation?.label || "unlabeled")],
-    ["Episode", file?.episode || ""],
-    ["MCAP", file?.path || ""],
-    ["Topic", frame.topic],
-    ["Frame", frame.frame_index],
-    ["Sequence", frame.sequence],
-    ["Log Time", frame.log_time_ns],
-    ["Timestamp", frame.timestamp_ns ?? ""],
-    ["Frame ID", frame.frame_id || ""],
-    ["Format", frame.format || ""],
-    ["Preview", frame.output_path || ""],
-    ["Updated", annotation?.updated_at || ""]
-  ];
-
-  els.annotationDetails.innerHTML = "";
-  for (const [label, value] of details) {
-    const dt = document.createElement("dt");
-    dt.textContent = label;
-    const dd = document.createElement("dd");
-    dd.textContent = value;
-    els.annotationDetails.append(dt, dd);
-  }
-}
-
-function updateAnnotationNav() {
-  const topic = currentAnnotationTopic();
-  const frameCount = Number(topic?.message_count || 0);
-  const maxIndex = Math.max(0, frameCount - 1);
-  els.annotationFrame.value = String(state.annotation.frameIndex || 0);
-  els.annotationFrame.max = String(maxIndex);
-  els.annotationFrame.disabled = frameCount === 0;
-  els.annotationFrameCount.textContent = formatNumber(frameCount);
-  els.annotationPrev.disabled = frameCount === 0 || state.annotation.frameIndex <= 0;
-  els.annotationNext.disabled = frameCount === 0 || state.annotation.frameIndex >= maxIndex;
-}
-
-function updateAnnotationButtons(activeLabel) {
-  els.annotationActions.querySelectorAll("[data-frame-label]").forEach((button) => {
-    button.classList.toggle("is-active", button.dataset.frameLabel === activeLabel);
-  });
-}
-
-function updateAnnotationCounter() {
-  const annotations = Object.values(state.annotation.labels);
-  els.annotationCounter.textContent = `${formatNumber(annotations.length)} labels`;
-  els.saveAnnotations.disabled = annotations.length === 0;
-}
-
-function currentFrameAnnotation() {
-  const frame = state.annotation.currentFrame;
-  const file = selectedAnnotationFile();
-  if (!frame || !file) {
-    return null;
-  }
-  return state.annotation.labels[annotationKey(file.path, frame.topic, frame.frame_index)] || null;
-}
-
-function annotationFiles() {
-  return state.annotation.index?.files || [];
-}
-
-function selectedAnnotationFile() {
-  return annotationFiles()[state.annotation.selectedFileIndex] || null;
-}
-
-function currentAnnotationTopic() {
-  const file = selectedAnnotationFile();
-  const topics = file && Array.isArray(file.topics) ? file.topics : [];
-  return topics.find((topic) => topic.name === state.annotation.selectedTopic) || null;
-}
-
-function annotationKey(mcapPath, topic, frameIndex) {
-  return `${mcapPath}#${topic}#${frameIndex}`;
-}
-
-function annotationCountForFile(mcapPath) {
-  return Object.values(state.annotation.labels).filter((item) => item.mcap_path === mcapPath).length;
-}
-
-function buildAnnotationsReport() {
-  const annotations = Object.values(state.annotation.labels).sort((left, right) => {
-    const leftKey = `${left.mcap_path}#${left.topic}#${String(left.frame_index).padStart(9, "0")}`;
-    const rightKey = `${right.mcap_path}#${right.topic}#${String(right.frame_index).padStart(9, "0")}`;
-    return leftKey.localeCompare(rightKey);
-  });
-  const summary = {
-    labels: annotations.length,
-    good: annotations.filter((item) => item.label === "good").length,
-    defect: annotations.filter((item) => item.label === "defect").length,
-    unsure: annotations.filter((item) => item.label === "unsure").length,
-    note: annotations.filter((item) => item.label === "note").length
-  };
-
-  return {
-    report_version: 1,
-    type: "frame_annotations",
-    generated_at: new Date().toISOString(),
-    rootPath: state.annotation.rootPath,
-    source_summary: state.annotation.index?.summary || {},
-    summary,
-    annotations
-  };
-}
-
-async function loadTopics() {
-  setStatus("Loading", "running");
-  els.scan.disabled = true;
-  els.topicList.innerHTML = '<div class="empty-state">Reading MCAP summary...</div>';
-
+async function exportResults() {
+  setBusyButton(els.exportResults, true, "导出中…");
   try {
-    const topics = await window.episodeQc.listTopics(state.mcapPath);
-    state.topics = topics.filter((topic) => topic.messageCount > 0);
-    renderTopics();
-    resetMetrics();
-    setStatus("Idle", "");
-    els.runSummary.textContent = `${state.topics.length} image topics ready`;
+    const episodeIds = state.filteredEpisodes.map((item) => item.id);
+    const result = await window.episodeQc.exportWorkspace({ episodeIds });
+    if (result) toast(`已导出 ${result.episode_count} 条 Episode、${result.annotation_count} 条标注到 ${result.output_dir}`, "success", 8000);
   } catch (error) {
-    state.topics = [];
-    renderTopics(error.message || String(error));
-    setStatus("Error", "error");
+    toast(error.message || String(error), "error", 7000);
+  } finally {
+    setBusyButton(els.exportResults, false, "导出结果");
   }
 }
 
-function renderFolderTopics() {
-  state.topics = [{ name: DEFAULT_IMAGE_TOPIC, messageCount: 0 }];
-  els.topicList.innerHTML = "";
-  const label = document.createElement("label");
-  label.className = "topic-item";
-  label.innerHTML = `
-    <input type="checkbox" value="${escapeAttribute(DEFAULT_IMAGE_TOPIC)}" checked />
-    <span class="topic-name" title="${escapeAttribute(DEFAULT_IMAGE_TOPIC)}">${escapeHtml(DEFAULT_IMAGE_TOPIC)}</span>
-    <span class="topic-count">folder</span>
-  `;
-  label.querySelector("input").addEventListener("change", updateScanEnabled);
-  els.topicList.append(label);
-  updateScanEnabled();
-}
-
-function renderTopics(errorText) {
-  if (errorText) {
-    els.topicList.innerHTML = `<div class="empty-state">${escapeHtml(errorText)}</div>`;
-    return;
-  }
-
-  if (state.topics.length === 0) {
-    els.topicList.innerHTML = '<div class="empty-state">No JPEG image topics found</div>';
-    els.scan.disabled = true;
-    return;
-  }
-
-  els.topicList.innerHTML = "";
-  for (const topic of state.topics) {
-    const label = document.createElement("label");
-    label.className = "topic-item";
-    const checked = topic.name === DEFAULT_IMAGE_TOPIC ? "checked" : "";
-    label.innerHTML = `
-      <input type="checkbox" value="${escapeAttribute(topic.name)}" ${checked} />
-      <span class="topic-name" title="${escapeAttribute(topic.name)}">${escapeHtml(topic.name)}</span>
-      <span class="topic-count">${formatNumber(topic.messageCount)}</span>
-    `;
-    label.querySelector("input").addEventListener("change", updateScanEnabled);
-    els.topicList.append(label);
-  }
-  updateScanEnabled();
-}
-
-function renderResult(result) {
-  const summary = result.summary || {};
-  const items = displayItems(result);
-  const eventCount = summary.events ?? (Array.isArray(result.events) ? result.events.length : null);
-  const metricCount = eventCount ?? summary.candidates ?? items.length;
-  const itemLabel = eventCount === null ? "candidates" : "events";
-  els.metricFrames.textContent = formatNumber(summary.decoded_frames || 0);
-  els.metricCandidates.textContent = formatNumber(metricCount || 0);
-  els.metricErrors.textContent = formatNumber(summary.decode_errors || 0);
-  els.metricTopics.textContent = formatNumber(summary.topics || 0);
-  const fileText = summary.files ? ` across ${formatNumber(summary.scanned_files || 0)} files` : "";
-  const candidateText =
-    eventCount === null || eventCount === summary.candidates
-      ? ""
-      : ` / ${formatNumber(summary.candidates || 0)} frame candidates`;
-  els.runSummary.textContent = `${formatNumber(metricCount || 0)} ${itemLabel}${candidateText} from ${formatNumber(
-    summary.decoded_frames || 0
-  )} decoded frames${fileText}`;
-
-  els.saveReport.disabled = false;
-  if (items.length === 0) {
-    clearCandidates("No candidates found");
-    return;
-  }
-
-  els.candidateList.innerHTML = "";
-  items.forEach((candidate, index) => {
-    const row = document.createElement("button");
-    row.type = "button";
-    row.className = "candidate-row";
-    const topicLabel = candidate.episode ? `${candidate.episode}:${shortTopic(candidate.topic)}` : shortTopic(candidate.topic);
-    const score = Number(candidate.event_max_score ?? candidate.score ?? 0);
-    row.innerHTML = `
-      <span title="${escapeAttribute(candidate.topic)}">${escapeHtml(topicLabel)}</span>
-      <span>${escapeHtml(formatFrameLabel(candidate))}</span>
-      <span class="score">${score.toFixed(3)}</span>
-      <span>${escapeHtml(formatReviewStatus(candidateReview(candidate)))}</span>
-    `;
-    row.addEventListener("click", () => selectCandidate(index));
-    els.candidateList.append(row);
+function renderEpisodeList() {
+  const query = els.episodeSearch.value.trim().toLowerCase();
+  const status = els.statusFilter.value;
+  state.filteredEpisodes = state.episodes.filter((episode) => {
+    const text = `${episode.episode_name} ${episode.relative_path} ${episode.data_group}`.toLowerCase();
+    return (!query || text.includes(query)) && (status === "all" || episode.review_status === status);
   });
-
-  selectCandidate(0);
-}
-
-function selectCandidate(index) {
-  const candidates = displayItems(state.lastResult);
-  const candidate = candidates[index];
-  if (!candidate) {
+  els.episodeTotal.textContent = state.episodes.length;
+  els.episodeDone.textContent = state.episodes.filter((item) => ["completed", "reviewed"].includes(item.review_status)).length;
+  els.episodeErrors.textContent = state.episodes.filter((item) => item.import_status !== "ready").length;
+  if (!state.filteredEpisodes.length) {
+    els.episodeList.innerHTML = `<div class="empty-panel">${state.episodes.length ? "没有符合筛选的 Episode" : "添加数据目录后开始质检"}</div>`;
     return;
   }
+  els.episodeList.innerHTML = state.filteredEpisodes.map((episode) => `
+    <button class="episode-item ${episode.id === state.currentEpisodeId ? "active" : ""}" data-episode-id="${escapeHtml(episode.id)}" data-status="${escapeHtml(episode.review_status)}" type="button">
+      <span class="review-dot"></span>
+      <span class="episode-copy">
+        <strong>${escapeHtml(episode.episode_name)}</strong>
+        <span title="${escapeHtml(episode.relative_path)}">${escapeHtml(episode.relative_path)}</span>
+        <span class="episode-badges"><em class="status-badge">${escapeHtml(reviewStatusName(episode.review_status))}</em>${episode.quality_decision ? `<em class="decision-badge">${escapeHtml(decisionName(episode.quality_decision))}</em>` : ""}<em>${episode.camera_count} CAM</em><em>${episode.mocap_available ? "MOCAP" : "无 MOCAP"}</em><em>${episode.annotation_count} 标签</em></span>
+      </span>
+      <time>${formatDuration(episode.duration_sec || 0)}</time>
+    </button>`).join("");
+}
 
-  state.selectedCandidateIndex = index;
-  document.querySelectorAll(".candidate-row").forEach((row, rowIndex) => {
-    row.classList.toggle("is-selected", rowIndex === index);
+async function openEpisode(episodeId) {
+  if (!episodeId || episodeId === state.currentEpisodeId && state.cache) return;
+  const token = ++state.loadToken;
+  if (state.currentEpisodeId) await savePlayhead();
+  state.playing = false;
+  state.cache = null;
+  state.detail = null;
+  state.currentEpisodeId = episodeId;
+  window.episodeQc.updateWorkspaceSettings({ lastEpisodeId: episodeId }).catch(() => {});
+  state.selectionStartNs = null;
+  state.selectionEndNs = null;
+  state.selectedCameraId = null;
+  state.selectedJoint = null;
+  state.motionFrame = null;
+  state.robotActionFrame = null;
+  state.motionSource = "policy";
+  syncJointSelectionUi();
+  updatePlaybackButton();
+  renderEpisodeList();
+  setCacheStatus("busy", "读取 Episode 元信息…");
+  try {
+    const detail = await window.episodeQc.getEpisode(episodeId);
+    if (token !== state.loadToken) return;
+    state.detail = detail;
+    state.labelSchema = detail.label_schema || state.labelSchema;
+    state.durationNs = Number(detail.episode.duration_ns || 0);
+    state.playheadNs = Math.min(Number(detail.episode.last_playhead_ns || 0), state.durationNs);
+    renderEpisodeDetail();
+    setCacheStatus("busy", "首次打开：正在建立只读播放缓存…");
+    const cache = await window.episodeQc.prepareEpisode(episodeId);
+    if (token !== state.loadToken) return;
+    state.cache = cache;
+    renderCameras();
+    renderMotionAvailability();
+    const cacheMessage = cache.complete
+      ? (cache.reused ? "完整播放缓存已复用" : "完整播放缓存已就绪")
+      : "默认相机与 Policy 已就绪 · 其余流后台缓存中…";
+    setCacheStatus("ready", `${cacheMessage}${cache.decode_errors?.length ? ` · ${cache.decode_errors.length} 个解析提示` : ""}`);
+    await requestVisualFrames(true);
+  } catch (error) {
+    if (token !== state.loadToken) return;
+    setCacheStatus("error", "载入失败");
+    toast(error.message || String(error), "error", 8000);
+  }
+}
+
+async function reloadCurrentEpisode() {
+  if (!state.currentEpisodeId) return;
+  const detail = await window.episodeQc.getEpisode(state.currentEpisodeId);
+  state.detail = detail;
+  state.labelSchema = detail.label_schema || state.labelSchema;
+  renderEpisodeDetail();
+}
+
+function renderEpisodeDetail() {
+  if (!state.detail) return;
+  const episode = state.detail.episode;
+  els.currentEpisode.textContent = episode.episode_name;
+  els.episodeMeta.textContent = `${episode.data_group} · ${episode.camera_count} 路相机 · ${episode.mocap_available ? "Mocap 可解析" : "Mocap 不可用"} · ${episode.relative_path}`;
+  els.durationTime.textContent = formatClock(state.durationNs);
+  els.timelineEnd.textContent = formatDuration(state.durationNs / 1e9);
+  renderClock();
+  renderCoverageTracks();
+  renderAnnotations();
+  renderLabels();
+  renderDecision();
+  renderTargetContext();
+}
+
+function clearEpisodeView() {
+  state.detail = null;
+  state.cache = null;
+  state.motionFrame = null;
+  state.robotActionFrame = null;
+  state.durationNs = 0;
+  state.playheadNs = 0;
+  els.currentEpisode.textContent = "未选择 Episode";
+  els.episodeMeta.textContent = "请选择左侧数据";
+  els.cameraGrid.innerHTML = '<div class="empty-panel">当前 Episode 的有效相机会在此动态显示</div>';
+  els.motionEmpty.hidden = false;
+  els.motionEmpty.textContent = "选择 Episode 后显示 G1 29DOF 机器人";
+  els.coverageTracks.innerHTML = "";
+  els.annotationTrack.innerHTML = "";
+  renderJointOptions([]);
+  renderMotionSourceOptions();
+  renderClock();
+  drawMotion();
+}
+
+function renderCameras() {
+  els.cameraGrid.querySelectorAll("img[data-object-url]").forEach((image) => URL.revokeObjectURL(image.dataset.objectUrl));
+  const cameras = state.cache?.cameras || [];
+  els.cameraGrid.className = `camera-grid count-${Math.min(cameras.length, 6)}`;
+  if (!cameras.length) {
+    els.cameraGrid.innerHTML = '<div class="empty-panel">当前 Episode 无有效相机</div>';
+    return;
+  }
+  els.cameraGrid.innerHTML = cameras.map((camera) => `
+    <article class="camera-card" data-camera-id="${escapeHtml(camera.stream_id)}" data-camera-topic="${escapeHtml(camera.topic)}" title="单击选择标注目标，双击放大">
+      <div class="camera-heading"><div><span class="status-dot"></span><strong>${escapeHtml(camera.display_name)}</strong></div><span class="camera-time">等待帧</span></div>
+      <img alt="${escapeHtml(camera.display_name)}" />
+    </article>`).join("");
+  els.cameraGrid.querySelectorAll(".camera-card").forEach((card) => {
+    card.addEventListener("click", (event) => { if (event.detail === 1) selectCamera(card.dataset.cameraId); });
+    card.addEventListener("dblclick", () => toggleCameraFullscreen(card.dataset.cameraId));
   });
+}
 
-  if (candidate.snapshot_url) {
-    els.previewImage.src = candidate.snapshot_url;
-    els.previewWrap.classList.add("has-image");
-  } else {
-    els.previewImage.removeAttribute("src");
-    els.previewWrap.classList.remove("has-image");
+function selectCamera(streamId) {
+  state.selectedCameraId = state.selectedCameraId === streamId ? null : streamId;
+  state.selectedJoint = null;
+  syncJointSelectionUi();
+  els.cameraGrid.querySelectorAll(".camera-card").forEach((card) => card.classList.toggle("selected", card.dataset.cameraId === state.selectedCameraId));
+  renderTargetContext();
+  drawMotion();
+}
+
+function toggleCameraFullscreen(streamId) {
+  const card = els.cameraGrid.querySelector(`[data-camera-id="${streamId}"]`);
+  if (!card) return;
+  const enabled = !card.classList.contains("fullscreen");
+  els.cameraGrid.querySelectorAll(".camera-card").forEach((item) => item.classList.remove("fullscreen"));
+  card.classList.toggle("fullscreen", enabled);
+  els.cameraGrid.classList.toggle("has-fullscreen", enabled);
+}
+
+function renderMotionAvailability() {
+  const available = Boolean(state.cache?.robot_actions?.available || state.cache?.motion?.available);
+  els.motionCard.classList.toggle("ready", available);
+  els.motionEmpty.hidden = available;
+  if (!available) els.motionEmpty.textContent = "当前 Episode 无可用的 G1 动作或 Mocap";
+  renderMotionSourceOptions();
+  renderJointOptions(state.cache?.motion?.available ? state.cache.motion.joint_names || [] : []);
+}
+
+function renderMotionSourceOptions() {
+  const sourceNames = {
+    policy: "Policy 实际执行姿态（默认）",
+    policy_target: "Policy 目标姿态",
+    soma: "SOMA 重定向动作"
+  };
+  const sources = state.cache?.robot_actions?.sources || [];
+  const available = new Set(sources.filter((item) => item.available).map((item) => item.key));
+  if (!available.has(state.motionSource)) {
+    state.motionSource = ["policy", "soma", "policy_target"].find((key) => available.has(key)) || "policy";
   }
+  els.motionSource.innerHTML = ["policy", "policy_target", "soma"].map((key) =>
+    `<option value="${key}"${available.has(key) ? "" : " disabled"}>${sourceNames[key]}${available.has(key) ? "" : "（不可用）"}</option>`
+  ).join("");
+  els.motionSource.value = state.motionSource;
+  els.motionSource.disabled = available.size < 2;
+}
 
-  updateReviewButtons(candidateReview(candidate));
+function renderCoverageTracks() {
+  const streams = (state.detail?.streams || []).filter((item) => item.available);
+  const priority = { mocap: 0, camera: 1 };
+  const visible = [...streams].sort((a, b) => (priority[a.stream_type] ?? 3) - (priority[b.stream_type] ?? 3)).slice(0, 7);
+  els.coverageTracks.innerHTML = visible.map((stream) => `
+    <div class="coverage-row ${escapeHtml(stream.stream_type)}" title="${escapeHtml(stream.topic)} · ${stream.message_count} 条">
+      <span>${escapeHtml(stream.display_name)}</span><span class="coverage-bar"><i></i></span>
+    </div>`).join("");
+}
 
-  els.candidateDetails.innerHTML = "";
-  const details = [
-    ["Detector", candidate.detector || "stale_region"],
-    ["Episode", candidate.episode || ""],
-    ["MCAP", candidate.mcap_path || ""],
-    ["Topic", candidate.topic],
-    ["Frame", candidate.frame_index],
-    ["Frame Range", formatFrameLabel(candidate)],
-    ["Frame Count", candidate.event_frame_count || ""],
-    ["Event Candidates", candidate.event_candidate_count || ""],
-    ["Region", candidate.region_index],
-    ["Score", Number(candidate.event_max_score ?? candidate.score ?? 0).toFixed(4)],
-    ["Mean Score", candidate.event_mean_score ? Number(candidate.event_mean_score).toFixed(4) : ""],
-    ["Reference Lag", candidate.reference_lag],
-    ["BBox", formatBBox(candidate.bbox)],
-    ["Area", `${(Number(candidate.area_ratio) * 100).toFixed(3)}%`],
-    ["Rectangularity", Number(candidate.rectangularity).toFixed(3)],
-    ["Stale Delta", Number(candidate.stale_delta).toFixed(5)],
-    ["Localized Change", Number(candidate.localized_change || 0).toFixed(5)],
-    ["Texture Increase", Number(candidate.texture_increase || 0).toFixed(5)],
-    ["Motion Residual", Number(candidate.motion_residual || 0).toFixed(5)],
-    ["Future Change", Number(candidate.future_change).toFixed(5)],
-    ["Temporal Contrast", Number(candidate.temporal_contrast).toFixed(5)],
-    ["Frame Gap Ratio", Number(candidate.frame_gap_ratio || 1).toFixed(3)],
-    ["Sequence Gap", candidate.sequence_gap || 1],
-    ["Event Start", candidate.event_start_frame ?? ""],
-    ["Event Offset", candidate.event_frame_offset || 0],
-    ["Review", formatReviewStatus(candidateReview(candidate))],
-    ["Log Time", candidate.log_time_ns],
-    ["Snapshot", candidate.snapshot_path || ""]
-  ];
-
-  for (const [label, value] of details) {
-    const dt = document.createElement("dt");
-    dt.textContent = label;
-    const dd = document.createElement("dd");
-    dd.textContent = value;
-    els.candidateDetails.append(dt, dd);
+async function requestVisualFrames(force = false) {
+  if (!state.cache || !state.currentEpisodeId || state.visualPending) return;
+  const now = performance.now();
+  if (!force && now - state.lastVisualRequest < 90) return;
+  state.lastVisualRequest = now;
+  state.visualPending = true;
+  const episodeId = state.currentEpisodeId;
+  const timeNs = Math.max(0, Math.min(state.durationNs, Math.round(state.playheadNs)));
+  try {
+    const cameraRequests = (state.cache.cameras || []).map(async (camera) => {
+      const frame = await window.episodeQc.getCameraFrame({ episodeId, streamId: camera.stream_id, timeNs });
+      if (episodeId !== state.currentEpisodeId) return;
+      const card = els.cameraGrid.querySelector(`[data-camera-id="${camera.stream_id}"]`);
+      if (!card) return;
+      const image = card.querySelector("img");
+      if (image.dataset.frameIndex !== String(frame.frameIndex)) {
+        if (image.dataset.objectUrl) URL.revokeObjectURL(image.dataset.objectUrl);
+        image.src = frame.dataUrl;
+        if (frame.dataUrl.startsWith("blob:")) image.dataset.objectUrl = frame.dataUrl;
+        else delete image.dataset.objectUrl;
+        image.dataset.frameIndex = String(frame.frameIndex);
+      }
+      card.classList.add("ready");
+      card.querySelector(".camera-time").textContent = `${formatClock(frame.frameOffsetNs)} · ${formatSkew(frame.skewNs)}`;
+    });
+    const motionRequest = state.cache.motion?.available
+      ? window.episodeQc.getMotionFrame({ episodeId, timeNs }).then((frame) => {
+          if (episodeId === state.currentEpisodeId) { state.motionFrame = frame; drawMotion(); }
+        })
+      : Promise.resolve();
+    const requestedSource = state.motionSource;
+    const actionSource = state.cache.robot_actions?.sources?.find((item) => item.key === requestedSource && item.available);
+    const actionRequest = actionSource
+      ? window.episodeQc.getRobotActionFrame({ episodeId, sourceKey: requestedSource, timeNs }).then((frame) => {
+          if (episodeId === state.currentEpisodeId && requestedSource === state.motionSource) {
+            state.robotActionFrame = frame;
+            drawMotion();
+          }
+        })
+      : Promise.resolve();
+    await Promise.all([...cameraRequests, motionRequest, actionRequest]);
+    if (episodeId === state.currentEpisodeId) {
+      setCacheStatus("ready", state.cache.reused ? "播放缓存已复用" : "播放缓存已就绪");
+    }
+  } catch (error) {
+    if (episodeId === state.currentEpisodeId) setCacheStatus("error", `帧读取失败：${error.message || error}`);
+  } finally {
+    state.visualPending = false;
   }
 }
 
-function clearCandidates(message) {
-  els.candidateList.innerHTML = `<div class="empty-state large">${escapeHtml(message)}</div>`;
-  els.previewImage.removeAttribute("src");
-  els.previewWrap.classList.remove("has-image");
-  els.candidateDetails.innerHTML = "";
-  updateReviewButtons("unreviewed");
+function playbackLoop(now) {
+  // requestAnimationFrame's timestamp may move backwards after a renderer
+  // lifecycle transition. Never let that transient clock reset rewind the
+  // playhead below zero and send an invalid frame request to the main process.
+  const elapsedMs = Math.max(0, Math.min(250, now - state.lastTick));
+  state.lastTick = now;
+  if (state.playing && state.durationNs > 0) {
+    state.playheadNs += elapsedMs * 1e6 * state.playbackRate;
+    const start = state.selectionStartNs;
+    const end = state.selectionEndNs;
+    if (els.loopSelection.checked && start !== null && end !== null && end > start && state.playheadNs >= end) {
+      state.playheadNs = start;
+    } else if (state.playheadNs >= state.durationNs) {
+      state.playheadNs = state.durationNs;
+      state.playing = false;
+      updatePlaybackButton();
+      savePlayhead();
+    }
+    renderClock();
+    requestVisualFrames();
+  }
+  requestAnimationFrame(playbackLoop);
 }
 
-function resetMetrics() {
-  els.metricFrames.textContent = "0";
-  els.metricCandidates.textContent = "0";
-  els.metricErrors.textContent = "0";
-  els.metricTopics.textContent = "0";
-  els.saveReport.disabled = true;
-  clearCandidates("No scan results yet");
+async function togglePlayback() {
+  if (!state.cache) return;
+  if (state.playheadNs >= state.durationNs) state.playheadNs = 0;
+  state.playing = !state.playing;
+  state.lastTick = performance.now();
+  updatePlaybackButton();
+  if (state.playing && state.detail?.episode.review_status === "unreviewed") await setReviewStatus("in_progress", false);
+  if (!state.playing) savePlayhead();
 }
 
-function markSelectedCandidate(reviewStatus) {
-  const candidate = displayItems(state.lastResult)[state.selectedCandidateIndex];
-  if (!candidate) {
+function updatePlaybackButton() {
+  els.togglePlay.textContent = state.playing ? "Ⅱ" : "▶";
+  els.togglePlay.title = state.playing ? "暂停 (Space)" : "播放 (Space)";
+}
+
+function seekTo(timeNs) {
+  state.playheadNs = Math.max(0, Math.min(Number(timeNs) || 0, state.durationNs));
+  renderClock();
+  requestVisualFrames(true);
+}
+
+function renderClock() {
+  els.currentTime.textContent = formatClock(state.playheadNs);
+  els.durationTime.textContent = formatClock(state.durationNs);
+  els.timelineRange.value = state.durationNs ? String(Math.round((state.playheadNs / state.durationNs) * 1_000_000)) : "0";
+}
+
+function markSelectionStart() {
+  state.selectionStartNs = Math.round(state.playheadNs);
+  if (state.selectionEndNs !== null && state.selectionEndNs < state.selectionStartNs) state.selectionEndNs = null;
+  renderSelection();
+}
+
+function markSelectionEnd() {
+  if (state.selectionStartNs === null) state.selectionStartNs = 0;
+  state.selectionEndNs = Math.max(state.selectionStartNs, Math.round(state.playheadNs));
+  renderSelection();
+}
+
+function renderSelection() {
+  if (state.selectionStartNs === null) els.selectionLabel.textContent = "未选择区间";
+  else if (state.selectionEndNs === null) els.selectionLabel.textContent = `${formatClock(state.selectionStartNs)} → 等待终点`;
+  else els.selectionLabel.textContent = `${formatClock(state.selectionStartNs)} → ${formatClock(state.selectionEndNs)}`;
+}
+
+function renderLabels() {
+  const labels = state.labelSchema?.labels || [];
+  const groups = new Map((state.labelSchema?.groups || []).map((item) => [item.code, groupDisplayName(item.code, item.name)]));
+  const groupCodes = [...new Set(labels.filter((label) => label.enabled !== false).map((label) => label.group).filter(Boolean))];
+  const selectedGroup = els.labelGroupFilter.value;
+  els.labelGroupFilter.innerHTML = [
+    '<option value="all">全部分组</option>',
+    ...groupCodes.map((code) => `<option value="${escapeHtml(code)}">${escapeHtml(groups.get(code) || groupDisplayName(code))}</option>`)
+  ].join("");
+  els.labelGroupFilter.value = groupCodes.includes(selectedGroup) ? selectedGroup : "all";
+  const activeGroup = els.labelGroupFilter.value;
+  const query = els.labelSearch.value.trim().toLowerCase();
+  const enabled = labels.filter((label) => label.enabled !== false);
+  const visible = enabled.filter((label) => label.annotation_scopes?.includes(state.scope) && (activeGroup === "all" || label.group === activeGroup) && (!query || `${label.code} ${label.name} ${label.description || ""}`.toLowerCase().includes(query)));
+  const schemaHeader = state.labelSchema?.schema || {};
+  const labelSetName = labelSetDisplayName(schemaHeader.label_set_id, schemaHeader.label_set_name);
+  const versionText = schemaHeader.schema_version ? ` · v${schemaHeader.schema_version}` : "";
+  els.labelSetMeta.textContent = labelSetName ? `${labelSetName}${versionText}` : "尚未导入标签库";
+  els.labelSetMeta.title = els.labelSetMeta.textContent;
+  els.labelCount.textContent = `${visible.length} / ${enabled.length}`;
+  if (!visible.length) {
+    els.labelList.innerHTML = `<div class="empty-panel">${labels.length ? "当前范围没有可用标签" : "请先导入标签库"}</div>`;
     return;
   }
+  els.labelList.innerHTML = visible.map((label) => `
+    <button class="label-button" data-label-code="${escapeHtml(label.code)}" style="--label-color:${escapeHtml(label.color || "#8c959f")}" title="${escapeHtml(`${label.name} · ${groups.get(label.group) || groupDisplayName(label.group)}${label.description ? `\n${label.description}` : ""}`)}" type="button">
+      <i class="label-color"></i><span class="label-copy"><strong>${escapeHtml(label.name)}</strong><small>${escapeHtml(groups.get(label.group) || label.group)}</small></span>${label.shortcut ? `<kbd>${escapeHtml(label.shortcut)}</kbd>` : ""}
+    </button>`).join("");
+}
 
-  const key = candidateKey(candidate);
-  if (reviewStatus === "unreviewed") {
-    delete state.annotations[key];
-  } else {
-    state.annotations[key] = {
-      status: reviewStatus,
-      updated_at: new Date().toISOString()
+function renderTargetContext() {
+  if (state.selectedJoint) els.targetContext.textContent = `目标：关节 · ${jointDisplayName(state.selectedJoint)} (${state.selectedJoint})`;
+  else if (state.selectedCameraId) {
+    const camera = state.cache?.cameras?.find((item) => item.stream_id === state.selectedCameraId);
+    els.targetContext.textContent = `目标：相机 · ${camera?.display_name || state.selectedCameraId}`;
+  } else if (state.detail?.episode.mocap_available) els.targetContext.textContent = "目标：Mocap · 全身（默认）";
+  else els.targetContext.textContent = "目标：全局（可点击相机切换）";
+}
+
+async function createAnnotation(labelCode) {
+  if (!state.detail) return toast("请先选择 Episode", "error");
+  const label = state.labelSchema?.labels?.find((item) => item.code === labelCode);
+  if (!label) return;
+  let start = Math.round(state.playheadNs);
+  let end = start;
+  if (state.scope === "time_range") {
+    if (state.selectionStartNs === null || state.selectionEndNs === null || state.selectionEndNs <= state.selectionStartNs) {
+      return toast("请先使用 I / O 设置有效区间", "error");
+    }
+    start = state.selectionStartNs;
+    end = state.selectionEndNs;
+  } else if (state.scope === "episode") {
+    start = 0;
+    end = state.durationNs;
+  }
+  const target = targetForLabel(label);
+  if (!target) return toast(`“${label.name}”不支持当前目标，请选择相机/关节或切回全局`, "error", 5000);
+  const attributes = collectCustomFields(label, target);
+  if (attributes === null) return;
+  const payload = {
+    episode_id: state.currentEpisodeId, label_code: label.code, scope: state.scope,
+    start_offset_ns: start, end_offset_ns: end, target_type: target.targetType, target_key: target.targetKey,
+    severity: label.default_severity, action: label.default_action, comment: els.annotationComment.value.trim(),
+    attributes, reviewer_name: els.reviewerName.value.trim(), status: "confirmed"
+  };
+  setSaveState("saving", "保存中…");
+  try {
+    const saved = await window.episodeQc.saveAnnotation({ payload });
+    state.detail.annotations.push(saved);
+    state.detail.episode.annotation_count = state.detail.annotations.length;
+    updateEpisodeFromDetail();
+    renderAnnotations();
+    els.annotationComment.value = "";
+    setSaveState("saved", "已保存");
+  } catch (error) {
+    setSaveState("error", "保存失败");
+    toast(error.message || String(error), "error", 7000);
+  }
+}
+
+function collectCustomFields(label, target) {
+  const attributes = {};
+  for (const field of label.fields || []) {
+    let value = null;
+    if (field.type === "joint_selector") {
+      const joint = state.selectedJoint || (target.targetType === "mocap" ? WHOLE_BODY_JOINT : null);
+      if (joint) value = field.multiple ? [joint] : joint;
+    }
+    else if (field.type === "camera_selector" && target.targetType === "camera") value = field.multiple ? [target.targetKey] : target.targetKey;
+    else if (field.type === "stream_selector" && target.targetKey) value = field.multiple ? [target.targetKey] : target.targetKey;
+    else if (field.type === "boolean") value = window.confirm(`${field.name || field.code}？`);
+    else if (["select", "multi_select"].includes(field.type)) {
+      const options = (field.options || []).map((item) => `${item.code}=${item.name}`).join("，");
+      const answer = window.prompt(`${field.name || field.code}${options ? `（${options}）` : ""}`, "");
+      if (answer !== null && answer.trim()) value = field.type === "multi_select" ? answer.split("|").map((item) => item.trim()).filter(Boolean) : answer.trim();
+    } else if (["text", "textarea", "number"].includes(field.type)) {
+      const answer = window.prompt(field.name || field.code, "");
+      if (answer !== null && answer.trim()) value = field.type === "number" ? Number(answer) : answer;
+    }
+    if (field.required && (value === null || value === "" || Array.isArray(value) && value.length === 0)) {
+      toast(`标签“${label.name}”需要填写：${field.name || field.code}`, "error");
+      return null;
+    }
+    if (value !== null && value !== "") attributes[field.code] = value;
+  }
+  return attributes;
+}
+
+function targetForLabel(label) {
+  const targets = label.target_types || [];
+  if (state.selectedJoint && targets.includes("joint")) return { targetType: "joint", targetKey: state.selectedJoint };
+  if (state.selectedCameraId && targets.includes("camera")) {
+    const camera = state.cache?.cameras?.find((item) => item.stream_id === state.selectedCameraId);
+    return { targetType: "camera", targetKey: camera?.topic || state.selectedCameraId };
+  }
+  if (targets.includes("global")) return { targetType: "global", targetKey: null };
+  if (targets.includes("mocap") && state.cache?.motion?.available) return { targetType: "mocap", targetKey: "/mocap/human_motion" };
+  if (targets.includes("camera") && state.cache?.cameras?.length) return { targetType: "camera", targetKey: state.cache.cameras[0].topic };
+  const fallback = targets[0];
+  return fallback ? { targetType: fallback, targetKey: null } : null;
+}
+
+function renderAnnotations() {
+  const annotations = state.detail?.annotations || [];
+  const labels = new Map((state.labelSchema?.labels || []).map((item) => [item.code, item]));
+  const severities = new Map((state.labelSchema?.severity_levels || []).map((item) => [item.code, item.name]));
+  els.annotationCount.textContent = annotations.length;
+  if (!annotations.length) els.annotationList.innerHTML = '<div class="empty-panel">暂无标注</div>';
+  else els.annotationList.innerHTML = annotations.map((annotation) => {
+    const label = labels.get(annotation.label_code) || { name: annotation.label_code, color: "#8c959f" };
+    return `<div class="annotation-item" data-annotation-id="${escapeHtml(annotation.annotation_id)}"><i style="background:${escapeHtml(label.color || "#8c959f")}"></i><span><strong>${escapeHtml(label.name)}</strong><small>${escapeHtml(annotationTargetName(annotation))} · ${escapeHtml(severities.get(annotation.severity) || annotation.severity || "未分级")}</small></span><time>${annotation.scope === "episode" ? "整条" : annotation.scope === "time_point" ? formatClock(annotation.start_offset_ns) : `${formatClock(annotation.start_offset_ns)}–${formatClock(annotation.end_offset_ns)}`}</time></div>`;
+  }).join("");
+  els.annotationTrack.innerHTML = annotations.map((annotation) => {
+    const label = labels.get(annotation.label_code) || {};
+    const left = state.durationNs ? (annotation.start_offset_ns / state.durationNs) * 100 : 0;
+    const width = annotation.scope === "time_point" ? 0.35 : state.durationNs ? Math.max(.35, ((annotation.end_offset_ns - annotation.start_offset_ns) / state.durationNs) * 100) : .35;
+    return `<i class="annotation-block" data-annotation-id="${escapeHtml(annotation.annotation_id)}" title="${escapeHtml(label.name || annotation.label_code)}" style="left:${left}%;width:${width}%;background:${escapeHtml(label.color || "#8c959f")}"></i>`;
+  }).join("");
+}
+
+function openAnnotationEditor(annotationId) {
+  const annotation = state.detail?.annotations?.find((item) => item.annotation_id === annotationId);
+  if (!annotation) return;
+  els.editId.value = annotationId;
+  els.editStart.value = (annotation.start_offset_ns / 1e9).toFixed(3);
+  els.editEnd.value = (annotation.end_offset_ns / 1e9).toFixed(3);
+  els.editStart.disabled = annotation.scope === "episode";
+  els.editEnd.disabled = annotation.scope === "episode";
+  fillSelect(els.editSeverity, state.labelSchema?.severity_levels || [], annotation.severity);
+  fillSelect(els.editAction, state.labelSchema?.actions || [], annotation.action);
+  els.editComment.value = annotation.comment || "";
+  seekTo(annotation.start_offset_ns);
+  els.annotationEditor.showModal();
+}
+
+function fillSelect(element, choices, selected) {
+  element.innerHTML = choices.map((item) => `<option value="${escapeHtml(item.code)}" ${item.code === selected ? "selected" : ""}>${escapeHtml(item.name)}</option>`).join("");
+}
+
+async function saveAnnotationEdit() {
+  const annotation = state.detail?.annotations?.find((item) => item.annotation_id === els.editId.value);
+  if (!annotation) return;
+  const payload = {
+    ...annotation,
+    episode_id: annotation.episode_id,
+    start_offset_ns: Math.round(Number(els.editStart.value) * 1e9),
+    end_offset_ns: Math.round(Number(els.editEnd.value) * 1e9),
+    severity: els.editSeverity.value,
+    action: els.editAction.value,
+    comment: els.editComment.value,
+    reviewer_name: els.reviewerName.value.trim()
+  };
+  setSaveState("saving", "保存中…");
+  try {
+    const saved = await window.episodeQc.saveAnnotation({ annotationId: annotation.annotation_id, payload });
+    state.detail.annotations = state.detail.annotations.map((item) => item.annotation_id === saved.annotation_id ? saved : item);
+    renderAnnotations();
+    els.annotationEditor.close();
+    setSaveState("saved", "已保存");
+  } catch (error) {
+    setSaveState("error", "保存失败");
+    toast(error.message || String(error), "error");
+  }
+}
+
+async function deleteCurrentAnnotation() {
+  const annotationId = els.editId.value;
+  if (!annotationId) return;
+  setSaveState("saving", "删除中…");
+  try {
+    await window.episodeQc.deleteAnnotation(annotationId);
+    state.detail.annotations = state.detail.annotations.filter((item) => item.annotation_id !== annotationId);
+    state.detail.episode.annotation_count = state.detail.annotations.length;
+    updateEpisodeFromDetail();
+    renderAnnotations();
+    els.annotationEditor.close();
+    setSaveState("saved", "已保存");
+  } catch (error) {
+    setSaveState("error", "删除失败");
+    toast(error.message || String(error), "error");
+  }
+}
+
+async function undo() {
+  try {
+    const result = await window.episodeQc.undo();
+    if (!result) return toast("没有可撤销的操作");
+    await reloadCurrentEpisode();
+    setSaveState("saved", "已撤销");
+  } catch (error) { toast(error.message || String(error), "error"); }
+}
+
+async function redo() {
+  try {
+    const result = await window.episodeQc.redo();
+    if (!result) return toast("没有可恢复的操作");
+    await reloadCurrentEpisode();
+    setSaveState("saved", "已恢复");
+  } catch (error) { toast(error.message || String(error), "error"); }
+}
+
+async function setDecision(decision) {
+  if (!state.currentEpisodeId) return;
+  setSaveState("saving", "保存结论…");
+  try {
+    const episode = await window.episodeQc.updateReview({ episodeId: state.currentEpisodeId, status: "completed", decision, reviewer: els.reviewerName.value.trim(), playheadNs: state.playheadNs });
+    state.detail.episode = { ...state.detail.episode, ...episode };
+    updateEpisodeFromDetail();
+    renderDecision();
+    setSaveState("saved", "已保存");
+  } catch (error) { setSaveState("error", "保存失败"); toast(error.message || String(error), "error"); }
+}
+
+async function setReviewStatus(status, showToast = true) {
+  if (!state.currentEpisodeId) return;
+  try {
+    const episode = await window.episodeQc.updateReview({ episodeId: state.currentEpisodeId, status, reviewer: els.reviewerName.value.trim(), playheadNs: state.playheadNs });
+    state.detail.episode = { ...state.detail.episode, ...episode };
+    updateEpisodeFromDetail();
+    renderDecision();
+    if (showToast) toast(status === "needs_recheck" ? "已标记为待复核" : "质检状态已保存", "success");
+  } catch (error) { toast(error.message || String(error), "error"); }
+}
+
+function renderDecision() {
+  const episode = state.detail?.episode;
+  els.decisionGrid.querySelectorAll("[data-decision]").forEach((button) => button.classList.toggle("active", button.dataset.decision === episode?.quality_decision));
+  els.needsRecheck.classList.toggle("active", episode?.review_status === "needs_recheck");
+}
+
+function updateEpisodeFromDetail() {
+  const index = state.episodes.findIndex((item) => item.id === state.currentEpisodeId);
+  if (index >= 0) state.episodes[index] = { ...state.episodes[index], ...state.detail.episode };
+  renderEpisodeList();
+}
+
+async function savePlayhead() {
+  if (!state.currentEpisodeId) return;
+  try {
+    await window.episodeQc.updateReview({ episodeId: state.currentEpisodeId, playheadNs: Math.round(state.playheadNs), reviewer: els.reviewerName.value.trim() });
+  } catch { /* best-effort window close / switch save */ }
+}
+
+function moveEpisode(direction) {
+  if (!state.filteredEpisodes.length) return;
+  let index = state.filteredEpisodes.findIndex((item) => item.id === state.currentEpisodeId);
+  if (index < 0) index = direction > 0 ? -1 : 0;
+  const next = state.filteredEpisodes[index + direction];
+  if (next) openEpisode(next.id);
+}
+
+function drawMotion() {
+  const frame = state.motionFrame;
+  const actionFrame = state.robotActionFrame;
+  if ((frame?.positions?.length || actionFrame?.jointPositions?.length) && g1Viewer.status === "loading") {
+    els.motionEmpty.hidden = false;
+    els.motionEmpty.textContent = "正在载入官方 G1 29DOF 模型…";
+  }
+  state.projectedJoints = g1Viewer.render(frame, {
+    episodeId: state.currentEpisodeId,
+    cameraYaw: state.cameraYaw,
+    cameraPitch: state.cameraPitch,
+    cameraZoom: state.cameraZoom,
+    selectedJoint: state.selectedJoint,
+    robotAction: actionFrame,
+    motionSource: state.motionSource,
+  });
+  els.jointLabelLayer.replaceChildren();
+  if (els.jointLabels.checked) {
+    for (const point of state.projectedJoints) {
+      const label = document.createElement("button");
+      label.type = "button";
+      label.dataset.jointName = point.name;
+      label.textContent = jointDisplayName(point.name);
+      label.title = `选择 ${jointDisplayName(point.name)} (${point.name})`;
+      label.classList.toggle("active", point.name === state.selectedJoint);
+      label.style.left = `${point.x}px`;
+      label.style.top = `${point.y}px`;
+      els.jointLabelLayer.append(label);
+    }
+  }
+}
+
+function robotLimbWidth(name) {
+  const value = String(name || "").toLowerCase();
+  if (value.includes("finger") || value.includes("toe")) return 3.5;
+  if (value.includes("hand") || value.includes("foot") || value.includes("neck")) return 5.5;
+  if (value.includes("spine") || value.includes("chest") || value.includes("hip")) return 9;
+  return 7;
+}
+
+function drawRobotLimb(context, point, parent, width, depth) {
+  const gradient = context.createLinearGradient(parent.x, parent.y, point.x, point.y);
+  const shade = Math.max(0, Math.min(1, .48 + depth * .12));
+  gradient.addColorStop(0, shade > .5 ? "#c9d0d3" : "#818b91");
+  gradient.addColorStop(.48, "#8d989e");
+  gradient.addColorStop(1, "#4e5960");
+  context.save();
+  context.lineCap = "round";
+  context.beginPath(); context.moveTo(parent.x, parent.y); context.lineTo(point.x, point.y);
+  context.lineWidth = width + 4; context.strokeStyle = "rgba(5,8,10,.92)"; context.stroke();
+  context.beginPath(); context.moveTo(parent.x, parent.y); context.lineTo(point.x, point.y);
+  context.lineWidth = width; context.strokeStyle = gradient; context.stroke();
+  context.beginPath(); context.moveTo(parent.x, parent.y); context.lineTo(point.x, point.y);
+  context.lineWidth = 1; context.strokeStyle = "rgba(238,245,247,.38)"; context.stroke();
+  context.restore();
+}
+
+function normalizeJointName(name) { return String(name || "").toLowerCase().replace(/[^a-z0-9]/g, ""); }
+
+function robotJointLookup(points, validity) {
+  const lookup = new Map();
+  points.forEach((point, index) => { if (validity?.[index]) lookup.set(normalizeJointName(point.name), point); });
+  return (...names) => names.map((name) => lookup.get(normalizeJointName(name))).find(Boolean);
+}
+
+function drawRobotTorso(context, joint) {
+  const leftShoulder = joint("LeftShoulder", "LeftArm"), rightShoulder = joint("RightShoulder", "RightArm");
+  const leftHip = joint("LeftUpLeg", "LeftHip"), rightHip = joint("RightUpLeg", "RightHip");
+  const chest = joint("Chest", "Spine2", "Spine1"), hips = joint("Hips", "Pelvis");
+  if (leftShoulder && rightShoulder && leftHip && rightHip) {
+    const panel = [leftShoulder, rightShoulder, rightHip, leftHip];
+    const top = Math.min(...panel.map((point) => point.y)), bottom = Math.max(...panel.map((point) => point.y));
+    const fill = context.createLinearGradient(0, top, 0, bottom || top + 1);
+    fill.addColorStop(0, "#d7dcde"); fill.addColorStop(.42, "#7d898f"); fill.addColorStop(1, "#3b454b");
+    context.save();
+    context.beginPath();
+    context.moveTo(leftShoulder.x, leftShoulder.y);
+    context.lineTo(rightShoulder.x, rightShoulder.y);
+    context.lineTo(rightHip.x, rightHip.y);
+    context.lineTo(leftHip.x, leftHip.y);
+    context.closePath();
+    context.lineJoin = "round"; context.lineWidth = 4; context.strokeStyle = "#090d10"; context.stroke();
+    context.fillStyle = fill; context.fill();
+    context.globalAlpha = .72;
+    context.beginPath();
+    context.moveTo(leftShoulder.x * .72 + rightShoulder.x * .28, leftShoulder.y * .72 + rightShoulder.y * .28);
+    context.lineTo(rightShoulder.x * .72 + leftShoulder.x * .28, rightShoulder.y * .72 + leftShoulder.y * .28);
+    context.lineTo(rightHip.x * .72 + leftHip.x * .28, rightHip.y * .72 + leftHip.y * .28);
+    context.lineTo(leftHip.x * .72 + rightHip.x * .28, leftHip.y * .72 + rightHip.y * .28);
+    context.closePath(); context.fillStyle = "#354148"; context.fill();
+    const mark = chest || {
+      x: panel.reduce((sum, point) => sum + point.x, 0) / panel.length,
+      y: panel.reduce((sum, point) => sum + point.y, 0) / panel.length,
     };
+    context.globalAlpha = 1; context.textAlign = "center"; context.textBaseline = "middle";
+    context.font = "800 10px system-ui"; context.fillStyle = "#d7f356"; context.fillText("G1", mark.x, mark.y);
+    context.restore();
   }
-
-  renderResult(state.lastResult);
-  selectCandidate(state.selectedCandidateIndex);
-}
-
-function candidateReview(candidate) {
-  return state.annotations[candidateKey(candidate)]?.status || "unreviewed";
-}
-
-function candidateKey(candidate) {
-  if (candidate.event_id) {
-    return candidate.event_id;
+  if (leftHip && rightHip) {
+    drawRobotLimb(context, leftHip, rightHip, 10, 0);
+    const middle = hips || { x: (leftHip.x + rightHip.x) / 2, y: (leftHip.y + rightHip.y) / 2 };
+    context.save(); context.beginPath(); context.arc(middle.x, middle.y, 5.2, 0, Math.PI * 2);
+    context.fillStyle = "#1b2227"; context.fill(); context.lineWidth = 1.5; context.strokeStyle = "#aeb8bc"; context.stroke(); context.restore();
   }
-  return `${candidate.mcap_path || ""}#${candidate.topic}#${candidate.frame_index}`;
 }
 
-function updateReviewButtons(activeStatus) {
-  els.reviewActions.querySelectorAll("[data-review]").forEach((button) => {
-    button.classList.toggle("is-active", button.dataset.review === activeStatus);
-  });
+function drawRobotHead(context, joint) {
+  const head = joint("Head"), neck = joint("Neck", "Neck1");
+  if (!head) return;
+  const distance = neck ? Math.hypot(head.x - neck.x, head.y - neck.y) : 18;
+  const radius = Math.max(9, Math.min(17, distance * .62));
+  const shell = context.createLinearGradient(head.x - radius, head.y - radius, head.x + radius, head.y + radius);
+  shell.addColorStop(0, "#e2e6e7"); shell.addColorStop(.52, "#8e999e"); shell.addColorStop(1, "#3c474d");
+  context.save();
+  context.beginPath(); context.ellipse(head.x, head.y, radius, radius * .78, 0, 0, Math.PI * 2);
+  context.fillStyle = shell; context.fill(); context.lineWidth = 3; context.strokeStyle = "#080c0f"; context.stroke();
+  context.beginPath(); context.ellipse(head.x, head.y - radius * .04, radius * .68, radius * .43, 0, 0, Math.PI * 2);
+  context.fillStyle = "#10161a"; context.fill();
+  context.beginPath(); context.moveTo(head.x - radius * .35, head.y - radius * .06); context.lineTo(head.x + radius * .35, head.y - radius * .06);
+  context.lineWidth = 1.2; context.strokeStyle = "rgba(215,243,86,.72)"; context.stroke();
+  context.restore();
 }
 
-function buildReport() {
-  const result = JSON.parse(JSON.stringify(state.lastResult));
-  const candidates = Array.isArray(result.events) && result.events.length > 0 ? result.events : result.candidates || [];
-  const reviewSummary = {
-    confirmed: 0,
-    false_positive: 0,
-    unreviewed: 0
-  };
-
-  for (const candidate of candidates) {
-    const status = candidateReview(candidate);
-    candidate.review_status = status;
-    candidate.review = state.annotations[candidateKey(candidate)] || null;
-    reviewSummary[status] += 1;
+function drawRobotJoint(context, point, selected) {
+  const small = /finger|toe/i.test(point.name);
+  const radius = small ? 2.2 : 4.1;
+  context.save();
+  if (selected) {
+    context.beginPath(); context.arc(point.x, point.y, radius + 4, 0, Math.PI * 2);
+    context.lineWidth = 2; context.strokeStyle = "#d7f356"; context.stroke();
   }
-
-  return {
-    report_version: 1,
-    generated_at: new Date().toISOString(),
-    mode: state.mode,
-    mcapPath: state.mcapPath || state.folderPath,
-    review_summary: reviewSummary,
-    scan: result
-  };
+  context.beginPath(); context.arc(point.x, point.y, radius + 1.5, 0, Math.PI * 2);
+  context.fillStyle = "#0b1013"; context.fill();
+  context.beginPath(); context.arc(point.x, point.y, radius, 0, Math.PI * 2);
+  context.fillStyle = selected ? "#ffffff" : "#778289"; context.fill();
+  context.beginPath(); context.arc(point.x - radius * .24, point.y - radius * .27, Math.max(1, radius * .28), 0, Math.PI * 2);
+  context.fillStyle = selected ? "#d7f356" : "rgba(235,241,243,.72)"; context.fill();
+  context.restore();
 }
 
-function displayItems(result) {
-  if (Array.isArray(result?.events) && result.events.length > 0) {
-    return result.events;
+function drawGroundGrid(context, width, height) {
+  const horizon = height * .73;
+  const platform = context.createRadialGradient(width / 2, horizon + 8, 0, width / 2, horizon + 8, width * .32);
+  platform.addColorStop(0, "rgba(215,243,86,.10)"); platform.addColorStop(1, "rgba(215,243,86,0)");
+  context.save(); context.scale(1, .24); context.beginPath(); context.arc(width / 2, (horizon + 8) / .24, width * .32, 0, Math.PI * 2);
+  context.fillStyle = platform; context.fill(); context.restore();
+  context.strokeStyle = "rgba(113,126,134,.13)";
+  context.lineWidth = 1;
+  for (let i = -6; i <= 6; i++) {
+    context.beginPath(); context.moveTo(width / 2 + i * 17, horizon); context.lineTo(width / 2 + i * 42, height); context.stroke();
   }
-  return result?.candidates || [];
+  for (let i = 0; i < 6; i++) {
+    const y = horizon + (height - horizon) * (i / 6) ** 1.65;
+    context.beginPath(); context.moveTo(0, y); context.lineTo(width, y); context.stroke();
+  }
 }
 
-function updateScanEnabled() {
-  if (state.activeTool !== "scan") {
-    els.scan.disabled = true;
+function motionPointerDown(event) { state.drag = { x: event.clientX, y: event.clientY, moved: false }; els.motionCanvas.setPointerCapture?.(event.pointerId); }
+function motionPointerMove(event) {
+  if (!state.drag) return;
+  const dx = event.clientX - state.drag.x, dy = event.clientY - state.drag.y;
+  if (Math.abs(dx) + Math.abs(dy) > 2) state.drag.moved = true;
+  state.cameraYaw += dx * .008; state.cameraPitch = Math.max(-1.1, Math.min(1.1, state.cameraPitch + dy * .006));
+  state.drag.x = event.clientX; state.drag.y = event.clientY; drawMotion();
+}
+function motionPointerUp() { setTimeout(() => { state.drag = null; }, 0); }
+function motionWheel(event) { event.preventDefault(); state.cameraZoom = Math.max(.35, Math.min(3, state.cameraZoom * Math.exp(-event.deltaY * .001))); drawMotion(); }
+function resetMotionView() { state.cameraYaw = -.15; state.cameraPitch = .12; state.cameraZoom = 1; drawMotion(); }
+function renderJointOptions(names) {
+  const available = [...new Set((names || []).filter(Boolean))];
+  const signature = available.join("|");
+  if (els.jointSelector.dataset.signature !== signature) {
+    const options = [new Option("全身（默认）", "")];
+    for (const name of available) options.push(new Option(`${jointDisplayName(name)} · ${name}`, name));
+    els.jointSelector.replaceChildren(...options);
+    els.jointSelector.dataset.signature = signature;
+  }
+  if (state.selectedJoint && !available.includes(state.selectedJoint)) state.selectedJoint = null;
+  syncJointSelectionUi();
+}
+function syncJointSelectionUi() {
+  els.jointSelector.value = state.selectedJoint || "";
+  els.selectedJoint.hidden = !state.selectedJoint;
+  els.selectedJoint.textContent = state.selectedJoint ? jointDisplayName(state.selectedJoint) : "";
+}
+function selectJoint(name) {
+  state.selectedJoint = name || null;
+  state.selectedCameraId = null;
+  els.cameraGrid.querySelectorAll(".camera-card").forEach((card) => card.classList.remove("selected"));
+  syncJointSelectionUi();
+  renderTargetContext();
+  drawMotion();
+}
+function selectJointAtPointer(event) {
+  if (state.drag?.moved || !state.projectedJoints.length) return;
+  const rect = els.motionCanvas.getBoundingClientRect();
+  const x = event.clientX - rect.left, y = event.clientY - rect.top;
+  let closest = null, distance = 28;
+  for (const point of state.projectedJoints) {
+    const value = Math.hypot(point.x - x, point.y - y);
+    if (value < distance) { distance = value; closest = point; }
+  }
+  if (closest) selectJoint(state.selectedJoint === closest.name ? null : closest.name);
+}
+
+function handleKeyboard(event) {
+  const editing = ["INPUT", "TEXTAREA", "SELECT"].includes(event.target.tagName) || els.annotationEditor.open;
+  if (editing && !(event.ctrlKey && event.key.toLowerCase() === "z")) return;
+  if (event.ctrlKey && event.key.toLowerCase() === "z") { event.preventDefault(); event.shiftKey ? redo() : undo(); return; }
+  if (event.altKey && /^[1-6]$/.test(event.key)) {
+    event.preventDefault();
+    setDecision(["pass", "pass_with_labels", "trim", "repair", "recollect", "reject"][Number(event.key) - 1]);
     return;
   }
-  els.scan.disabled = !currentInputPath() || selectedTopics().length === 0;
-}
-
-function currentInputPath() {
-  return state.mode === "folder" ? state.folderPath : state.mcapPath;
-}
-
-function selectedTopics() {
-  return [...els.topicList.querySelectorAll("input[type='checkbox']:checked")].map((input) => input.value);
-}
-
-function parseLimit(value) {
-  if (!value) {
-    return null;
+  if (event.code === "Space") { event.preventDefault(); togglePlayback(); return; }
+  if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+    event.preventDefault(); seekTo(state.playheadNs + (event.key === "ArrowRight" ? 1 : -1) * (event.shiftKey ? 1e9 : 1e9 / 30)); return;
   }
-  const parsed = Number(value);
-  return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
-}
-
-function parseOptionalFloat(value) {
-  if (!value) {
-    return null;
+  const key = event.key.toUpperCase();
+  if (key === "I") return markSelectionStart();
+  if (key === "O") return markSelectionEnd();
+  if (key === "N") return moveEpisode(1);
+  if (key === "P") return moveEpisode(-1);
+  if (key === "F") {
+    const streamId = state.selectedCameraId || state.cache?.cameras?.[0]?.stream_id;
+    if (streamId) toggleCameraFullscreen(streamId);
+    return;
   }
-  const parsed = Number(value);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+  const label = state.labelSchema?.labels?.find((item) => item.enabled !== false && item.shortcut?.toUpperCase() === key && item.annotation_scopes?.includes(state.scope));
+  if (label) { event.preventDefault(); createAnnotation(label.code); }
 }
 
-function setStatus(text, mode) {
-  els.statusPill.textContent = text;
-  els.statusPill.classList.toggle("is-running", mode === "running");
-  els.statusPill.classList.toggle("is-error", mode === "error");
+function beginTimelineSelection(event) {
+  if (event.target.closest("[data-annotation-id]") || !state.durationNs) return;
+  state.timelineSelecting = true;
+  state.timelineAnchorNs = Math.round(timelineTimeFromPointer(event));
+  state.selectionStartNs = state.timelineAnchorNs;
+  state.selectionEndNs = state.selectionStartNs;
+  els.annotationTrack.setPointerCapture?.(event.pointerId);
+  renderSelection();
 }
 
-function formatNumber(value) {
-  return new Intl.NumberFormat().format(value);
+function updateTimelineSelection(event) {
+  if (!state.timelineSelecting) return;
+  const time = Math.round(timelineTimeFromPointer(event));
+  state.selectionStartNs = Math.min(state.timelineAnchorNs, time);
+  state.selectionEndNs = Math.max(state.timelineAnchorNs, time);
+  renderSelection();
 }
 
-function shortTopic(topic) {
-  return topic.replace("/camera/", "");
+function endTimelineSelection() {
+  if (!state.timelineSelecting) return;
+  state.timelineSelecting = false;
+  state.timelineAnchorNs = null;
+  if (state.selectionEndNs === state.selectionStartNs) state.selectionEndNs = Math.min(state.durationNs, state.selectionStartNs + Math.round(1e9 / 30));
+  renderSelection();
 }
 
-function formatFrameLabel(candidate) {
-  const start = candidate.event_frame_start ?? candidate.frame_index;
-  const end = candidate.event_frame_end ?? candidate.frame_index;
-  if (start === undefined || start === null) {
-    return "";
+function timelineTimeFromPointer(event) {
+  const rect = els.annotationTrack.getBoundingClientRect();
+  const ratio = Math.max(0, Math.min(1, (event.clientX - rect.left) / Math.max(1, rect.width)));
+  return ratio * state.durationNs;
+}
+
+function scheduleReviewerSave() {
+  clearTimeout(state.reviewerTimer);
+  setSaveState("saving", "保存中…");
+  state.reviewerTimer = setTimeout(async () => {
+    try {
+      state.workspace = await window.episodeQc.updateWorkspaceSettings({ reviewer: els.reviewerName.value.trim() });
+      setSaveState("saved", "已保存");
+    } catch (error) { setSaveState("error", "保存失败"); toast(error.message || String(error), "error"); }
+  }, 550);
+}
+
+function reviewStatusName(status) {
+  return ({
+    unreviewed: "未开始",
+    in_progress: "质检中",
+    completed: "已完成",
+    reviewed: "已完成",
+    needs_recheck: "待复核"
+  })[status] || status || "未开始";
+}
+
+function decisionName(decision) {
+  return ({
+    pass: "通过",
+    pass_with_labels: "有条件通过",
+    trim: "需裁剪",
+    repair: "需修复",
+    recollect: "需重采",
+    reject: "废弃"
+  })[decision] || decision || "";
+}
+
+function groupDisplayName(code, configuredName = "") {
+  if (configuredName && configuredName !== code) return configuredName;
+  return ({
+    episode: "整体问题",
+    mocap: "Mocap 问题",
+    camera: "相机问题",
+    teleoperation: "遥操作问题",
+    collection: "采集过程问题",
+    task_execution: "任务执行",
+    clothes_handling: "衣物处理",
+    motion_safety: "动作与安全"
+  })[code] || configuredName || code || "其他";
+}
+
+function labelSetDisplayName(id, configuredName = "") {
+  if (id === "washing_machine_task_qc_v1") return "洗衣机任务质检标签";
+  return configuredName || id || "";
+}
+
+function jointDisplayName(name) {
+  return ({
+    Hips: "骨盆",
+    LeftUpLeg: "左髋",
+    LeftLeg: "左膝",
+    LeftFoot: "左踝",
+    LeftToe: "左脚尖",
+    RightUpLeg: "右髋",
+    RightLeg: "右膝",
+    RightFoot: "右踝",
+    RightToe: "右脚尖",
+    Spine1: "腰部",
+    Spine2: "胸腰",
+    Chest: "胸部",
+    Neck: "颈部",
+    Head: "头部",
+    LeftShoulder: "左锁骨",
+    LeftArm: "左肩",
+    LeftForeArm: "左肘",
+    LeftHand: "左腕",
+    RightShoulder: "右锁骨",
+    RightArm: "右肩",
+    RightForeArm: "右肘",
+    RightHand: "右腕",
+  })[name] || name || "未命名关节";
+}
+
+function annotationTargetName(annotation) {
+  const target = annotation.target_type;
+  if (target === "global") return "全局";
+  if (target === "joint") return `关节 · ${jointDisplayName(annotation.target_key)}${annotation.target_key ? ` (${annotation.target_key})` : ""}`;
+  if (target === "camera") {
+    const camera = state.cache?.cameras?.find((item) => item.topic === annotation.target_key || item.stream_id === annotation.target_key);
+    return `相机 · ${camera?.display_name || annotation.target_key || "未指定"}`;
   }
-  return start === end ? String(start) : `${start}-${end}`;
+  return ({ mocap: "Mocap", stream: "数据流", retarget: "重定向", robot: "机器人", hand: "灵巧手" })[target] || annotation.target_key || target || "未指定";
 }
 
-function formatBBox(value) {
-  if (!Array.isArray(value) || value.length !== 4) {
-    return "";
-  }
-  return `x=${value[0]}, y=${value[1]}, w=${value[2]}, h=${value[3]}`;
+function setCacheStatus(kind, text) { els.cacheStatus.className = `cache-status ${kind}`; els.cacheStatus.textContent = text; }
+function setSaveState(kind, text) { els.saveState.className = `save-state ${kind === "saved" ? "" : kind}`; els.saveState.innerHTML = `<span></span>${escapeHtml(text)}`; }
+function setBusyButton(button, busy, text) { button.disabled = busy; button.textContent = text; }
+function toast(message, kind = "", timeout = 3500) {
+  const item = document.createElement("div"); item.className = `toast ${kind}`; item.textContent = message; els.toastStack.appendChild(item);
+  setTimeout(() => item.remove(), timeout);
 }
+function formatClock(ns) {
+  const milliseconds = Math.max(0, Number(ns) || 0) / 1e6;
+  const minutes = Math.floor(milliseconds / 60000); const seconds = Math.floor(milliseconds / 1000) % 60; const millis = Math.floor(milliseconds % 1000);
+  return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}.${String(millis).padStart(3, "0")}`;
+}
+function formatDuration(seconds) { const value = Math.max(0, Number(seconds) || 0); return `${Math.floor(value / 60)}:${String(Math.floor(value % 60)).padStart(2, "0")}`; }
+function formatSkew(ns) { const ms = Number(ns) / 1e6; return `${ms >= 0 ? "+" : ""}${ms.toFixed(1)} ms`; }
+function escapeHtml(value) { return String(value ?? "").replace(/[&<>'"]/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" })[char]); }
 
-function formatReviewStatus(value) {
-  if (value === "confirmed") {
-    return "Confirmed";
-  }
-  if (value === "false_positive") {
-    return "False Positive";
-  }
-  return "Unreviewed";
-}
-
-function formatFrameLabelStatus(value) {
-  if (value === "good") {
-    return "Good";
-  }
-  if (value === "defect") {
-    return "Defect";
-  }
-  if (value === "unsure") {
-    return "Unsure";
-  }
-  if (value === "note") {
-    return "Note";
-  }
-  return "Unlabeled";
-}
-
-function escapeHtml(value) {
-  return String(value)
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
-}
-
-function escapeAttribute(value) {
-  return escapeHtml(value);
-}
+initialize();

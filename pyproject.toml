@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11,<3.13"
 dependencies = [
   "mcap>=1.4.0",
+  "msgpack>=1.1.0",
   "numpy>=2.0",
   "pillow>=10.0",
   "pyyaml>=6.0",
@@ -26,3 +27,8 @@ build-backend = "hatchling.build"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"app/renderer" = "episode_qc/web_static"
+"mocap_qc_v1_design_bundle/data_profile_v1.example.yaml" = "episode_qc/defaults/data_profile_v1.example.yaml"
+"mocap_qc_v1_design_bundle/label_schema_v1.example.yaml" = "episode_qc/defaults/label_schema_v1.example.yaml"

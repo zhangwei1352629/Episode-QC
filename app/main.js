@@ -240,9 +240,11 @@ ipcMain.handle("workspace:addSourcePath", async (_event, rootPath) => {
 });
 
 async function scanWorkspaceSource(rootPath) {
-  assertFolderPath(rootPath);
+  if (typeof rootPath !== "string" || !rootPath.trim()) {
+    throw new Error("请选择数据目录或输入 smb:// NAS 地址");
+  }
   const paths = workspacePaths();
-  const args = ["workspace-scan", paths.dbPath, rootPath];
+  const args = ["workspace-scan", paths.dbPath, rootPath.trim()];
   if (fs.existsSync(paths.defaultProfile)) {
     args.push("--profile", paths.defaultProfile);
   }

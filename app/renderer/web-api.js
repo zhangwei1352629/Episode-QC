@@ -46,7 +46,10 @@ function installWebApi() {
     updateWorkspaceSettings: (value) => request("/api/workspace/settings", { method: "POST", body: value }),
     addSource: async () => {
       const previous = window.localStorage.getItem("episodeQcSourcePath") || "";
-      const rootPath = window.prompt("请输入本机数据源目录（服务端可访问的绝对路径）", previous);
+      const rootPath = window.prompt(
+        "请输入本机绝对路径或 NAS 地址（例如 smb://server/share/dataset；NAS 需先登录挂载）",
+        previous,
+      );
       if (rootPath === null || !rootPath.trim()) return null;
       window.localStorage.setItem("episodeQcSourcePath", rootPath.trim());
       return request("/api/sources", { method: "POST", body: { rootPath: rootPath.trim() } });

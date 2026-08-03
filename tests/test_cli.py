@@ -60,6 +60,25 @@ def test_worker_reuses_process_for_multiple_commands(tmp_path):
     assert json.loads(second["stdout"])["workspace"]["schema_version"] == 1
 
 
+def test_workspace_scan_preserves_smb_uri(monkeypatch, tmp_path, capsys):
+    captured = {}
+
+    def fake_scan(db_path, root_path, *, profile_path):
+        captured["db_path"] = db_path
+        captured["root_path"] = root_path
+        captured["profile_path"] = profile_path
+        return {"root_path": root_path, "discovered": 0, "ready": 0, "failed": 0}
+
+    monkeypatch.setattr(cli, "scan_data_source", fake_scan)
+    uri = "smb://nas.local/datasets/%E5%90%AB%20%E7%A9%BA%E6%A0%BC"
+
+    assert cli.main(["workspace-scan", str(tmp_path / "workspace.db"), uri]) == 0
+
+    assert captured["root_path"] == uri
+    assert captured["profile_path"] is None
+    assert '"discovered": 0' in capsys.readouterr().out
+
+
 def test_detect_stale_region_defaults_to_ego_head_topic(monkeypatch, capsys):
     captured = {}
 

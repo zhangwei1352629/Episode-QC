@@ -16,6 +16,8 @@ from typing import Any, Iterable
 import yaml
 from mcap.reader import make_reader
 
+from episode_qc.source_paths import resolve_source_directory
+
 
 SCHEMA_VERSION = 1
 
@@ -302,9 +304,8 @@ def scan_data_source(
     profile_path: str | Path | None = None,
 ) -> dict[str, object]:
     initialize_workspace(db_path)
-    root = Path(root_path).expanduser().resolve()
-    if not root.is_dir():
-        raise FileNotFoundError(f"数据源目录不存在: {root}")
+    requested_root_path = str(root_path)
+    root = resolve_source_directory(root_path)
     profile = _load_profile(profile_path)
     profile_id = str(((profile.get("profile") or {}) if isinstance(profile.get("profile"), dict) else {}).get("id") or "default_v1")
     profile_json = _json(profile)
@@ -362,6 +363,7 @@ def scan_data_source(
 
     failures = [item for item in indexed if item["import_status"] != "ready"]
     return {
+        "requested_root_path": requested_root_path,
         "root_path": str(root),
         "source_id": source_id,
         "profile_id": profile_id,

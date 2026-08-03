@@ -256,7 +256,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     workspace_scan_parser = subparsers.add_parser("workspace-scan", help="Recursively import or rescan an Episode source.")
     workspace_scan_parser.add_argument("db_path", type=Path)
-    workspace_scan_parser.add_argument("root_path", type=Path)
+    # Keep URI strings intact: Path("smb://server/share") collapses one slash.
+    workspace_scan_parser.add_argument("root_path")
     workspace_scan_parser.add_argument("--profile", type=Path)
     workspace_scan_parser.set_defaults(func=_cmd_workspace_scan)
 

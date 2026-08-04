@@ -1,20 +1,17 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import redirect_stderr, redirect_stdout
-import io
 import json
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import replace
 from pathlib import Path
-import sys
-import traceback
 from typing import Any
 
 from episode_qc import __version__
 from episode_qc.annotation import annotation_payload_to_json, export_annotation_frame, index_annotation_folder
 from episode_qc.mcap_video import list_image_topics
+from episode_qc.platform_workflow import FlowClient, FlowClientError, QualityCacheManager
 from episode_qc.playback import prepare_episode_cache, public_cache_manifest
 from episode_qc.workspace import (
     delete_annotation,
@@ -82,7 +79,7 @@ STALE_REGION_DEFAULTS = {
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="episode-qc",
-        description="Quality-control helpers for episode MCAP datasets.",
+        description="Quality-control helpers for Episode MCAP and BVH datasets.",
     )
     parser.add_argument(
         "--version",
@@ -288,23 +285,23 @@ def build_parser() -> argparse.ArgumentParser:
     annotation_save_parser.add_argument("db_path", type=Path)
     annotation_save_parser.add_argument("--payload", required=True)
     annotation_save_parser.add_argument("--annotation-id")
-    annotation_save_parser.add_argument("--session-id", default="desktop")
+    annotation_save_parser.add_argument("--session-id", default="cli")
     annotation_save_parser.set_defaults(func=_cmd_annotation_save)
 
     annotation_delete_parser = subparsers.add_parser("annotation-delete", help="Soft-delete an annotation.")
     annotation_delete_parser.add_argument("db_path", type=Path)
     annotation_delete_parser.add_argument("annotation_id")
-    annotation_delete_parser.add_argument("--session-id", default="desktop")
+    annotation_delete_parser.add_argument("--session-id", default="cli")
     annotation_delete_parser.set_defaults(func=_cmd_annotation_delete)
 
     annotation_undo_parser = subparsers.add_parser("annotation-undo", help="Undo the last session annotation change.")
     annotation_undo_parser.add_argument("db_path", type=Path)
-    annotation_undo_parser.add_argument("--session-id", default="desktop")
+    annotation_undo_parser.add_argument("--session-id", default="cli")
     annotation_undo_parser.set_defaults(func=_cmd_annotation_undo)
 
     annotation_redo_parser = subparsers.add_parser("annotation-redo", help="Redo the last undone session annotation change.")
     annotation_redo_parser.add_argument("db_path", type=Path)
-    annotation_redo_parser.add_argument("--session-id", default="desktop")
+    annotation_redo_parser.add_argument("--session-id", default="cli")
     annotation_redo_parser.set_defaults(func=_cmd_annotation_redo)
 
     review_parser = subparsers.add_parser("episode-review", help="Autosave Episode review state and playhead.")
@@ -316,12 +313,56 @@ def build_parser() -> argparse.ArgumentParser:
     review_parser.add_argument("--playhead-ns", type=int)
     review_parser.set_defaults(func=_cmd_episode_review)
 
-    export_parser = subparsers.add_parser("workspace-export", help="Atomically export V1 annotations, episodes and schema.")
+    export_parser = subparsers.add_parser("workspace-export", help="Atomically export one CSV or JSON result file.")
     export_parser.add_argument("db_path", type=Path)
     export_parser.add_argument("output_parent", type=Path)
     export_parser.add_argument("--episode-id", action="append", dest="episode_ids")
     export_parser.add_argument("--completed-only", action="store_true")
+    export_parser.add_argument("--format", choices=("csv", "json"), default="json", dest="export_format")
     export_parser.set_defaults(func=_cmd_workspace_export)
+
+    platform_jobs_parser = subparsers.add_parser(
+        "platform-jobs", help="List Flow quality-control jobs assigned or available to this reviewer."
+    )
+    _add_platform_connection_options(platform_jobs_parser)
+    platform_jobs_parser.add_argument("--status", action="append", dest="statuses")
+    platform_jobs_parser.set_defaults(func=_cmd_platform_jobs)
+
+    platform_cache_parser = subparsers.add_parser(
+        "platform-cache",
+        help="Claim a Flow job, fully stage its asset locally, index all Episodes, and build playback caches.",
+    )
+    _add_platform_connection_options(platform_cache_parser)
+    platform_cache_parser.add_argument("job_code")
+    platform_cache_parser.add_argument("cache_root", type=Path)
+    platform_cache_parser.add_argument("workspace_db", type=Path)
+    platform_cache_parser.add_argument("--playback-cache-root", type=Path)
+    platform_cache_parser.add_argument("--reserve-gb", type=float, default=10.0)
+    platform_cache_parser.set_defaults(func=_cmd_platform_cache)
+
+    platform_submit_parser = subparsers.add_parser(
+        "platform-submit",
+        help="Publish all Episode results in one locally reviewed asset job to NAS and Flow.",
+    )
+    _add_platform_connection_options(platform_submit_parser)
+    platform_submit_parser.add_argument("job_code")
+    platform_submit_parser.add_argument("cache_root", type=Path)
+    platform_submit_parser.add_argument("workspace_db", type=Path)
+    platform_submit_parser.add_argument(
+        "--decision",
+        choices=("pass", "pass_with_labels", "trim", "repair", "recollect", "reject"),
+    )
+    platform_submit_parser.add_argument(
+        "--quality-grade", choices=("excellent", "good", "medium", "poor", "invalid")
+    )
+    platform_submit_parser.set_defaults(func=_cmd_platform_submit)
+
+    platform_evict_parser = subparsers.add_parser(
+        "platform-evict", help="Delete a completed local Flow job cache after result synchronization."
+    )
+    platform_evict_parser.add_argument("job_code")
+    platform_evict_parser.add_argument("cache_root", type=Path)
+    platform_evict_parser.set_defaults(func=_cmd_platform_evict)
 
     web_parser = subparsers.add_parser(
         "web",
@@ -330,14 +371,42 @@ def build_parser() -> argparse.ArgumentParser:
     web_parser.add_argument("--port", type=int, default=0, help="Local TCP port; defaults to an available port.")
     web_parser.add_argument("--workspace-root", type=Path, help="Override the local workspace directory.")
     web_parser.add_argument("--no-browser", action="store_true", help="Print the URL without opening a browser.")
+    web_parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Listening address. Use 0.0.0.0 for explicitly configured LAN access.",
+    )
+    web_parser.add_argument(
+        "--public-host",
+        action="append",
+        default=[],
+        help="Allowed browser IP/host. Repeat for multiple LAN interfaces.",
+    )
     web_parser.set_defaults(func=_cmd_web)
 
-    worker_parser = subparsers.add_parser(
-        "worker",
-        help="Run a persistent JSON-lines command worker for the desktop app.",
+    data_worker_parser = subparsers.add_parser(
+        "data-worker",
+        help="Run a localhost data worker so the central QC page can read this computer's files.",
     )
-    worker_parser.set_defaults(func=_cmd_worker)
+    data_worker_parser.add_argument("--port", type=int, default=8766)
+    data_worker_parser.add_argument("--workspace-root", type=Path)
+    data_worker_parser.add_argument(
+        "--allow-origin",
+        action="append",
+        required=True,
+        help="Central QC browser origin, for example http://10.1.11.155:8765. Repeat if needed.",
+    )
+    data_worker_parser.set_defaults(func=_cmd_data_worker)
     return parser
+
+
+def _add_platform_connection_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--flow-url",
+        default=os.environ.get("EPISODE_QC_FLOW_URL", "http://127.0.0.1:8000"),
+    )
+    parser.add_argument("--username", default=os.environ.get("EPISODE_QC_FLOW_USERNAME", ""))
+    parser.add_argument("--password", default=os.environ.get("EPISODE_QC_FLOW_PASSWORD", ""))
 
 
 def _add_detection_options(parser: argparse.ArgumentParser) -> None:
@@ -663,8 +732,153 @@ def _cmd_workspace_export(args: argparse.Namespace) -> int:
             args.output_parent,
             episode_ids=args.episode_ids,
             completed_only=args.completed_only,
+            export_format=args.export_format,
         )
     )
+
+
+def _platform_client(args: argparse.Namespace) -> FlowClient:
+    if not args.username or not args.password:
+        raise FlowClientError(
+            "请通过 --username/--password 或 EPISODE_QC_FLOW_USERNAME/EPISODE_QC_FLOW_PASSWORD 提供质检账号"
+        )
+    return FlowClient(args.flow_url, args.username, args.password)
+
+
+def _platform_job(client: FlowClient, job_code: str) -> dict:
+    job = next((item for item in client.jobs() if item.get("code") == job_code), None)
+    if job is None:
+        raise FlowClientError(f"Flow 中不存在或当前账号无权访问质检任务：{job_code}")
+    return job
+
+
+def _cmd_platform_jobs(args: argparse.Namespace) -> int:
+    return _print_json({"jobs": _platform_client(args).jobs(args.statuses)})
+
+
+def _cmd_platform_cache(args: argparse.Namespace) -> int:
+    client = _platform_client(args)
+    job = _platform_job(client, args.job_code)
+    manager = QualityCacheManager(
+        args.cache_root,
+        reserve_bytes=max(0, int(args.reserve_gb * 1024**3)),
+    )
+    cached = manager.cache_job(client, job)
+    indexed = scan_data_source(
+        args.workspace_db,
+        cached["cache_dir"],
+        task_code=str(job["code"]),
+        task_name=str(job.get("name") or job.get("asset_name") or job["code"]),
+        origin="flow",
+        flow_job_code=str(job["code"]),
+        asset_id=str(job.get("asset_id") or "") or None,
+        source_uri=str(job.get("source_uri") or job.get("asset_nas_uri") or ""),
+        task_metadata={"flow_job": job},
+    )
+    ready = [item for item in indexed["episodes"] if item["import_status"] == "ready"]
+    ready_by_path = {
+        str(Path(item["relative_path"]).as_posix()).strip("./"): item for item in ready
+    }
+    local_episodes = []
+    for platform_episode in job.get("episodes", []):
+        relative_path = str(Path(platform_episode["relative_path"]).as_posix()).strip("./")
+        local_episode = ready_by_path.get(relative_path)
+        if local_episode is None:
+            raise RuntimeError(
+                f"本地缓存未索引到 Flow Episode：{platform_episode['episode_id']} ({relative_path})"
+            )
+        local_episodes.append(
+            {
+                "episode_id": platform_episode["episode_id"],
+                "local_episode_id": local_episode["id"],
+                "relative_path": relative_path,
+            }
+        )
+    if len(local_episodes) != len(ready):
+        raise RuntimeError(
+            f"资产缓存包含未登记的 Episode：Flow {len(local_episodes)} 个，本地 {len(ready)} 个"
+        )
+    playback_root = args.playback_cache_root or (args.cache_root / "playback")
+    playbacks = []
+    for mapping in local_episodes:
+        playback = prepare_episode_cache(
+            args.workspace_db,
+            mapping["local_episode_id"],
+            playback_root,
+            mode="full",
+        )
+        playbacks.append(
+            {
+                **mapping,
+                "playback": public_cache_manifest(playback)
+                | {"manifest_path": playback["manifest_path"]},
+            }
+        )
+    manager.record_local_episodes(args.job_code, local_episodes)
+    started = manager.start_review(client, args.job_code)
+    return _print_json(
+        {
+            "job": started,
+            "cache": cached,
+            "local_episodes": local_episodes,
+            "workspace_db": str(args.workspace_db.expanduser().resolve()),
+            "playbacks": playbacks,
+        }
+    )
+
+
+def _cmd_platform_submit(args: argparse.Namespace) -> int:
+    client = _platform_client(args)
+    job = _platform_job(client, args.job_code)
+    manager = QualityCacheManager(args.cache_root)
+    mappings = manager.local_episode_mappings(args.job_code)
+    if not mappings:
+        raise ValueError("资产任务没有本地 Episode 映射，请先执行 platform-cache")
+    episode_results = []
+    for mapping in mappings:
+        local_episode_id = mapping["local_episode_id"]
+        detail = episode_detail(args.workspace_db, local_episode_id)
+        local_episode = detail["episode"]
+        decision = args.decision or local_episode.get("quality_decision")
+        if not decision:
+            raise ValueError(
+                f"Episode {mapping['episode_id']} 尚未设置质检结论，请先在 QC 中完成质检"
+            )
+        if local_episode.get("review_status") not in {"completed", "reviewed"}:
+            update_episode_review(
+                args.workspace_db,
+                local_episode_id,
+                review_status="completed",
+                quality_decision=decision,
+            )
+            detail = episode_detail(args.workspace_db, local_episode_id)
+            local_episode = detail["episode"]
+        episode_result = {
+            "episode_id": mapping["episode_id"],
+            "decision": decision,
+            "annotation_count": int(local_episode.get("annotation_count") or 0),
+            "result": {
+                "local_episode_id": local_episode_id,
+                "review_status": local_episode.get("review_status"),
+                "reviewer_name": local_episode.get("reviewer_name"),
+                "annotations": detail["annotations"],
+            },
+        }
+        if args.quality_grade:
+            episode_result["quality_grade"] = args.quality_grade
+        episode_results.append(episode_result)
+    response = manager.submit_result(
+        client,
+        job,
+        episode_results=episode_results,
+        result={"episode_count": len(episode_results)},
+    )
+    return _print_json(response)
+
+
+def _cmd_platform_evict(args: argparse.Namespace) -> int:
+    QualityCacheManager(args.cache_root).evict(args.job_code)
+    return _print_json({"job_code": args.job_code, "evicted": True})
 
 
 def _cmd_web(args: argparse.Namespace) -> int:
@@ -674,52 +888,31 @@ def _cmd_web(args: argparse.Namespace) -> int:
         port=args.port,
         workspace_root=args.workspace_root,
         open_browser=not args.no_browser,
+        host=args.host,
+        public_hosts=tuple(args.public_host),
     )
     return 0
 
 
-def _cmd_worker(_args: argparse.Namespace) -> int:
-    return serve_worker(sys.stdin, sys.stdout)
+def _cmd_data_worker(args: argparse.Namespace) -> int:
+    from episode_qc.web_server import persistent_worker_identity, serve_web_app
 
-
-def serve_worker(input_stream, output_stream) -> int:
-    """Execute CLI argument lists over a line-delimited JSON protocol."""
-    for line in input_stream:
-        request_id: object = None
-        captured_stdout = io.StringIO()
-        captured_stderr = io.StringIO()
-        try:
-            request = json.loads(line)
-            if not isinstance(request, dict):
-                raise ValueError("worker 请求必须是 JSON 对象")
-            request_id = request.get("id")
-            command_args = request.get("args")
-            if not isinstance(command_args, list) or not all(isinstance(item, str) for item in command_args):
-                raise ValueError("worker args 必须是字符串数组")
-            if command_args and command_args[0] in {"worker", "web"}:
-                raise ValueError(f"worker 不能启动长驻命令: {command_args[0]}")
-            with redirect_stdout(captured_stdout), redirect_stderr(captured_stderr):
-                exit_code = main(command_args)
-            if exit_code != 0:
-                raise RuntimeError(f"episode-qc exited with code {exit_code}")
-            response = {
-                "id": request_id,
-                "ok": True,
-                "stdout": captured_stdout.getvalue(),
-                "stderr": captured_stderr.getvalue(),
-            }
-        except (Exception, SystemExit) as exc:
-            details = captured_stderr.getvalue()
-            if not isinstance(exc, SystemExit):
-                details += "".join(traceback.format_exception(exc))
-            response = {
-                "id": request_id,
-                "ok": False,
-                "error": str(exc),
-                "stderr": details,
-            }
-        output_stream.write(json.dumps(response, ensure_ascii=False, separators=(",", ":")) + "\n")
-        output_stream.flush()
+    workspace_root = args.workspace_root
+    if workspace_root is None:
+        config_root = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+        workspace_root = config_root / "episode-qc" / "data-worker"
+    worker_info = persistent_worker_identity(workspace_root)
+    print(f"Episode QC Data Worker：{worker_info['name']} ({worker_info['id']})", flush=True)
+    print("仅向已配置的中央 QC 页面开放；源文件始终只读。", flush=True)
+    serve_web_app(
+        port=args.port,
+        workspace_root=workspace_root,
+        open_browser=False,
+        host="127.0.0.1",
+        cors_origins=tuple(args.allow_origin),
+        worker_info=worker_info,
+        print_token=True,
+    )
     return 0
 
 

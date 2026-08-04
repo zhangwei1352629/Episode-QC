@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: file: blob:; connect-src 'self'; object-src 'none'; base-uri 'none'" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: file: blob:; connect-src 'self' http://127.0.0.1:* http://localhost:* http://[::1]:*; object-src 'none'; base-uri 'none'" />
     <title>Mocap QC Annotator</title>
     <link rel="stylesheet" href="./styles.css" />
   </head>
@@ -19,14 +19,32 @@
         </div>
         <div class="top-actions">
           <label class="reviewer-field">质检员 <input id="reviewer-name" placeholder="输入姓名" /></label>
+          <a class="button secondary download-button" href="./label-template-simple.yaml" download="标签库简易模板.yaml" title="下载后填写英文编码、中文名称和判断标准">下载标签模板</a>
           <button class="button secondary" id="import-labels" type="button">导入标签库</button>
+          <select class="export-format" id="export-format" aria-label="标注结果导出格式" title="每个任务导出一个文件">
+            <option value="json">JSON</option>
+            <option value="csv">CSV</option>
+          </select>
           <button class="button secondary" id="export-results" type="button">导出结果</button>
-          <button class="button primary" id="add-source" type="button">添加数据目录</button>
+          <button class="button primary" id="add-source" type="button">导入新任务</button>
           <div class="save-state" id="save-state"><span></span>已保存</div>
         </div>
       </header>
 
       <aside class="episode-sidebar">
+        <section class="current-task-card">
+          <div class="current-task-heading">
+            <span class="eyebrow">当前 QC 任务</span>
+            <button id="open-task-center" type="button">切换任务</button>
+          </div>
+          <strong id="current-task-name">尚未导入任务</strong>
+          <span id="current-task-code">—</span>
+          <p id="current-task-path" title="">点击“导入新任务”选择数据目录</p>
+          <div class="current-task-footer">
+            <span class="task-status" id="current-task-status">未加载</span>
+            <button id="rescan-task" type="button" disabled>重新扫描</button>
+          </div>
+        </section>
         <div class="source-summary">
           <div><strong id="episode-total">0</strong><span>总计</span></div>
           <div><strong id="episode-done">0</strong><span>已完成</span></div>
@@ -121,6 +139,7 @@
               <span class="eyebrow">人工标注</span>
               <div class="section-title-row"><h2>标签</h2><span class="section-count" id="label-count">0 / 0</span></div>
               <span class="section-meta" id="label-set-meta">正在读取标签库…</span>
+              <span class="label-help">简易模板只要求填写标签名称，其余字段均可省略</span>
             </div>
             <div class="undo-actions"><button id="undo" title="撤销 Ctrl+Z">↶</button><button id="redo" title="恢复 Ctrl+Shift+Z">↷</button></div>
           </div>
@@ -161,6 +180,20 @@
     </div>
 
     <div class="toast-stack" id="toast-stack"></div>
+    <dialog id="task-center" class="task-center-dialog">
+      <div class="task-center-shell">
+        <div class="dialog-heading">
+          <div><span class="eyebrow">一个数据资产对应一个任务</span><h3>QC 任务中心</h3></div>
+          <button id="close-task-center" type="button" aria-label="关闭">×</button>
+        </div>
+        <div class="task-center-summary" id="task-center-summary"></div>
+        <div class="task-list" id="task-list"><div class="empty-panel">暂无任务</div></div>
+        <div class="task-center-actions">
+          <p>切换任务不会删除以前的 Episode、标注或质检结论。</p>
+          <button class="button primary" id="task-center-import" type="button">导入新任务</button>
+        </div>
+      </div>
+    </dialog>
     <dialog id="annotation-editor">
       <form method="dialog" id="annotation-edit-form">
         <div class="dialog-heading"><h3>编辑标注</h3><button value="cancel" type="submit">×</button></div>

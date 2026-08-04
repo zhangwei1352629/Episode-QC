@@ -13,6 +13,7 @@ from typing import BinaryIO
 
 from mcap.reader import make_reader
 
+from episode_qc.bvh import iter_bvh_motion, read_bvh_header
 from episode_qc.compressed_image import decode_compressed_image
 from episode_qc.messagepack import decode_messagepack
 from episode_qc.workspace import _json, _now, connect_workspace, episode_detail
@@ -183,62 +184,75 @@ def prepare_episode_cache(
                 action_files[key] = (actions_dir / f"{key}.frames").open("wb")
 
         start_ns = int(episode["start_time_ns"] or 0)
-        messages = ()
-        source = None
-        if selected_topics:
-            source = Path(str(episode["mcap_path"])).open("rb")
-            reader = make_reader(source)
-            messages = reader.iter_messages(topics=selected_topics)
-        try:
-            for _schema, channel, message in messages:
-                offset_ns = max(0, int(message.log_time) - start_ns)
-                if channel.topic in camera_by_topic:
-                    stream = camera_by_topic[channel.topic]
-                    stream_id = str(stream["id"])
-                    try:
-                        compressed = decode_compressed_image(message.data)
-                        output = camera_files[stream_id]
-                        byte_offset = output.tell()
-                        output.write(compressed.data)
-                        camera_indices[stream_id].append(
-                            [offset_ns, byte_offset, len(compressed.data), len(camera_indices[stream_id])]
-                        )
-                    except Exception as exc:
-                        if len(decode_errors) < 100:
-                            decode_errors.append(f"{channel.topic}: {type(exc).__name__}: {exc}")
-                elif channel.topic in motion_topics and motion_file is not None:
-                    try:
-                        frame, names = decode_human_motion(message.data)
-                        if not joint_names:
-                            joint_names = names
-                            parent_indices = _parent_indices(names)
-                        if names != joint_names:
-                            raise ValueError("Episode 内骨架关节顺序发生变化")
-                        encoded = encode_motion_frame(frame, len(joint_names))
-                        byte_offset = motion_file.tell()
-                        motion_file.write(encoded)
-                        motion_index.append([offset_ns, byte_offset, len(encoded), len(motion_index)])
-                    except Exception as exc:
-                        if len(decode_errors) < 100:
-                            decode_errors.append(f"{channel.topic}: {type(exc).__name__}: {exc}")
-                elif channel.topic in action_by_topic:
-                    try:
-                        spec = action_by_topic[channel.topic]
-                        key = str(spec["key"])
-                        frame = decode_robot_action(message.data, key)
-                        encoded = encode_robot_action_frame(frame, key)
-                        output = action_files[key]
-                        byte_offset = output.tell()
-                        output.write(encoded)
-                        action_indices[key].append(
-                            [offset_ns, byte_offset, len(encoded), len(action_indices[key])]
-                        )
-                    except Exception as exc:
-                        if len(decode_errors) < 100:
-                            decode_errors.append(f"{channel.topic}: {type(exc).__name__}: {exc}")
-        finally:
-            if source is not None:
-                source.close()
+        episode_path = Path(str(episode["mcap_path"]))
+        if episode_path.suffix.lower() == ".bvh":
+            if motion_file is not None and motion_streams:
+                header = read_bvh_header(episode_path)
+                joint_names = [joint.name for joint in header.joints]
+                parent_indices = [joint.parent_index for joint in header.joints]
+                for frame in iter_bvh_motion(episode_path):
+                    encoded = encode_motion_frame(frame, len(joint_names))
+                    byte_offset = motion_file.tell()
+                    motion_file.write(encoded)
+                    offset_ns = int(frame["source_timestamp_ns"])
+                    motion_index.append([offset_ns, byte_offset, len(encoded), len(motion_index)])
+        else:
+            messages = ()
+            source = None
+            if selected_topics:
+                source = episode_path.open("rb")
+                reader = make_reader(source)
+                messages = reader.iter_messages(topics=selected_topics)
+            try:
+                for _schema, channel, message in messages:
+                    offset_ns = max(0, int(message.log_time) - start_ns)
+                    if channel.topic in camera_by_topic:
+                        stream = camera_by_topic[channel.topic]
+                        stream_id = str(stream["id"])
+                        try:
+                            compressed = decode_compressed_image(message.data)
+                            output = camera_files[stream_id]
+                            byte_offset = output.tell()
+                            output.write(compressed.data)
+                            camera_indices[stream_id].append(
+                                [offset_ns, byte_offset, len(compressed.data), len(camera_indices[stream_id])]
+                            )
+                        except Exception as exc:
+                            if len(decode_errors) < 100:
+                                decode_errors.append(f"{channel.topic}: {type(exc).__name__}: {exc}")
+                    elif channel.topic in motion_topics and motion_file is not None:
+                        try:
+                            frame, names = decode_human_motion(message.data)
+                            if not joint_names:
+                                joint_names = names
+                                parent_indices = _parent_indices(names)
+                            if names != joint_names:
+                                raise ValueError("Episode 内骨架关节顺序发生变化")
+                            encoded = encode_motion_frame(frame, len(joint_names))
+                            byte_offset = motion_file.tell()
+                            motion_file.write(encoded)
+                            motion_index.append([offset_ns, byte_offset, len(encoded), len(motion_index)])
+                        except Exception as exc:
+                            if len(decode_errors) < 100:
+                                decode_errors.append(f"{channel.topic}: {type(exc).__name__}: {exc}")
+                    elif channel.topic in action_by_topic:
+                        try:
+                            spec = action_by_topic[channel.topic]
+                            key = str(spec["key"])
+                            frame = decode_robot_action(message.data, key)
+                            encoded = encode_robot_action_frame(frame, key)
+                            output = action_files[key]
+                            byte_offset = output.tell()
+                            output.write(encoded)
+                            action_indices[key].append(
+                                [offset_ns, byte_offset, len(encoded), len(action_indices[key])]
+                            )
+                        except Exception as exc:
+                            if len(decode_errors) < 100:
+                                decode_errors.append(f"{channel.topic}: {type(exc).__name__}: {exc}")
+            finally:
+                if source is not None:
+                    source.close()
         for output in camera_files.values():
             output.close()
         camera_files.clear()

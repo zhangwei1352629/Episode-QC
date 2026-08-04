@@ -1,7 +1,5 @@
 import os
 from pathlib import Path
-import io
-import json
 import subprocess
 import sys
 
@@ -15,6 +13,46 @@ def test_cli_help(capsys):
         assert exc.code == 0
 
     assert "Quality-control helpers" in capsys.readouterr().out
+
+
+def test_web_cli_accepts_multiple_lan_hosts():
+    args = cli.build_parser().parse_args(
+        [
+            "web",
+            "--host",
+            "0.0.0.0",
+            "--public-host",
+            "192.168.123.222",
+            "--public-host",
+            "10.1.11.155",
+            "--port",
+            "8765",
+        ]
+    )
+
+    assert args.host == "0.0.0.0"
+    assert args.public_host == ["192.168.123.222", "10.1.11.155"]
+    assert args.port == 8765
+
+
+def test_data_worker_cli_requires_and_accepts_central_origins():
+    args = cli.build_parser().parse_args(
+        [
+            "data-worker",
+            "--port",
+            "8766",
+            "--allow-origin",
+            "http://192.168.123.222:8765",
+            "--allow-origin",
+            "http://10.1.11.155:8765",
+        ]
+    )
+
+    assert args.port == 8766
+    assert args.allow_origin == [
+        "http://192.168.123.222:8765",
+        "http://10.1.11.155:8765",
+    ]
 
 
 def test_cli_does_not_load_image_detection_by_default():
@@ -37,27 +75,6 @@ def test_cli_does_not_load_image_detection_by_default():
     )
 
     assert result.stdout.strip() == ""
-
-
-def test_worker_reuses_process_for_multiple_commands(tmp_path):
-    db_path = tmp_path / "workspace.db"
-    requests = io.StringIO(
-        "\n".join(
-            [
-                json.dumps({"id": 1, "args": ["workspace-init", str(db_path)]}),
-                json.dumps({"id": 2, "args": ["workspace-state", str(db_path)]}),
-            ]
-        )
-        + "\n"
-    )
-    responses = io.StringIO()
-
-    assert cli.serve_worker(requests, responses) == 0
-
-    first, second = [json.loads(line) for line in responses.getvalue().splitlines()]
-    assert first["id"] == 1 and first["ok"] is True
-    assert second["id"] == 2 and second["ok"] is True
-    assert json.loads(second["stdout"])["workspace"]["schema_version"] == 1
 
 
 def test_workspace_scan_preserves_smb_uri(monkeypatch, tmp_path, capsys):

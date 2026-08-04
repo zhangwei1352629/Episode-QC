@@ -3,6 +3,8 @@ from __future__ import annotations
 import csv
 import io
 import json
+import re
+import sqlite3
 import struct
 from pathlib import Path
 
@@ -24,8 +26,12 @@ from episode_qc.workspace import (
     export_workspace,
     import_label_schema,
     initialize_workspace,
+    list_qc_tasks,
     preview_label_schema,
+    qc_task_manifest,
     redo_annotation_change,
+    register_worker_task,
+    rescan_qc_task,
     save_annotation,
     scan_data_source,
     undo_annotation_change,
@@ -46,7 +52,7 @@ def test_v1_import_playback_annotation_and_export_round_trip(tmp_path: Path):
     workspace = initialize_workspace(db_path, reviewer_name="测试员")
     result = scan_data_source(db_path, source_root)
 
-    assert workspace["schema_version"] == 1
+    assert workspace["schema_version"] == 2
     assert result["discovered"] == 1
     assert result["ready"] == 1
     episode_id = result["episodes"][0]["id"]
@@ -122,25 +128,211 @@ def test_v1_import_playback_annotation_and_export_round_trip(tmp_path: Path):
     assert len(episode_detail(db_path, episode_id)["annotations"]) == 1
 
     update_episode_review(db_path, episode_id, review_status="completed", quality_decision="pass_with_labels", last_playhead_ns=1_100_000_000)
-    exported = export_workspace(db_path, tmp_path / "exports", completed_only=True)
-    output = Path(exported["output_dir"])
+    json_export_root = tmp_path / "exports-json"
+    exported = export_workspace(
+        db_path,
+        json_export_root,
+        completed_only=True,
+        export_format="json",
+    )
+    output = Path(exported["output_file"])
     assert exported["episode_count"] == 1
     assert exported["annotation_count"] == 1
-    assert output.name.startswith("含_空格的数据_qc_annotations_")
+    assert exported["task_count"] == 1
+    assert exported["output_files"] == [str(output)]
+    assert exported["format"] == "json"
+    assert output.name == "含 空格的数据_标注结果.json"
     assert exported["source_directories"] == [str(source_root.resolve())]
-    assert {path.name for path in output.iterdir()} == {
-        "annotations.jsonl", "annotations.csv", "episodes.csv", "label_schema.json", "export_manifest.json"
-    }
-    jsonl_rows = [json.loads(line) for line in (output / "annotations.jsonl").read_text(encoding="utf-8").splitlines()]
-    with (output / "annotations.csv").open(encoding="utf-8-sig", newline="") as source:
+    assert [path.name for path in json_export_root.iterdir()] == [output.name]
+    document = json.loads(output.read_text(encoding="utf-8"))
+    assert document["task_name"] == "含 空格的数据"
+    assert document["episode_count"] == 1
+    assert len(document["episodes"]) == 1
+    assert len(document["annotations"]) == 1
+    assert document["annotations"][0]["episode_id"] == episode_id
+    assert document["annotations"][0]["absolute_start_time_ns"] == 10_500_000_000
+    assert document["annotations"][0]["label_schema_version"] == "1.0.0"
+
+    csv_export_root = tmp_path / "exports-csv"
+    csv_exported = export_workspace(db_path, csv_export_root, export_format="csv")
+    csv_output = Path(csv_exported["output_file"])
+    assert csv_output.name == "含 空格的数据_标注结果.csv"
+    assert [path.name for path in csv_export_root.iterdir()] == [csv_output.name]
+    with csv_output.open(encoding="utf-8-sig", newline="") as source:
         csv_rows = list(csv.DictReader(source))
-    assert len(jsonl_rows) == len(csv_rows) == 1
-    assert jsonl_rows[0]["absolute_start_time_ns"] == 10_500_000_000
-    assert jsonl_rows[0]["label_schema_version"] == "1.0.0"
+    assert len(csv_rows) == 1
+    assert csv_rows[0]["task_name"] == "含 空格的数据"
+    assert csv_rows[0]["episode_id"] == episode_id
+    assert csv_rows[0]["annotation_id"] == annotation["annotation_id"]
+    assert csv_rows[0]["quality_decision"] == "pass_with_labels"
+    assert csv_rows[0]["label_schema_version"] == "1.0.0"
+
+    with pytest.raises(ValueError, match="csv 或 json"):
+        export_workspace(db_path, tmp_path / "invalid-export", export_format="jsonl")
     assert (mcap_path.stat().st_size, mcap_path.stat().st_mtime_ns) == source_before
 
     delete_annotation(db_path, annotation["annotation_id"])
     assert workspace_state(db_path)["episodes"][0]["annotation_count"] == 0
+
+
+def test_export_writes_exactly_one_result_file_per_data_task(tmp_path: Path):
+    db_path = tmp_path / "workspace.db"
+    first_root = tmp_path / "任务甲"
+    second_root = tmp_path / "任务乙"
+    _write_sample_episode(first_root / "episode_000001")
+    _write_sample_episode(second_root / "episode_000001")
+    scan_data_source(db_path, first_root)
+    scan_data_source(db_path, second_root)
+
+    export_root = tmp_path / "exports"
+    result = export_workspace(db_path, export_root, export_format="json")
+
+    assert result["task_count"] == 2
+    assert result["episode_count"] == 2
+    assert {Path(path).name for path in result["output_files"]} == {
+        "任务甲_标注结果.json",
+        "任务乙_标注结果.json",
+    }
+    assert {path.name for path in export_root.iterdir()} == {
+        "任务甲_标注结果.json",
+        "任务乙_标注结果.json",
+    }
+    for task in result["tasks"]:
+        document = json.loads(Path(task["output_file"]).read_text(encoding="utf-8"))
+        assert document["task_name"] == task["task_name"]
+        assert document["episode_count"] == 1
+        assert len(document["episodes"]) == 1
+        assert {item["source_root"] for item in document["episodes"]} == set(document["source_directories"])
+
+
+def test_qc_tasks_isolate_episode_lists_and_reuse_same_source(tmp_path: Path):
+    db_path = tmp_path / "workspace.db"
+    first_root = tmp_path / "资产甲"
+    second_root = tmp_path / "资产乙"
+    _write_sample_episode(first_root / "episode_000001")
+    _write_sample_episode(second_root / "episode_000001")
+
+    first = scan_data_source(db_path, first_root)
+    second = scan_data_source(db_path, second_root)
+
+    tasks = list_qc_tasks(db_path)
+    assert len(tasks) == 2
+    assert {item["task_name"] for item in tasks} == {"资产甲", "资产乙"}
+    assert all(item["episode_count"] == 1 for item in tasks)
+    assert workspace_state(db_path, task_id=first["task_id"])["selected_task"]["task_name"] == "资产甲"
+    assert [
+        item["episode_name"] for item in workspace_state(db_path, task_id=first["task_id"])["episodes"]
+    ] == ["episode_000001"]
+    assert all(
+        item["task_id"] == first["task_id"]
+        for item in workspace_state(db_path, task_id=first["task_id"])["episodes"]
+    )
+    assert len(workspace_state(db_path)["episodes"]) == 2
+
+    rescanned = scan_data_source(db_path, first_root)
+    assert rescanned["existing_task"] is True
+    assert rescanned["task_id"] == first["task_id"]
+    assert len(list_qc_tasks(db_path)) == 2
+
+    exported = export_workspace(
+        db_path,
+        tmp_path / "task-export",
+        task_id=second["task_id"],
+    )
+    assert exported["task_id"] == second["task_id"]
+    assert exported["task_name"] == "资产乙"
+    assert exported["episode_count"] == 1
+
+
+def test_client_worker_task_mirrors_metadata_and_keeps_central_review_state(tmp_path: Path):
+    worker_db = tmp_path / "worker" / "workspace.db"
+    central_db = tmp_path / "central" / "workspace.db"
+    source_root = tmp_path / "客户端电脑" / "本地数据"
+    _write_sample_episode(source_root / "episode_000001")
+    indexed = scan_data_source(worker_db, source_root)
+    manifest = qc_task_manifest(worker_db, indexed["task_id"])
+    worker = {
+        "id": "wrk_" + "1" * 24,
+        "name": "质检电脑-01",
+        "url": "http://127.0.0.1:8766",
+    }
+
+    registered = register_worker_task(central_db, worker=worker, manifest=manifest)
+
+    assert registered["ready"] == 1
+    assert registered["failed"] == 0
+    assert registered["task"]["source_type"] == "client_worker"
+    assert registered["task"]["worker_id"] == worker["id"]
+    assert registered["task"]["remote_task_id"] == indexed["task_id"]
+    state = workspace_state(central_db, task_id=registered["task_id"])
+    assert len(state["episodes"]) == 1
+    mirrored_episode = state["episodes"][0]
+    remote_episode = manifest["episodes"][0]["episode"]
+    assert mirrored_episode["id"] != remote_episode["id"]
+    assert mirrored_episode["remote_episode_id"] == remote_episode["id"]
+    assert mirrored_episode["source_type"] == "client_worker"
+    detail = episode_detail(central_db, mirrored_episode["id"])
+    assert {item["remote_stream_id"] for item in detail["streams"]} == {
+        item["id"] for item in manifest["episodes"][0]["streams"]
+    }
+
+    update_episode_review(
+        central_db,
+        mirrored_episode["id"],
+        review_status="completed",
+        quality_decision="pass",
+        reviewer_name="中央质检员",
+    )
+    refreshed = register_worker_task(central_db, worker=worker, manifest=manifest)
+    preserved = episode_detail(central_db, mirrored_episode["id"])["episode"]
+    assert refreshed["existing_task"] is True
+    assert preserved["review_status"] == "completed"
+    assert preserved["quality_decision"] == "pass"
+    assert preserved["reviewer_name"] == "中央质检员"
+
+    with pytest.raises(ValueError, match="Data Worker"):
+        rescan_qc_task(central_db, registered["task_id"])
+    with pytest.raises(ValueError, match="本机"):
+        register_worker_task(
+            central_db,
+            worker={**worker, "url": "http://10.1.11.155:8766"},
+            manifest=manifest,
+        )
+def test_schema_v1_data_source_is_migrated_to_qc_task(tmp_path: Path):
+    db_path = tmp_path / "legacy.db"
+    source_root = tmp_path / "旧资产"
+    with sqlite3.connect(db_path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE workspace (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL, reviewer_name TEXT NOT NULL DEFAULT '',
+                active_label_set_id TEXT, settings_json TEXT NOT NULL DEFAULT '{}',
+                schema_version INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE TABLE data_source (
+                id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL REFERENCES workspace(id),
+                root_path TEXT NOT NULL UNIQUE, profile_id TEXT, profile_json TEXT NOT NULL DEFAULT '{}',
+                enabled INTEGER NOT NULL DEFAULT 1, last_scanned_at TEXT, created_at TEXT NOT NULL
+            );
+            """
+        )
+        connection.execute(
+            "INSERT INTO workspace VALUES ('ws_legacy', '旧工作区', '', NULL, '{}', 1, '2026-08-01T00:00:00+00:00', '2026-08-01T00:00:00+00:00')"
+        )
+        connection.execute(
+            "INSERT INTO data_source VALUES ('src_legacy', 'ws_legacy', ?, NULL, '{}', 1, '2026-08-01T01:00:00+00:00', '2026-08-01T00:00:00+00:00')",
+            (str(source_root),),
+        )
+
+    workspace = initialize_workspace(db_path)
+    tasks = list_qc_tasks(db_path)
+
+    assert workspace["schema_version"] == 2
+    assert len(tasks) == 1
+    assert tasks[0]["task_name"] == "旧资产"
+    assert tasks[0]["local_source_path"] == str(source_root)
+    with sqlite3.connect(db_path) as connection:
+        assert connection.execute("SELECT task_id FROM data_source").fetchone()[0] == tasks[0]["id"]
 
 
 def test_v1_bad_episode_does_not_block_valid_episode(tmp_path: Path):
@@ -247,6 +439,138 @@ def test_v1_label_schema_supports_json_and_csv(tmp_path: Path):
     label = csv_preview["schema"]["labels"][0]
     assert label["annotation_scopes"] == ["time_range", "time_point"]
     assert label["target_types"] == ["camera"]
+
+
+def test_simple_chinese_label_template_fills_internal_defaults_and_imports(tmp_path: Path):
+    schema_path = tmp_path / "标注规范.yaml"
+    schema_path.write_text(
+        """标签库名称: 洗衣机任务标签
+版本: "2.0"
+标签:
+  - 编码: unnatural_motion
+    名称: 动作不自然
+  - 编码: clothes_drop
+    名称: 衣物掉落
+    分组: 衣物处理
+    说明: 衣物从手中或目标位置掉落
+    范围: 时间点、区间
+    对象: 画面、动捕
+    严重程度: 严重
+    处理建议: 待复核
+""",
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "workspace.db"
+
+    preview = preview_label_schema(db_path, schema_path)
+
+    assert preview["valid"] is True
+    assert preview["template_mode"] == "simple"
+    assert preview["schema"]["schema"]["label_set_name"] == "洗衣机任务标签"
+    minimal, detailed = preview["schema"]["labels"]
+    assert minimal["code"] == "unnatural_motion"
+    assert minimal["annotation_scopes"] == ["time_range", "time_point", "episode"]
+    assert minimal["target_types"] == ["global"]
+    assert minimal["default_severity"] == "normal"
+    assert minimal["default_action"] == "keep_with_label"
+    assert detailed["annotation_scopes"] == ["time_point", "time_range"]
+    assert detailed["target_types"] == ["camera", "mocap"]
+    assert detailed["default_severity"] == "critical"
+    assert detailed["default_action"] == "review"
+
+    imported = import_label_schema(db_path, schema_path)
+    active = workspace_state(db_path)["label_schema"]
+    assert imported["active"] is True
+    assert active["schema"]["label_set_name"] == "洗衣机任务标签"
+    assert [item["name"] for item in active["labels"]] == ["动作不自然", "衣物掉落"]
+
+
+def test_simple_chinese_label_template_reports_plain_language_errors(tmp_path: Path):
+    schema_path = tmp_path / "错误模板.yaml"
+    schema_path.write_text(
+        """标签库名称: 测试标签
+标签:
+  - 编码: clothes_drop
+    名称: 衣物掉落
+    范围: 一小会儿
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="标签“衣物掉落”的范围“一小会儿”无法识别；可填写：区间、时间点、整条、全部",
+    ):
+        preview_label_schema(tmp_path / "workspace.db", schema_path)
+
+
+@pytest.mark.parametrize(
+    ("label", "message"),
+    [
+        ("名称: 衣物掉落", "标签“衣物掉落”没有填写“编码”"),
+        (
+            "编码: 衣物-掉落\n    名称: 衣物掉落",
+            "标签“衣物掉落”的编码“衣物-掉落”格式不正确",
+        ),
+        (
+            "编码: ClothesDrop\n    名称: 衣物掉落",
+            "标签“衣物掉落”的编码“ClothesDrop”格式不正确",
+        ),
+    ],
+)
+def test_simple_chinese_label_template_requires_readable_code(
+    tmp_path: Path, label: str, message: str
+):
+    schema_path = tmp_path / "编码错误.yaml"
+    schema_path.write_text(
+        f"标签库名称: 测试标签\n标签:\n  - {label}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=re.escape(message)):
+        preview_label_schema(tmp_path / "workspace.db", schema_path)
+
+
+def test_simple_chinese_csv_template_uses_readable_columns(tmp_path: Path):
+    csv_path = tmp_path / "洗衣机标签.csv"
+    csv_path.write_text(
+        "编码,标签名称,分组,判断标准,范围,对象,严重程度,处理建议\n"
+        "clothes_drop,衣物掉落,衣物处理,衣物从手中掉落,时间点或区间,画面,严重,待复核\n",
+        encoding="utf-8",
+    )
+
+    preview = preview_label_schema(tmp_path / "workspace.db", csv_path)
+
+    assert preview["valid"] is True
+    assert preview["template_mode"] == "simple"
+    label = preview["schema"]["labels"][0]
+    assert label["code"] == "clothes_drop"
+    assert label["name"] == "衣物掉落"
+    assert label["annotation_scopes"] == ["time_point", "time_range"]
+    assert label["target_types"] == ["camera"]
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "expected_count"),
+    [
+        ("app/renderer/label-template-simple.yaml", 6),
+        ("mocap_qc_v1_design_bundle/label_templates/washing_machine_task_qc_simple.yaml", 9),
+        ("mocap_qc_v1_design_bundle/label_templates/washing_machine_task_qc_simple.csv", 9),
+    ],
+)
+def test_shipped_simple_label_templates_are_importable(
+    tmp_path: Path, relative_path: str, expected_count: int
+):
+    project_root = Path(__file__).resolve().parents[1]
+
+    preview = preview_label_schema(
+        tmp_path / f"workspace-{expected_count}-{Path(relative_path).suffix}.db",
+        project_root / relative_path,
+    )
+
+    assert preview["valid"] is True
+    assert preview["template_mode"] == "simple"
+    assert len(preview["schema"]["labels"]) == expected_count
 
 
 def test_v1_annotation_rejects_out_of_bounds_time(tmp_path: Path):

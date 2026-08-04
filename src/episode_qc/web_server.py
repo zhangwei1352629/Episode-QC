@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import hmac
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import ipaddress
 import json
 import mimetypes
 import os
@@ -12,10 +13,11 @@ from pathlib import Path
 import queue
 import re
 import secrets
+import socket
 import threading
 import traceback
 from typing import Any
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 import webbrowser
 
 from episode_qc.playback import (
@@ -30,8 +32,12 @@ from episode_qc.workspace import (
     export_workspace,
     import_label_schema,
     initialize_workspace,
+    list_qc_tasks,
     preview_label_schema,
+    qc_task_manifest,
+    register_worker_task,
     redo_annotation_change,
+    rescan_qc_task,
     save_annotation,
     scan_data_source,
     undo_annotation_change,
@@ -44,6 +50,10 @@ from episode_qc.workspace import (
 
 ENTITY_ID = re.compile(r"^(?:ep|str|ann)_[a-f0-9]{24,32}$")
 ACTION_KEYS = {"policy", "policy_target", "soma"}
+WEB_TOKEN_FILE = ".web-token"
+WORKER_ID_FILE = ".worker-id"
+LOCAL_WEB_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+WILDCARD_WEB_HOSTS = frozenset({"0.0.0.0", "::"})
 
 
 @dataclass(frozen=True)
@@ -79,11 +89,30 @@ def default_web_paths(workspace_root: str | Path | None = None) -> WebPaths:
             else project_root / "mocap_qc_v1_design_bundle" / "data_profile_v1.example.yaml"
         ),
         default_label_schema=(
-            packaged_defaults / "label_schema_v1.example.yaml"
-            if packaged_defaults.is_dir()
-            else project_root / "mocap_qc_v1_design_bundle" / "label_schema_v1.example.yaml"
+            packaged_static / "label-template-simple.yaml"
+            if packaged_static.is_dir()
+            else project_root / "app" / "renderer" / "label-template-simple.yaml"
         ),
     )
+
+
+def persistent_web_token(workspace_root: Path) -> str:
+    """Return a stable local token so open QC pages survive server restarts."""
+    workspace_root.mkdir(parents=True, exist_ok=True)
+    token_path = workspace_root / WEB_TOKEN_FILE
+    configured = os.environ.get("EPISODE_QC_WEB_TOKEN", "").strip()
+    if configured:
+        token = configured
+    elif token_path.is_file():
+        token = token_path.read_text(encoding="utf-8").strip()
+        if token:
+            return token
+        token = secrets.token_urlsafe(32)
+    else:
+        token = secrets.token_urlsafe(32)
+    token_path.write_text(f"{token}\n", encoding="utf-8")
+    token_path.chmod(0o600)
+    return token
 
 
 class EventHub:
@@ -173,7 +202,13 @@ class PlaybackRegistry:
 
 
 class EpisodeQcWebApplication:
-    def __init__(self, paths: WebPaths, *, token: str | None = None) -> None:
+    def __init__(
+        self,
+        paths: WebPaths,
+        *,
+        token: str | None = None,
+        worker_info: dict[str, str] | None = None,
+    ) -> None:
         self.paths = paths
         self.token = token or secrets.token_urlsafe(32)
         self.events = EventHub()
@@ -183,17 +218,21 @@ class EpisodeQcWebApplication:
         self._jobs: set[str] = set()
         self._jobs_lock = threading.Lock()
         self.session_id = f"web-{self.token[:12]}"
+        self.worker_info = worker_info
         paths.root.mkdir(parents=True, exist_ok=True)
         initialize_workspace(paths.db_path)
 
     def close(self) -> None:
         self._executor.shutdown(wait=False, cancel_futures=True)
 
-    def get_workspace_state(self) -> dict[str, object]:
-        state = workspace_state(self.paths.db_path)
+    def get_workspace_state(self, task_id: str | None = None) -> dict[str, object]:
+        if task_id is None:
+            tasks = list_qc_tasks(self.paths.db_path)
+            task_id = str(tasks[0]["id"]) if tasks else None
+        state = workspace_state(self.paths.db_path, task_id=task_id)
         if not state.get("label_schema") and self.paths.default_label_schema.is_file():
             import_label_schema(self.paths.db_path, self.paths.default_label_schema)
-            state = workspace_state(self.paths.db_path)
+            state = workspace_state(self.paths.db_path, task_id=task_id)
         return state
 
     def update_settings(self, request: dict[str, object]) -> dict[str, object]:
@@ -202,7 +241,30 @@ class EpisodeQcWebApplication:
             name=request.get("name") if isinstance(request.get("name"), str) else None,
             reviewer_name=request.get("reviewer") if isinstance(request.get("reviewer"), str) else None,
             last_episode_id=request.get("lastEpisodeId") if isinstance(request.get("lastEpisodeId"), str) else None,
+            task_id=request.get("taskId") if isinstance(request.get("taskId"), str) else None,
         )
+
+    def get_tasks(self) -> dict[str, object]:
+        return {"tasks": list_qc_tasks(self.paths.db_path)}
+
+    def get_worker_info(self) -> dict[str, object]:
+        if self.worker_info is None:
+            raise KeyError("当前服务不是客户端 Data Worker")
+        return {"worker": self.worker_info}
+
+    def get_task_manifest(self, task_id: str) -> dict[str, object]:
+        if self.worker_info is None:
+            raise KeyError("任务清单接口只在客户端 Data Worker 中开放")
+        return qc_task_manifest(self.paths.db_path, task_id)
+
+    def register_worker_source(self, request: dict[str, object]) -> dict[str, object]:
+        if self.worker_info is not None:
+            raise ValueError("Data Worker 不能作为中央 QC 服务注册其他 Worker")
+        worker = request.get("worker")
+        manifest = request.get("manifest")
+        if not isinstance(worker, dict) or not isinstance(manifest, dict):
+            raise ValueError("客户端 Worker 注册信息无效")
+        return register_worker_task(self.paths.db_path, worker=worker, manifest=manifest)
 
     def add_source(self, request: dict[str, object]) -> dict[str, object]:
         root_path = request.get("rootPath")
@@ -211,7 +273,14 @@ class EpisodeQcWebApplication:
         profile_path = self.paths.default_profile if self.paths.default_profile.is_file() else None
         return scan_data_source(self.paths.db_path, root_path, profile_path=profile_path)
 
+    def rescan_task(self, task_id: str) -> dict[str, object]:
+        profile_path = self.paths.default_profile if self.paths.default_profile.is_file() else None
+        return rescan_qc_task(self.paths.db_path, task_id, profile_path=profile_path)
+
     def prepare_episode(self, episode_id: str) -> dict[str, object]:
+        detail = episode_detail(self.paths.db_path, episode_id)
+        if detail["episode"].get("source_type") == "client_worker":
+            raise ValueError("此任务的数据在客户端电脑上，请启动该电脑的 Data Worker 后播放")
         result = prepare_episode_cache(
             self.paths.db_path,
             episode_id,
@@ -270,7 +339,7 @@ class EpisodeQcWebApplication:
     def export(self, request: dict[str, object]) -> dict[str, object]:
         output_parent = request.get("outputParent") or os.environ.get("EPISODE_QC_EXPORT_ROOT")
         if not isinstance(output_parent, str) or not output_parent.strip():
-            raise ValueError("请输入导出目录")
+            raise ValueError("请输入标注结果保存目录")
         episode_ids = request.get("episodeIds") or []
         if not isinstance(episode_ids, list) or not all(isinstance(item, str) for item in episode_ids):
             raise ValueError("Episode ID 列表无效")
@@ -279,6 +348,8 @@ class EpisodeQcWebApplication:
             output_parent,
             episode_ids=episode_ids,
             completed_only=bool(request.get("completedOnly")),
+            export_format=str(request.get("format") or "json"),
+            task_id=request.get("taskId") if isinstance(request.get("taskId"), str) else None,
         )
 
     def _queue_full_cache(self, episode_id: str) -> None:
@@ -308,9 +379,29 @@ class EpisodeQcWebApplication:
 class EpisodeQcWebServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, server_address: tuple[str, int], application: EpisodeQcWebApplication) -> None:
+    def __init__(
+        self,
+        server_address: tuple[str, int],
+        application: EpisodeQcWebApplication,
+        *,
+        allowed_hosts: frozenset[str],
+        public_hosts: tuple[str, ...],
+        cors_origins: frozenset[str],
+    ) -> None:
         self.application = application
+        self.allowed_hosts = allowed_hosts
+        self.public_hosts = public_hosts
+        self.cors_origins = cors_origins
         super().__init__(server_address, EpisodeQcRequestHandler)
+
+    @property
+    def allowed_origins(self) -> frozenset[str]:
+        port = self.server_address[1]
+        return frozenset(_http_origin(host, port) for host in self.allowed_hosts)
+
+    @property
+    def api_origins(self) -> frozenset[str]:
+        return self.allowed_origins | self.cors_origins
 
     def server_close(self) -> None:
         self.application.close()
@@ -334,6 +425,22 @@ class EpisodeQcRequestHandler(BaseHTTPRequestHandler):
     def do_DELETE(self) -> None:  # noqa: N802
         self._dispatch("DELETE")
 
+    def do_OPTIONS(self) -> None:  # noqa: N802
+        try:
+            self._assert_allowed_host()
+            origin = self.headers.get("Origin", "")
+            if origin not in self.server.cors_origins:  # type: ignore[attr-defined]
+                raise PermissionError("跨域来源未授权")
+            self.send_response(HTTPStatus.NO_CONTENT)
+            self._send_cors_headers()
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Episode-QC-Token")
+            self.send_header("Access-Control-Max-Age", "600")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        except PermissionError as exc:
+            self._send_json({"error": str(exc)}, HTTPStatus.UNAUTHORIZED)
+
     def log_message(self, format_string: str, *args: object) -> None:
         if self.path.startswith("/api/") and not self.path.startswith("/api/events"):
             super().log_message(format_string, *args)
@@ -341,16 +448,23 @@ class EpisodeQcRequestHandler(BaseHTTPRequestHandler):
     def _dispatch(self, method: str) -> None:
         try:
             parsed = urlsplit(self.path)
+            self._assert_allowed_host()
             if parsed.path.startswith("/api/"):
                 self._assert_api_access(parsed)
                 self._route_api(method, parsed.path, parse_qs(parsed.query))
             elif method == "GET":
-                self._serve_static(parsed.path)
+                if not self._redirect_entry_with_current_token(parsed):
+                    self._serve_static(parsed.path)
             else:
                 self._send_json({"error": "方法不允许"}, HTTPStatus.METHOD_NOT_ALLOWED)
         except BrokenPipeError:
             pass
         except PermissionError as exc:
+            if method in {"POST", "DELETE"}:
+                try:
+                    self._discard_body()
+                except (OSError, ValueError):
+                    self.close_connection = True
             self._send_json({"error": str(exc)}, HTTPStatus.UNAUTHORIZED)
         except WorkspaceConflictError as exc:
             self._send_json({"error": str(exc)}, HTTPStatus.CONFLICT)
@@ -363,19 +477,46 @@ class EpisodeQcRequestHandler(BaseHTTPRequestHandler):
             self._send_json({"error": f"{type(exc).__name__}: {exc}"}, HTTPStatus.INTERNAL_SERVER_ERROR)
 
     def _assert_api_access(self, parsed: Any) -> None:
-        host = self.headers.get("Host", "").split(":", 1)[0].strip("[]").lower()
-        if host not in {"127.0.0.1", "localhost", "::1"}:
-            raise PermissionError("拒绝非本机 Host")
         query_token = parse_qs(parsed.query).get("token", [""])[0]
         supplied = self.headers.get("X-Episode-QC-Token", "") or query_token
         if not hmac.compare_digest(supplied, self.application.token):
             raise PermissionError("访问令牌无效")
         origin = self.headers.get("Origin")
         if self.command != "GET" and origin:
-            port = self.server.server_address[1]  # type: ignore[attr-defined]
-            allowed = {f"http://127.0.0.1:{port}", f"http://localhost:{port}"}
-            if origin not in allowed:
+            if origin not in self.server.api_origins:  # type: ignore[attr-defined]
                 raise PermissionError("请求 Origin 无效")
+
+    def _assert_allowed_host(self) -> None:
+        raw_host = self.headers.get("Host", "")
+        try:
+            parsed = urlsplit(f"//{raw_host}")
+            host = _normalize_web_host(parsed.hostname or "")
+            _ = parsed.port
+        except ValueError as exc:
+            raise PermissionError("请求 Host 无效") from exc
+        if (
+            parsed.username
+            or parsed.password
+            or parsed.path
+            or parsed.query
+            or parsed.fragment
+            or host not in self.server.allowed_hosts  # type: ignore[attr-defined]
+        ):
+            raise PermissionError("拒绝未授权 Host")
+
+    def _redirect_entry_with_current_token(self, parsed: Any) -> bool:
+        if parsed.path not in {"", "/"}:
+            return False
+        supplied = parse_qs(parsed.query).get("token", [""])[0]
+        if hmac.compare_digest(supplied, self.application.token):
+            return False
+        location = f"/?token={quote(self.application.token, safe='')}"
+        self.send_response(HTTPStatus.TEMPORARY_REDIRECT)
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        return True
 
     def _route_api(self, method: str, path: str, query: dict[str, list[str]]) -> None:
         app = self.application
@@ -383,13 +524,32 @@ class EpisodeQcRequestHandler(BaseHTTPRequestHandler):
             self._send_json({"ok": True})
             return
         if method == "GET" and path == "/api/workspace":
-            self._send_json(app.get_workspace_state())
+            task_id = query.get("task_id", [None])[0]
+            self._send_json(app.get_workspace_state(task_id))
             return
         if method == "POST" and path == "/api/workspace/settings":
             self._send_json(app.update_settings(self._json_body()))
             return
-        if method == "POST" and path == "/api/sources":
+        if method == "GET" and path == "/api/tasks":
+            self._send_json(app.get_tasks())
+            return
+        if method == "GET" and path == "/api/worker/info":
+            self._send_json(app.get_worker_info())
+            return
+        if method == "POST" and path == "/api/tasks/register-worker":
+            self._send_json(app.register_worker_source(self._json_body()))
+            return
+        if method == "POST" and path in {"/api/sources", "/api/tasks/import"}:
             self._send_json(app.add_source(self._json_body()))
+            return
+        task_rescan_match = re.fullmatch(r"/api/tasks/(tsk_[a-f0-9]{24,32})/rescan", path)
+        if method == "POST" and task_rescan_match:
+            self._discard_body()
+            self._send_json(app.rescan_task(task_rescan_match.group(1)))
+            return
+        task_manifest_match = re.fullmatch(r"/api/tasks/(tsk_[a-f0-9]{24,32})/manifest", path)
+        if method == "GET" and task_manifest_match:
+            self._send_json(app.get_task_manifest(task_manifest_match.group(1)))
             return
         if method == "GET" and path == "/api/events":
             self._serve_events()
@@ -473,6 +633,7 @@ class EpisodeQcRequestHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
             self.send_header("Cache-Control", "no-cache, no-transform")
             self.send_header("Connection", "keep-alive")
+            self._send_cors_headers()
             self.end_headers()
             while True:
                 try:
@@ -529,6 +690,7 @@ class EpisodeQcRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(payload)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
+        self._send_cors_headers()
         self.end_headers()
         self.wfile.write(payload)
 
@@ -542,6 +704,7 @@ class EpisodeQcRequestHandler(BaseHTTPRequestHandler):
         self.send_header("X-Frame-Index", str(metadata["frame_index"]))
         self.send_header("X-End-Of-Stream", "1" if metadata["end_of_stream"] else "0")
         self.send_header("X-Content-Type-Options", "nosniff")
+        self._send_cors_headers()
         self.end_headers()
         self.wfile.write(payload)
 
@@ -549,7 +712,18 @@ class EpisodeQcRequestHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Length", "0")
         self.send_header("Cache-Control", "no-store")
+        self._send_cors_headers()
         self.end_headers()
+
+    def _send_cors_headers(self) -> None:
+        origin = self.headers.get("Origin", "")
+        if origin and origin in self.server.cors_origins:  # type: ignore[attr-defined]
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header(
+                "Access-Control-Expose-Headers",
+                "X-Frame-Offset-Ns, X-Frame-Skew-Ns, X-Frame-Index, X-End-Of-Stream",
+            )
+            self.send_header("Vary", "Origin")
 
 
 def create_web_server(
@@ -557,13 +731,32 @@ def create_web_server(
     *,
     port: int = 0,
     token: str | None = None,
+    host: str = "127.0.0.1",
+    public_hosts: tuple[str, ...] = (),
+    cors_origins: tuple[str, ...] = (),
+    worker_info: dict[str, str] | None = None,
 ) -> EpisodeQcWebServer:
     if not 0 <= port <= 65535:
         raise ValueError("端口必须在 0 到 65535 之间")
     if not paths.static_root.is_dir():
         raise FileNotFoundError(f"Web 静态资源目录不存在: {paths.static_root}")
-    application = EpisodeQcWebApplication(paths, token=token)
-    return EpisodeQcWebServer(("127.0.0.1", port), application)
+    bind_host = _normalize_web_host(host)
+    normalized_public_hosts = tuple(dict.fromkeys(_normalize_web_host(item) for item in public_hosts))
+    if bind_host in WILDCARD_WEB_HOSTS and not normalized_public_hosts:
+        raise ValueError("监听全部网卡时至少需要一个 --public-host")
+    if any(item in WILDCARD_WEB_HOSTS for item in normalized_public_hosts):
+        raise ValueError("--public-host 必须是可访问的具体 IP 地址或主机名")
+    advertised_hosts = normalized_public_hosts or (bind_host,)
+    allowed_hosts = frozenset(LOCAL_WEB_HOSTS | set(advertised_hosts))
+    normalized_cors_origins = frozenset(_normalize_http_origin(item) for item in cors_origins)
+    application = EpisodeQcWebApplication(paths, token=token, worker_info=worker_info)
+    return EpisodeQcWebServer(
+        (bind_host, port),
+        application,
+        allowed_hosts=allowed_hosts,
+        public_hosts=advertised_hosts,
+        cors_origins=normalized_cors_origins,
+    )
 
 
 def serve_web_app(
@@ -571,19 +764,98 @@ def serve_web_app(
     port: int = 0,
     workspace_root: str | Path | None = None,
     open_browser: bool = True,
+    host: str = "127.0.0.1",
+    public_hosts: tuple[str, ...] = (),
+    cors_origins: tuple[str, ...] = (),
+    worker_info: dict[str, str] | None = None,
+    print_token: bool = False,
 ) -> None:
-    server = create_web_server(default_web_paths(workspace_root), port=port)
+    paths = default_web_paths(workspace_root)
+    server = create_web_server(
+        paths,
+        port=port,
+        token=persistent_web_token(paths.root),
+        host=host,
+        public_hosts=public_hosts,
+        cors_origins=cors_origins,
+        worker_info=worker_info,
+    )
     actual_port = server.server_address[1]
-    url = f"http://127.0.0.1:{actual_port}/?token={server.application.token}"
-    print(f"Episode QC Web: {url}", flush=True)
+    entry_urls = [f"{_http_origin(item, actual_port)}/" for item in server.public_hosts]
+    browser_url = f"{entry_urls[0]}?token={quote(server.application.token, safe='')}"
+    print("Episode QC Web:", flush=True)
+    for entry_url in entry_urls:
+        print(f"  {entry_url}", flush=True)
+    if any(item not in LOCAL_WEB_HOSTS for item in server.public_hosts):
+        print("警告：局域网直达模式已开启；同网段用户打开上述地址后将获得完整质检权限。", flush=True)
+    if print_token:
+        print(f"访问令牌：{server.application.token}", flush=True)
     if open_browser:
-        threading.Timer(0.25, webbrowser.open, args=(url,)).start()
+        threading.Timer(0.25, webbrowser.open, args=(browser_url,)).start()
     try:
         server.serve_forever(poll_interval=0.25)
     except KeyboardInterrupt:
         pass
     finally:
         server.server_close()
+
+
+def _normalize_web_host(value: str) -> str:
+    candidate = str(value).strip()
+    if candidate.startswith("[") and candidate.endswith("]"):
+        candidate = candidate[1:-1]
+    if not candidate or any(character.isspace() for character in candidate):
+        raise ValueError("主机地址不能为空或包含空白")
+    try:
+        return ipaddress.ip_address(candidate).compressed.lower()
+    except ValueError:
+        if ":" in candidate or not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?", candidate):
+            raise ValueError(f"主机地址无效: {value}") from None
+        return candidate.rstrip(".").lower()
+
+
+def _http_origin(host: str, port: int) -> str:
+    rendered_host = f"[{host}]" if ":" in host else host
+    return f"http://{rendered_host}:{port}"
+
+
+def _normalize_http_origin(value: str) -> str:
+    candidate = str(value).strip().rstrip("/")
+    parsed = urlsplit(candidate)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError(f"Origin 地址无效: {value}")
+    try:
+        if parsed.port is None:
+            raise ValueError
+    except ValueError:
+        raise ValueError(f"Origin 地址必须包含有效端口: {value}") from None
+    return candidate
+
+
+def persistent_worker_identity(workspace_root: str | Path) -> dict[str, str]:
+    root = Path(workspace_root).expanduser().resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / WORKER_ID_FILE
+    worker_id = path.read_text(encoding="utf-8").strip() if path.is_file() else ""
+    if not re.fullmatch(r"wrk_[a-f0-9]{24,32}", worker_id):
+        worker_id = _worker_id()
+        temporary = path.with_name(f".{path.name}.{secrets.token_hex(6)}.tmp")
+        temporary.write_text(worker_id + "\n", encoding="utf-8")
+        os.chmod(temporary, 0o600)
+        temporary.replace(path)
+    return {"id": worker_id, "name": socket.gethostname()}
+
+
+def _worker_id() -> str:
+    return f"wrk_{secrets.token_hex(12)}"
 
 
 def _manifest_has_indices(manifest: dict[str, object]) -> bool:

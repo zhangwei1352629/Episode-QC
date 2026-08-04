@@ -1,10 +1,15 @@
 import { G1Viewer } from "./g1-viewer.bundle.js";
+import {
+  labelSupportsTarget,
+  resolveSelectedTarget,
+  targetTypesDescription,
+} from "./target-selection.mjs";
 
 const $ = (id) => document.getElementById(id);
 
 const els = {
   workspaceName: $("workspace-name"), reviewerName: $("reviewer-name"), importLabels: $("import-labels"),
-  exportResults: $("export-results"), addSource: $("add-source"), saveState: $("save-state"),
+  exportFormat: $("export-format"), exportResults: $("export-results"), addSource: $("add-source"), saveState: $("save-state"),
   episodeTotal: $("episode-total"), episodeDone: $("episode-done"), episodeErrors: $("episode-errors"),
   episodeSearch: $("episode-search"), statusFilter: $("status-filter"), episodeList: $("episode-list"),
   currentEpisode: $("current-episode"), episodeMeta: $("episode-meta"), previousEpisode: $("previous-episode"),
@@ -22,17 +27,27 @@ const els = {
   needsRecheck: $("needs-recheck"), toastStack: $("toast-stack"), annotationEditor: $("annotation-editor"),
   editId: $("edit-id"), editStart: $("edit-start"), editEnd: $("edit-end"), editSeverity: $("edit-severity"),
   editAction: $("edit-action"), editComment: $("edit-comment"), deleteAnnotation: $("delete-annotation"),
-  saveEdit: $("save-edit")
+  saveEdit: $("save-edit"), currentTaskName: $("current-task-name"), currentTaskCode: $("current-task-code"),
+  currentTaskPath: $("current-task-path"), currentTaskStatus: $("current-task-status"),
+  openTaskCenter: $("open-task-center"), rescanTask: $("rescan-task"), taskCenter: $("task-center"),
+  closeTaskCenter: $("close-task-center"), taskCenterSummary: $("task-center-summary"),
+  taskList: $("task-list"), taskCenterImport: $("task-center-import")
 };
 
 const state = {
   workspace: null,
+  tasks: [],
+  currentTask: null,
+  currentTaskId: null,
   episodes: [],
   filteredEpisodes: [],
   labelSchema: null,
   detail: null,
   cache: null,
   currentEpisodeId: null,
+  playbackEpisodeId: null,
+  dataProvider: null,
+  workerEventsClose: null,
   loadToken: 0,
   playheadNs: 0,
   durationNs: 0,
@@ -46,6 +61,7 @@ const state = {
   scope: "time_range",
   selectedCameraId: null,
   selectedJoint: null,
+  selectedBaseTarget: "global",
   motionFrame: null,
   robotActionFrame: null,
   motionSource: "policy",
@@ -77,10 +93,20 @@ async function initialize() {
   bindEvents();
   setSaveState("saving", "打开中…");
   try {
-    await refreshWorkspace();
+    const taskPayload = await window.episodeQc.getTasks();
+    state.tasks = taskPayload.tasks || [];
+    const savedTaskId = window.localStorage.getItem("episodeQcActiveTaskId");
+    state.currentTaskId = state.tasks.some((item) => item.id === savedTaskId)
+      ? savedTaskId
+      : state.tasks.find((item) => item.last_episode_id)?.id || state.tasks[0]?.id || null;
+    await refreshWorkspace({ preserveEpisode: false });
     setSaveState("saved", "已保存");
-    const recentEpisodeId = state.workspace?.settings?.last_episode_id;
-    if (recentEpisodeId && state.episodes.some((item) => item.id === recentEpisodeId)) openEpisode(recentEpisodeId);
+    const recentEpisodeId = state.currentTask?.last_episode_id;
+    if (recentEpisodeId && state.episodes.some((item) => item.id === recentEpisodeId)) {
+      openEpisode(recentEpisodeId);
+    } else if (state.episodes.length) {
+      openEpisode(state.episodes[0].id);
+    }
   } catch (error) {
     setSaveState("error", "打开失败");
     toast(error.message || String(error), "error", 7000);
@@ -89,12 +115,18 @@ async function initialize() {
 }
 
 async function refreshWorkspace({ preserveEpisode = true } = {}) {
-  const payload = await window.episodeQc.getWorkspaceState();
+  const payload = await window.episodeQc.getWorkspaceState(state.currentTaskId);
   state.workspace = payload.workspace;
+  state.tasks = payload.tasks || [];
+  state.currentTask = payload.selected_task || null;
+  state.currentTaskId = state.currentTask?.id || null;
   state.episodes = payload.episodes || [];
   state.labelSchema = payload.label_schema;
+  if (state.currentTaskId) window.localStorage.setItem("episodeQcActiveTaskId", state.currentTaskId);
+  else window.localStorage.removeItem("episodeQcActiveTaskId");
   els.workspaceName.textContent = payload.workspace.name;
   if (document.activeElement !== els.reviewerName) els.reviewerName.value = payload.workspace.reviewer_name || "";
+  renderTaskContext();
   renderEpisodeList();
   renderLabels();
   if (!preserveEpisode || !state.episodes.some((item) => item.id === state.currentEpisodeId)) {
@@ -106,6 +138,14 @@ async function refreshWorkspace({ preserveEpisode = true } = {}) {
 function bindEvents() {
   window.episodeQc.onEpisodeCacheReady(handleEpisodeCacheReady);
   els.addSource.addEventListener("click", addSource);
+  els.taskCenterImport.addEventListener("click", addSource);
+  els.openTaskCenter.addEventListener("click", () => { renderTaskContext(); els.taskCenter.showModal(); });
+  els.closeTaskCenter.addEventListener("click", () => els.taskCenter.close());
+  els.rescanTask.addEventListener("click", rescanCurrentTask);
+  els.taskList.addEventListener("click", (event) => {
+    const item = event.target.closest("[data-task-id]");
+    if (item) switchTask(item.dataset.taskId);
+  });
   els.importLabels.addEventListener("click", importLabels);
   els.exportResults.addEventListener("click", exportResults);
   els.episodeSearch.addEventListener("input", renderEpisodeList);
@@ -130,6 +170,15 @@ function bindEvents() {
   });
   els.labelSearch.addEventListener("input", renderLabels);
   els.labelGroupFilter.addEventListener("change", renderLabels);
+  els.targetContext.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-target-type]");
+    if (button) selectAnnotationTarget(button.dataset.targetType, button.dataset.targetKey || null);
+  });
+  els.targetContext.addEventListener("change", (event) => {
+    if (event.target.matches("[data-target-joint]")) {
+      selectAnnotationTarget(event.target.value ? "joint" : "mocap", event.target.value || null);
+    }
+  });
   els.labelList.addEventListener("click", (event) => {
     const button = event.target.closest("[data-label-code]");
     if (button) createAnnotation(button.dataset.labelCode);
@@ -182,11 +231,14 @@ function bindEvents() {
   els.reviewerName.addEventListener("input", scheduleReviewerSave);
   els.saveEdit.addEventListener("click", saveAnnotationEdit);
   els.deleteAnnotation.addEventListener("click", deleteCurrentAnnotation);
-  window.addEventListener("beforeunload", () => savePlayhead());
+  window.addEventListener("beforeunload", () => {
+    state.workerEventsClose?.();
+    savePlayhead();
+  });
 }
 
 function handleEpisodeCacheReady(payload) {
-  if (!payload || payload.episodeId !== state.currentEpisodeId) return;
+  if (!payload || payload.episodeId !== state.playbackEpisodeId) return;
   if (payload.error) {
     setCacheStatus("ready", "优先流可用 · 后台完整缓存失败");
     toast(`后台缓存失败：${payload.error}`, "error", 7000);
@@ -199,18 +251,129 @@ function handleEpisodeCacheReady(payload) {
   requestVisualFrames(true);
 }
 
-async function addSource() {
-  setBusyButton(els.addSource, true, "索引中…");
+function renderTaskContext() {
+  const task = state.currentTask;
+  els.currentTaskName.textContent = task?.task_name || "尚未导入任务";
+  els.currentTaskCode.textContent = task?.task_code || "—";
+  const taskPath = task?.local_source_path || task?.source_uri || "点击“导入新任务”选择数据目录";
+  els.currentTaskPath.textContent = taskPath;
+  els.currentTaskPath.title = taskPath;
+  els.currentTaskStatus.textContent = task
+    ? `${taskStatusName(task.status)} · ${task.completed_count}/${task.episode_count}`
+    : "未加载";
+  els.currentTaskStatus.dataset.status = task?.status || "empty";
+  els.rescanTask.disabled = !task;
+
+  const completedTasks = state.tasks.filter((item) => ["completed", "submitted", "archived"].includes(item.status)).length;
+  const failedTasks = state.tasks.filter((item) => item.status === "failed").length;
+  els.taskCenterSummary.innerHTML = [
+    `<span>任务 ${state.tasks.length}</span>`,
+    `<span>进行中 ${state.tasks.length - completedTasks - failedTasks}</span>`,
+    `<span>已完成 ${completedTasks}</span>`,
+    `<span>异常 ${failedTasks}</span>`,
+  ].join("");
+  if (!state.tasks.length) {
+    els.taskList.innerHTML = '<div class="empty-panel">暂无任务，导入数据目录后开始质检</div>';
+    return;
+  }
+  els.taskList.innerHTML = state.tasks.map((item) => {
+    const path = item.local_source_path || item.source_uri || "";
+    const issue = item.import_error ? ` · ${item.import_error}` : "";
+    return `
+      <button class="task-list-item ${item.id === state.currentTaskId ? "active" : ""}" data-task-id="${escapeHtml(item.id)}" type="button">
+        <span class="task-list-copy">
+          <strong>${escapeHtml(item.task_name)}</strong>
+          <small>${escapeHtml(item.task_code)} · ${escapeHtml(taskStatusName(item.status))}${escapeHtml(issue)}</small>
+          <span title="${escapeHtml(path)}">${escapeHtml(path)}</span>
+        </span>
+        <span class="task-list-progress"><strong>${item.completed_count}/${item.episode_count}</strong><span>${formatBytes(item.source_size_bytes)} · 异常 ${item.error_count}</span></span>
+      </button>`;
+  }).join("");
+}
+
+async function switchTask(taskId) {
+  if (!taskId || taskId === state.currentTaskId) {
+    els.taskCenter.close();
+    return;
+  }
+  setSaveState("saving", "切换任务…");
   try {
-    const result = await window.episodeQc.addSource();
-    if (!result) return;
-    toast(`已识别 ${result.ready}/${result.discovered} 条 Episode${result.failed ? `，${result.failed} 条失败` : ""}`, result.failed ? "error" : "success", 5500);
+    await savePlayhead();
+    state.playing = false;
+    state.currentTaskId = taskId;
+    state.currentEpisodeId = null;
+    await refreshWorkspace({ preserveEpisode: false });
+    els.taskCenter.close();
+    const episodeId = state.currentTask?.last_episode_id;
+    const targetEpisode = state.episodes.some((item) => item.id === episodeId) ? episodeId : state.episodes[0]?.id;
+    if (targetEpisode) openEpisode(targetEpisode);
+    setSaveState("saved", "已切换");
+  } catch (error) {
+    setSaveState("error", "切换失败");
+    toast(error.message || String(error), "error", 7000);
+  }
+}
+
+async function rescanCurrentTask() {
+  if (!state.currentTaskId) return;
+  setBusyButton(els.rescanTask, true, "扫描中…");
+  try {
+    const result = state.currentTask?.source_type === "client_worker"
+      ? await window.episodeQc.rescanWorkerTask(state.currentTask)
+      : await window.episodeQc.rescanTask(state.currentTaskId);
     await refreshWorkspace();
-    if (!state.currentEpisodeId && state.episodes.length) openEpisode(state.episodes[0].id);
+    toast(
+      `任务“${result.task.task_name}”扫描完成：发现 ${result.discovered}，成功 ${result.ready}，失败 ${result.failed}`,
+      result.failed ? "error" : "success",
+      6500,
+    );
   } catch (error) {
     toast(error.message || String(error), "error", 7000);
   } finally {
-    setBusyButton(els.addSource, false, "添加数据目录");
+    setBusyButton(els.rescanTask, false, "重新扫描");
+  }
+}
+
+async function addSource() {
+  setBusyButton(els.addSource, true, "导入中…");
+  setBusyButton(els.taskCenterImport, true, "导入中…");
+  try {
+    const sourceType = window.prompt(
+      "数据在哪台电脑？\n1 = 当前打开网页的电脑（推荐启动 Data Worker）\n2 = QC 服务器或服务器已挂载的 NAS",
+      "1",
+    );
+    if (sourceType === null) return;
+    if (!['1', '2'].includes(sourceType.trim())) {
+      throw new Error("请输入 1（当前电脑）或 2（QC 服务器/NAS）");
+    }
+    const result = sourceType.trim() === "1"
+      ? await window.episodeQc.addLocalWorkerSource()
+      : await window.episodeQc.addSource();
+    if (!result) return;
+    if (!result.ready) {
+      const taskPayload = await window.episodeQc.getTasks();
+      state.tasks = taskPayload.tasks || [];
+      renderTaskContext();
+      toast(`任务没有加载到可用 Episode：${result.task?.import_error || "请检查目录结构"}`, "error", 7500);
+      return;
+    }
+    state.currentTaskId = result.task_id;
+    state.currentEpisodeId = null;
+    await refreshWorkspace({ preserveEpisode: false });
+    els.taskCenter.close();
+    const targetEpisode = state.currentTask?.last_episode_id || state.episodes[0]?.id;
+    if (targetEpisode) openEpisode(targetEpisode);
+    const sourceText = result.workerName ? `；数据由当前电脑 ${result.workerName} 读取` : "";
+    toast(
+      `${result.existing_task ? "已有任务已重新扫描" : "新任务加载成功"}：${result.task.task_name}；发现 ${result.discovered}，成功 ${result.ready}，失败 ${result.failed}${sourceText}`,
+      result.failed ? "error" : "success",
+      7500,
+    );
+  } catch (error) {
+    toast(error.message || String(error), "error", 7000);
+  } finally {
+    setBusyButton(els.addSource, false, "导入新任务");
+    setBusyButton(els.taskCenterImport, false, "导入新任务");
   }
 }
 
@@ -224,8 +387,9 @@ async function importLabels() {
       return;
     }
     const preview = result.preview;
+    const templateText = preview.template_mode === "simple" ? "中文简易模板" : "高级完整模板";
     const confirmed = window.confirm(
-      `标签库 ${preview.label_set_id} ${preview.version}\n新增 ${preview.added.length}，更新 ${preview.updated.length}，不变 ${preview.unchanged.length}，保留旧标签 ${preview.preserved.length}\n\n确认导入并激活吗？`
+      `${templateText}：${preview.schema.schema.label_set_name} v${preview.version}\n新增 ${preview.added.length}，更新 ${preview.updated.length}，不变 ${preview.unchanged.length}，保留旧标签 ${preview.preserved.length}\n\n确认导入并激活吗？`
     );
     if (!confirmed) return;
     const imported = await window.episodeQc.confirmLabelSchema();
@@ -240,11 +404,19 @@ async function importLabels() {
 }
 
 async function exportResults() {
+  if (!state.currentTaskId) return toast("请先选择 QC 任务", "error");
   setBusyButton(els.exportResults, true, "导出中…");
   try {
-    const episodeIds = state.filteredEpisodes.map((item) => item.id);
-    const result = await window.episodeQc.exportWorkspace({ episodeIds });
-    if (result) toast(`已导出 ${result.episode_count} 条 Episode、${result.annotation_count} 条标注到 ${result.output_dir}`, "success", 8000);
+    const episodeIds = state.episodes.map((item) => item.id);
+    const result = await window.episodeQc.exportWorkspace({
+      taskId: state.currentTaskId,
+      episodeIds,
+      format: els.exportFormat.value,
+    });
+    if (result) {
+      const outputText = result.output_files?.join("；") || result.output_file;
+      toast(`已导出 ${result.task_count || 1} 个任务、${result.episode_count} 条 Episode、${result.annotation_count} 条标注：${outputText}`, "success", 8000);
+    }
   } catch (error) {
     toast(error.message || String(error), "error", 7000);
   } finally {
@@ -285,12 +457,17 @@ async function openEpisode(episodeId) {
   state.playing = false;
   state.cache = null;
   state.detail = null;
+  state.workerEventsClose?.();
+  state.workerEventsClose = null;
+  state.dataProvider = null;
+  state.playbackEpisodeId = null;
   state.currentEpisodeId = episodeId;
-  window.episodeQc.updateWorkspaceSettings({ lastEpisodeId: episodeId }).catch(() => {});
+  window.episodeQc.updateWorkspaceSettings({ lastEpisodeId: episodeId, taskId: state.currentTaskId }).catch(() => {});
   state.selectionStartNs = null;
   state.selectionEndNs = null;
   state.selectedCameraId = null;
   state.selectedJoint = null;
+  state.selectedBaseTarget = "global";
   state.motionFrame = null;
   state.robotActionFrame = null;
   state.motionSource = "policy";
@@ -302,12 +479,28 @@ async function openEpisode(episodeId) {
     const detail = await window.episodeQc.getEpisode(episodeId);
     if (token !== state.loadToken) return;
     state.detail = detail;
+    state.selectedBaseTarget = detail.episode.mocap_available ? "mocap" : "global";
     state.labelSchema = detail.label_schema || state.labelSchema;
     state.durationNs = Number(detail.episode.duration_ns || 0);
     state.playheadNs = Math.min(Number(detail.episode.last_playhead_ns || 0), state.durationNs);
+    if (detail.episode.source_type === "client_worker") {
+      state.dataProvider = await window.episodeQc.requireWorker(detail.episode);
+      if (token !== state.loadToken) return;
+      state.playbackEpisodeId = detail.episode.remote_episode_id;
+      if (!state.playbackEpisodeId) throw new Error("客户端任务缺少远端 Episode 映射，请重新扫描任务");
+      state.workerEventsClose = window.episodeQc.onWorkerEpisodeCacheReady(
+        state.dataProvider,
+        handleEpisodeCacheReady,
+      );
+    } else {
+      state.playbackEpisodeId = episodeId;
+    }
     renderEpisodeDetail();
-    setCacheStatus("busy", "首次打开：正在建立只读播放缓存…");
-    const cache = await window.episodeQc.prepareEpisode(episodeId);
+    setCacheStatus(
+      "busy",
+      state.dataProvider ? "正在本机建立只读播放缓存…" : "首次打开：正在建立只读播放缓存…",
+    );
+    const cache = await window.episodeQc.prepareEpisode(state.playbackEpisodeId, state.dataProvider);
     if (token !== state.loadToken) return;
     state.cache = cache;
     renderCameras();
@@ -336,7 +529,8 @@ function renderEpisodeDetail() {
   if (!state.detail) return;
   const episode = state.detail.episode;
   els.currentEpisode.textContent = episode.episode_name;
-  els.episodeMeta.textContent = `${episode.data_group} · ${episode.camera_count} 路相机 · ${episode.mocap_available ? "Mocap 可解析" : "Mocap 不可用"} · ${episode.relative_path}`;
+  const providerText = state.dataProvider ? ` · 当前电脑读取（${state.dataProvider.name}）` : "";
+  els.episodeMeta.textContent = `${episode.data_group} · ${episode.camera_count} 路相机 · ${episode.mocap_available ? "Mocap 可解析" : "Mocap 不可用"}${providerText} · ${episode.relative_path}`;
   els.durationTime.textContent = formatClock(state.durationNs);
   els.timelineEnd.textContent = formatDuration(state.durationNs / 1e9);
   renderClock();
@@ -348,6 +542,10 @@ function renderEpisodeDetail() {
 }
 
 function clearEpisodeView() {
+  state.workerEventsClose?.();
+  state.workerEventsClose = null;
+  state.dataProvider = null;
+  state.playbackEpisodeId = null;
   state.detail = null;
   state.cache = null;
   state.motionFrame = null;
@@ -363,6 +561,11 @@ function clearEpisodeView() {
   els.annotationTrack.innerHTML = "";
   renderJointOptions([]);
   renderMotionSourceOptions();
+  state.selectedCameraId = null;
+  state.selectedJoint = null;
+  state.selectedBaseTarget = "global";
+  renderTargetContext();
+  renderLabels();
   renderClock();
   drawMotion();
 }
@@ -373,6 +576,9 @@ function renderCameras() {
   els.cameraGrid.className = `camera-grid count-${Math.min(cameras.length, 6)}`;
   if (!cameras.length) {
     els.cameraGrid.innerHTML = '<div class="empty-panel">当前 Episode 无有效相机</div>';
+    if (state.selectedCameraId) state.selectedCameraId = null;
+    renderTargetContext();
+    renderLabels();
     return;
   }
   els.cameraGrid.innerHTML = cameras.map((camera) => `
@@ -384,15 +590,14 @@ function renderCameras() {
     card.addEventListener("click", (event) => { if (event.detail === 1) selectCamera(card.dataset.cameraId); });
     card.addEventListener("dblclick", () => toggleCameraFullscreen(card.dataset.cameraId));
   });
+  syncCameraSelectionUi();
+  renderTargetContext();
+  renderLabels();
 }
 
 function selectCamera(streamId) {
-  state.selectedCameraId = state.selectedCameraId === streamId ? null : streamId;
-  state.selectedJoint = null;
-  syncJointSelectionUi();
-  els.cameraGrid.querySelectorAll(".camera-card").forEach((card) => card.classList.toggle("selected", card.dataset.cameraId === state.selectedCameraId));
-  renderTargetContext();
-  drawMotion();
+  if (state.selectedCameraId === streamId) selectAnnotationTarget(state.selectedBaseTarget);
+  else selectAnnotationTarget("camera", streamId);
 }
 
 function toggleCameraFullscreen(streamId) {
@@ -411,6 +616,8 @@ function renderMotionAvailability() {
   if (!available) els.motionEmpty.textContent = "当前 Episode 无可用的 G1 动作或 Mocap";
   renderMotionSourceOptions();
   renderJointOptions(state.cache?.motion?.available ? state.cache.motion.joint_names || [] : []);
+  renderTargetContext();
+  renderLabels();
 }
 
 function renderMotionSourceOptions() {
@@ -442,16 +649,23 @@ function renderCoverageTracks() {
 }
 
 async function requestVisualFrames(force = false) {
-  if (!state.cache || !state.currentEpisodeId || state.visualPending) return;
+  if (!state.cache || !state.currentEpisodeId || !state.playbackEpisodeId || state.visualPending) return;
   const now = performance.now();
   if (!force && now - state.lastVisualRequest < 90) return;
   state.lastVisualRequest = now;
   state.visualPending = true;
   const episodeId = state.currentEpisodeId;
+  const playbackEpisodeId = state.playbackEpisodeId;
+  const provider = state.dataProvider;
   const timeNs = Math.max(0, Math.min(state.durationNs, Math.round(state.playheadNs)));
   try {
     const cameraRequests = (state.cache.cameras || []).map(async (camera) => {
-      const frame = await window.episodeQc.getCameraFrame({ episodeId, streamId: camera.stream_id, timeNs });
+      const frame = await window.episodeQc.getCameraFrame({
+        episodeId: playbackEpisodeId,
+        streamId: camera.stream_id,
+        timeNs,
+        provider,
+      });
       if (episodeId !== state.currentEpisodeId) return;
       const card = els.cameraGrid.querySelector(`[data-camera-id="${camera.stream_id}"]`);
       if (!card) return;
@@ -467,14 +681,19 @@ async function requestVisualFrames(force = false) {
       card.querySelector(".camera-time").textContent = `${formatClock(frame.frameOffsetNs)} · ${formatSkew(frame.skewNs)}`;
     });
     const motionRequest = state.cache.motion?.available
-      ? window.episodeQc.getMotionFrame({ episodeId, timeNs }).then((frame) => {
+      ? window.episodeQc.getMotionFrame({ episodeId: playbackEpisodeId, timeNs, provider }).then((frame) => {
           if (episodeId === state.currentEpisodeId) { state.motionFrame = frame; drawMotion(); }
         })
       : Promise.resolve();
     const requestedSource = state.motionSource;
     const actionSource = state.cache.robot_actions?.sources?.find((item) => item.key === requestedSource && item.available);
     const actionRequest = actionSource
-      ? window.episodeQc.getRobotActionFrame({ episodeId, sourceKey: requestedSource, timeNs }).then((frame) => {
+      ? window.episodeQc.getRobotActionFrame({
+          episodeId: playbackEpisodeId,
+          sourceKey: requestedSource,
+          timeNs,
+          provider,
+        }).then((frame) => {
           if (episodeId === state.currentEpisodeId && requestedSource === state.motionSource) {
             state.robotActionFrame = frame;
             drawMotion();
@@ -575,29 +794,46 @@ function renderLabels() {
   const query = els.labelSearch.value.trim().toLowerCase();
   const enabled = labels.filter((label) => label.enabled !== false);
   const visible = enabled.filter((label) => label.annotation_scopes?.includes(state.scope) && (activeGroup === "all" || label.group === activeGroup) && (!query || `${label.code} ${label.name} ${label.description || ""}`.toLowerCase().includes(query)));
+  const currentTarget = currentAnnotationTarget();
+  const usable = visible.filter((label) => labelSupportsTarget(label, currentTarget));
   const schemaHeader = state.labelSchema?.schema || {};
   const labelSetName = labelSetDisplayName(schemaHeader.label_set_id, schemaHeader.label_set_name);
   const versionText = schemaHeader.schema_version ? ` · v${schemaHeader.schema_version}` : "";
   els.labelSetMeta.textContent = labelSetName ? `${labelSetName}${versionText}` : "尚未导入标签库";
   els.labelSetMeta.title = els.labelSetMeta.textContent;
-  els.labelCount.textContent = `${visible.length} / ${enabled.length}`;
+  els.labelCount.textContent = `${usable.length} 可用 / ${visible.length}`;
   if (!visible.length) {
     els.labelList.innerHTML = `<div class="empty-panel">${labels.length ? "当前范围没有可用标签" : "请先导入标签库"}</div>`;
     return;
   }
-  els.labelList.innerHTML = visible.map((label) => `
-    <button class="label-button" data-label-code="${escapeHtml(label.code)}" style="--label-color:${escapeHtml(label.color || "#8c959f")}" title="${escapeHtml(`${label.name} · ${groups.get(label.group) || groupDisplayName(label.group)}${label.description ? `\n${label.description}` : ""}`)}" type="button">
-      <i class="label-color"></i><span class="label-copy"><strong>${escapeHtml(label.name)}</strong><small>${escapeHtml(groups.get(label.group) || label.group)}</small></span>${label.shortcut ? `<kbd>${escapeHtml(label.shortcut)}</kbd>` : ""}
-    </button>`).join("");
+  els.labelList.innerHTML = visible.map((label) => {
+    const supported = labelSupportsTarget(label, currentTarget);
+    const targetHint = targetTypesDescription(label.target_types || []);
+    const title = supported
+      ? `${label.name} · ${groups.get(label.group) || groupDisplayName(label.group)}${label.description ? `\n${label.description}` : ""}`
+      : `当前对象“${currentTarget.displayName}”不可用；该标签支持：${targetHint}`;
+    return `
+    <button class="label-button${supported ? "" : " target-disabled"}" data-label-code="${escapeHtml(label.code)}" style="--label-color:${escapeHtml(label.color || "#8c959f")}" title="${escapeHtml(title)}" type="button"${supported ? "" : " disabled"}>
+      <i class="label-color"></i><span class="label-copy"><strong>${escapeHtml(label.name)}</strong><small>${escapeHtml(supported ? (groups.get(label.group) || label.group) : `仅支持：${targetHint}`)}</small></span>${label.shortcut ? `<kbd>${escapeHtml(label.shortcut)}</kbd>` : ""}
+    </button>`;
+  }).join("");
 }
 
 function renderTargetContext() {
-  if (state.selectedJoint) els.targetContext.textContent = `目标：关节 · ${jointDisplayName(state.selectedJoint)} (${state.selectedJoint})`;
-  else if (state.selectedCameraId) {
-    const camera = state.cache?.cameras?.find((item) => item.stream_id === state.selectedCameraId);
-    els.targetContext.textContent = `目标：相机 · ${camera?.display_name || state.selectedCameraId}`;
-  } else if (state.detail?.episode.mocap_available) els.targetContext.textContent = "目标：Mocap · 全身（默认）";
-  else els.targetContext.textContent = "目标：全局（可点击相机切换）";
+  const active = currentAnnotationTarget();
+  const cameras = state.cache?.cameras || [];
+  const mocapAvailable = Boolean(state.detail?.episode.mocap_available || state.cache?.motion?.available);
+  const joints = state.cache?.motion?.joint_names || [];
+  const button = (type, key, label) => `
+    <button class="target-option${active.targetType === type && (key === null || active.selectionKey === key) ? " active" : ""}" data-target-type="${type}"${key ? ` data-target-key="${escapeHtml(key)}"` : ""} aria-pressed="${active.targetType === type && (key === null || active.selectionKey === key)}" type="button">${escapeHtml(label)}</button>`;
+  els.targetContext.innerHTML = `
+    <div class="target-picker-heading"><strong>标注对象</strong><span>当前：${escapeHtml(active.displayName)}</span></div>
+    <div class="target-options">
+      ${button("global", null, "全局")}
+      ${mocapAvailable ? button("mocap", null, "全身动作") : ""}
+      ${cameras.map((camera) => button("camera", camera.stream_id, camera.display_name || "相机")).join("")}
+      ${joints.length ? `<select class="target-joint-select${active.targetType === "joint" ? " active" : ""}" data-target-joint aria-label="选择标注关节"><option value="">选择关节…</option>${joints.map((joint) => `<option value="${escapeHtml(joint)}"${state.selectedJoint === joint ? " selected" : ""}>${escapeHtml(jointDisplayName(joint))}</option>`).join("")}</select>` : ""}
+    </div>`;
 }
 
 async function createAnnotation(labelCode) {
@@ -617,7 +853,10 @@ async function createAnnotation(labelCode) {
     end = state.durationNs;
   }
   const target = targetForLabel(label);
-  if (!target) return toast(`“${label.name}”不支持当前目标，请选择相机/关节或切回全局`, "error", 5000);
+  if (!target) {
+    const current = currentAnnotationTarget();
+    return toast(`“${label.name}”不支持当前对象“${current.displayName}”；请选择：${targetTypesDescription(label.target_types || [])}`, "error", 5500);
+  }
   const attributes = collectCustomFields(label, target);
   if (attributes === null) return;
   const payload = {
@@ -670,17 +909,47 @@ function collectCustomFields(label, target) {
 }
 
 function targetForLabel(label) {
-  const targets = label.target_types || [];
-  if (state.selectedJoint && targets.includes("joint")) return { targetType: "joint", targetKey: state.selectedJoint };
-  if (state.selectedCameraId && targets.includes("camera")) {
-    const camera = state.cache?.cameras?.find((item) => item.stream_id === state.selectedCameraId);
-    return { targetType: "camera", targetKey: camera?.topic || state.selectedCameraId };
+  const target = currentAnnotationTarget();
+  return labelSupportsTarget(label, target) ? target : null;
+}
+
+function currentAnnotationTarget() {
+  return resolveSelectedTarget({
+    selectedJoint: state.selectedJoint,
+    selectedCameraId: state.selectedCameraId,
+    baseTarget: state.selectedBaseTarget,
+    cameras: state.cache?.cameras || [],
+    jointDisplayName,
+  });
+}
+
+function selectAnnotationTarget(targetType, targetKey = null) {
+  if (targetType === "global" || targetType === "mocap") {
+    state.selectedBaseTarget = targetType;
+    state.selectedCameraId = null;
+    state.selectedJoint = null;
+  } else if (targetType === "camera") {
+    if (!(state.cache?.cameras || []).some((item) => item.stream_id === targetKey)) return;
+    state.selectedCameraId = targetKey;
+    state.selectedJoint = null;
+  } else if (targetType === "joint") {
+    if (!targetKey) return selectAnnotationTarget("mocap");
+    state.selectedJoint = targetKey;
+    state.selectedCameraId = null;
+  } else {
+    return;
   }
-  if (targets.includes("global")) return { targetType: "global", targetKey: null };
-  if (targets.includes("mocap") && state.cache?.motion?.available) return { targetType: "mocap", targetKey: "/mocap/human_motion" };
-  if (targets.includes("camera") && state.cache?.cameras?.length) return { targetType: "camera", targetKey: state.cache.cameras[0].topic };
-  const fallback = targets[0];
-  return fallback ? { targetType: fallback, targetKey: null } : null;
+  syncJointSelectionUi();
+  syncCameraSelectionUi();
+  renderTargetContext();
+  renderLabels();
+  drawMotion();
+}
+
+function syncCameraSelectionUi() {
+  els.cameraGrid.querySelectorAll(".camera-card").forEach((card) => {
+    card.classList.toggle("selected", card.dataset.cameraId === state.selectedCameraId);
+  });
 }
 
 function renderAnnotations() {
@@ -815,6 +1084,16 @@ function updateEpisodeFromDetail() {
   const index = state.episodes.findIndex((item) => item.id === state.currentEpisodeId);
   if (index >= 0) state.episodes[index] = { ...state.episodes[index], ...state.detail.episode };
   renderEpisodeList();
+  refreshTaskSummaries();
+}
+
+async function refreshTaskSummaries() {
+  try {
+    const payload = await window.episodeQc.getTasks();
+    state.tasks = payload.tasks || [];
+    state.currentTask = state.tasks.find((item) => item.id === state.currentTaskId) || state.currentTask;
+    renderTaskContext();
+  } catch { /* Episode 已保存，任务摘要稍后刷新即可 */ }
 }
 
 async function savePlayhead() {
@@ -1018,12 +1297,7 @@ function syncJointSelectionUi() {
   els.selectedJoint.textContent = state.selectedJoint ? jointDisplayName(state.selectedJoint) : "";
 }
 function selectJoint(name) {
-  state.selectedJoint = name || null;
-  state.selectedCameraId = null;
-  els.cameraGrid.querySelectorAll(".camera-card").forEach((card) => card.classList.remove("selected"));
-  syncJointSelectionUi();
-  renderTargetContext();
-  drawMotion();
+  selectAnnotationTarget(name ? "joint" : (state.detail?.episode.mocap_available ? "mocap" : "global"), name || null);
 }
 function selectJointAtPointer(event) {
   if (state.drag?.moved || !state.projectedJoints.length) return;
@@ -1198,6 +1472,25 @@ function formatClock(ns) {
   return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}.${String(millis).padStart(3, "0")}`;
 }
 function formatDuration(seconds) { const value = Math.max(0, Number(seconds) || 0); return `${Math.floor(value / 60)}:${String(Math.floor(value % 60)).padStart(2, "0")}`; }
+function formatBytes(bytes) {
+  let value = Math.max(0, Number(bytes) || 0);
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit += 1; }
+  return `${value >= 10 || unit === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[unit]}`;
+}
+function taskStatusName(status) {
+  return ({
+    importing: "正在导入",
+    caching: "正在缓存",
+    ready: "待质检",
+    in_progress: "质检中",
+    completed: "已完成",
+    submitted: "已提交",
+    archived: "已归档",
+    failed: "导入失败",
+  })[status] || status || "未知状态";
+}
 function formatSkew(ns) { const ms = Number(ns) / 1e6; return `${ms >= 0 ? "+" : ""}${ms.toFixed(1)} ms`; }
 function escapeHtml(value) { return String(value ?? "").replace(/[&<>'"]/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" })[char]); }
 

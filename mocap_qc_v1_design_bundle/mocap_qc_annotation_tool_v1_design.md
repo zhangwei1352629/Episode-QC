@@ -142,8 +142,8 @@
 - 标签搜索、分组、快捷键；
 - 质检工作状态和质量结论；
 - 自动保存与崩溃恢复；
-- JSON、JSONL、CSV 标签导出；
-- 标签定义快照和导出清单；
+- 每个任务导出单个 JSON 或 CSV 结果文件；
+- JSON 结果内嵌标签定义快照和导出元数据；
 - 安装包或可重复启动脚本。
 
 ### 4.2 V1 可选但建议实现
@@ -1364,57 +1364,24 @@ absolute_end_time_ns   = episode.start_time_ns + end_offset_ns
 
 ### 22.2 V1 导出格式
 
-- `annotations.jsonl`：每行一条标注，供程序处理；
-- `annotations.csv`：每行一条标注，供表格查看；
-- `episodes.csv`：每行一条 Episode 质检结果；
-- `label_schema.json`：标签定义快照；
-- `export_manifest.json`：导出条件、版本和文件信息。
+- JSON：单个文件同时包含任务元数据、Episode 结论、标注明细和标签定义快照；
+- CSV：单个文件将 Episode 结论和标注明细展开到同一张表；
+- 每个任务每次只选择一种格式，不再同时生成多份内容重复的文件。
 
-### 22.3 导出目录
+### 22.3 导出文件命名
 
 ```text
-export_20260801_001500/
-├── annotations.jsonl
-├── annotations.csv
-├── episodes.csv
-├── label_schema.json
-└── export_manifest.json
+<任务目录名>_标注结果.json
+<任务目录名>_标注结果.csv
 ```
 
-### 22.4 `annotations.csv` 字段
+同一任务以相同格式重复导出时原子更新原文件，不添加时间戳，也不创建额外结果目录。
+
+### 22.4 CSV 字段
 
 ```text
-annotation_id
-source_root
-relative_episode_path
-episode_name
-episode_start_time_ns
-episode_duration_ns
-label_set_id
-label_schema_version
-label_code
-label_name
-scope
-start_offset_ns
-end_offset_ns
-start_sec
-end_sec
-absolute_start_time_ns
-absolute_end_time_ns
-target_type
-target_key
-severity
-action
-comment
-attributes_json
-reviewer
-created_at
-updated_at
-```
-
-### 22.5 `episodes.csv` 字段
-
-```text
+task_name
+exported_at
 episode_id
 source_root
 relative_episode_path
@@ -1432,15 +1399,39 @@ annotation_count
 reviewer
 reviewed_at
 source_fingerprint
+annotation_id
+label_set_id
+label_schema_version
+label_code
+label_name
+scope
+start_offset_ns
+end_offset_ns
+start_sec
+end_sec
+absolute_start_time_ns
+absolute_end_time_ns
+target_type
+target_key
+severity
+action
+comment
+attributes_json
+annotation_reviewer
+annotation_created_at
+annotation_updated_at
 ```
 
-### 22.6 导出清单
+一个 Episode 有多条标注时对应多行；没有标注时仍保留一行，标注字段为空。
+
+### 22.5 JSON 结构
 
 ```json
 {
-  "export_version": "1.0.0",
+  "export_version": "2.0.0",
   "application_version": "1.0.0",
   "workspace_id": "ws_01J...",
+  "task_name": "20260717_dishwasher_yangqiyao2",
   "label_set_id": "mocap_qc_default",
   "label_schema_version": "1.1.0",
   "exported_at": "2026-08-01T00:15:00+09:00",
@@ -1450,22 +1441,20 @@ source_fingerprint
   },
   "episode_count": 120,
   "annotation_count": 387,
-  "files": [
-    "annotations.jsonl",
-    "annotations.csv",
-    "episodes.csv",
-    "label_schema.json"
-  ]
+  "format": "json",
+  "label_schema": {},
+  "episodes": [],
+  "annotations": []
 }
 ```
 
-### 22.7 导出稳定性
+### 22.6 导出稳定性
 
 - 使用稳定字段名；
 - 任何新增字段不破坏已有字段；
 - 导出结果必须携带 schema/version；
-- 导出过程先写临时目录，全部成功后原子重命名；
-- 导出失败不产生半成品正式目录。
+- 导出过程先写同目录临时文件，全部成功后原子替换正式文件；
+- 导出失败不产生半成品正式文件。
 
 ---
 
@@ -1473,26 +1462,18 @@ source_fingerprint
 
 ### 23.1 V1 推荐技术选型
 
-#### 桌面壳
-
-- Electron；
-- 负责原生文件夹选择、窗口、菜单、应用打包和启动 Python 后端。
-
 #### 前端
 
-- React + TypeScript；
-- Vite；
+- Chrome / Chromium；
+- 浏览器原生 JavaScript ES Module；
+- HTML + CSS；
 - Three.js：Mocap 3D；
-- Canvas/SVG：时间轴；
-- Zustand 或同类轻量状态管理；
-- 前端组件库可选，但时间轴与播放区需定制。
+- Canvas：时间轴与姿态辅助绘制。
 
 #### 后端
 
 - Python；
-- FastAPI；
-- Pydantic；
-- SQLAlchemy + Alembic；
+- 本机 HTTP、SSE 与二进制帧 API；
 - SQLite；
 - `mcap` Python 库；
 - `msgpack`；
@@ -1501,16 +1482,16 @@ source_fingerprint
 
 ### 23.2 选择该架构的原因
 
-- Electron 可直接弹出本地文件夹选择框，不受浏览器目录权限限制；
-- React/Three.js 更适合实现多相机网格、3D 和复杂时间轴；
+- Web 入口避免桌面壳与浏览器后端形成两套业务逻辑；
+- 浏览器和 Three.js 适合实现多相机网格、3D 和复杂时间轴；
 - Python 更适合读取 MCAP、JSON、MsgPack、NumPy 和现有数据处理脚本；
 - SQLite 足够支持本地单用户、数千 Episode 和大量标签；
-- 前后端分离，后续可将 Python 后端独立部署为局域网服务。
+- 前后端通过本机 API 分离，便于独立测试和持续运行。
 
 ### 23.3 安全边界
 
-- FastAPI 只监听 `127.0.0.1`；
-- Electron 启动时生成随机会话令牌；
+- Web 服务只监听 `127.0.0.1`；
+- 工作区保存稳定的本机会话令牌；
 - 所有 API 请求携带令牌；
 - 不开放公网；
 - 文件系统访问只允许用户显式添加的数据源和工作区目录。
@@ -1521,18 +1502,15 @@ source_fingerprint
 
 ```text
 ┌───────────────────────────────────────────────────────────┐
-│ Electron Desktop                                          │
-│ ┌───────────────────────────────────────────────────────┐ │
-│ │ React UI                                              │ │
-│ │ Episode List / Cameras / Three.js / Timeline / Labels │ │
-│ └───────────────────────┬───────────────────────────────┘ │
-│                         │ HTTP / WebSocket                 │
-│ ┌───────────────────────▼───────────────────────────────┐ │
-│ │ Python FastAPI Sidecar                               │ │
-│ │ Import / MCAP / Playback / Annotation / Export       │ │
-│ └─────────────┬───────────────────────┬─────────────────┘ │
-└───────────────┼───────────────────────┼───────────────────┘
-                │                       │
+│ Chrome / Chromium                                         │
+│ Episode List / Cameras / Three.js / Timeline / Labels     │
+└───────────────────────────┬───────────────────────────────┘
+                            │ HTTP / SSE
+┌───────────────────────────▼───────────────────────────────┐
+│ Python Local Web Service                                  │
+│ Import / MCAP / Playback / Annotation / Export            │
+└─────────────┬───────────────────────┬─────────────────────┘
+              │                       │
        ┌────────▼────────┐      ┌───────▼─────────┐
        │ Source Dataset  │      │ Workspace       │
        │ Read-only MCAP  │      │ SQLite + Cache  │
@@ -1545,57 +1523,25 @@ source_fingerprint
 
 ```text
 mocap-qc-annotator/
-├── apps/
-│   ├── desktop/
-│   │   ├── electron/
-│   │   └── package.json
-│   └── frontend/
-│       ├── src/
-│       │   ├── pages/
-│       │   ├── components/
-│       │   │   ├── EpisodeList/
-│       │   │   ├── CameraGrid/
-│       │   │   ├── MocapViewer/
-│       │   │   ├── Timeline/
-│       │   │   ├── LabelPanel/
-│       │   │   └── ReviewDecision/
-│       │   ├── stores/
-│       │   ├── api/
-│       │   └── types/
-│       └── package.json
-├── backend/
-│   ├── app/
-│   │   ├── main.py
-│   │   ├── api/
-│   │   ├── core/
-│   │   ├── db/
-│   │   ├── models/
-│   │   ├── schemas/
-│   │   ├── services/
-│   │   │   ├── workspace_service.py
-│   │   │   ├── import_service.py
-│   │   │   ├── episode_service.py
-│   │   │   ├── mcap_service.py
-│   │   │   ├── playback_service.py
-│   │   │   ├── annotation_service.py
-│   │   │   ├── label_schema_service.py
-│   │   │   └── export_service.py
-│   │   ├── adapters/
-│   │   │   ├── base.py
-│   │   │   ├── motion/
-│   │   │   ├── camera/
-│   │   │   └── stream/
-│   │   └── workers/
-│   ├── migrations/
-│   ├── tests/
-│   └── pyproject.toml
-├── schemas/
-│   ├── label_schema.example.yaml
-│   └── data_profile.example.yaml
+├── app/
+│   ├── renderer/
+│   │   ├── index.html
+│   │   ├── renderer.js
+│   │   ├── web-api.js
+│   │   ├── styles.css
+│   │   └── assets/
+│   └── tests/
+├── src/episode_qc/
+│   ├── cli.py
+│   ├── web_server.py
+│   ├── workspace.py
+│   └── playback.py
+├── tests/
 ├── scripts/
-│   ├── dev.sh
-│   ├── package.sh
-│   └── verify_sample.py
+│   ├── dev-web.sh
+│   └── test-all.sh
+├── package.json
+├── pyproject.toml
 └── README.md
 ```
 
@@ -1691,9 +1637,8 @@ Motion Adapter 输出 `MotionFrame`；Camera Adapter 输出原始图片字节和
 负责：
 
 - 解析导出筛选条件；
-- 导出 JSONL、CSV、schema 和 manifest；
-- 临时目录写入；
-- 原子完成；
+- 导出单个 JSON 或 CSV 文件；
+- 临时文件写入并原子替换；
 - 导出日志。
 
 ---
@@ -2223,7 +2168,7 @@ FRAME_NOT_FOUND
 - 二次打开复用缓存；
 - 标签库导入预览和冲突处理；
 - 自动保存后重启恢复；
-- 批量导出结果可再次读取。
+- 单文件 JSON/CSV 导出结果可再次读取。
 
 ### 34.3 UI/E2E 测试
 
@@ -2255,13 +2200,13 @@ FRAME_NOT_FOUND
 
 交付：
 
-- Electron、React、FastAPI 可联调；
-- Electron 启动和关闭 Python sidecar；
+- 浏览器页面与 Python 本地 Web API 可联调；
+- Web 服务可启动、关闭并持久化工作区；
 - SQLite 和 Alembic 初始化；
 - 工作区创建和打开；
 - 基础日志。
 
-验收：桌面应用可启动，前端能调用本地 API。
+验收：本机 Web 服务可启动，浏览器前端能调用本地 API。
 
 ### 里程碑 1：文件夹导入与 Episode 列表
 
@@ -2329,7 +2274,7 @@ FRAME_NOT_FOUND
 - 质检状态；
 - 质量结论；
 - 上一条/下一条工作流；
-- JSONL/CSV/Schema/Manifest 导出；
+- 单文件 JSON/CSV 导出；
 - 导出预览；
 - 崩溃恢复；
 - 缓存清理；
@@ -2387,11 +2332,11 @@ FRAME_NOT_FOUND
 ### 36.6 导出
 
 - 可导出当前筛选结果；
-- JSONL 和 CSV 标签数量一致；
+- 每个任务只生成一份所选格式的结果文件；
 - 导出包含 Episode 结论；
-- 导出包含标签 Schema 快照和版本；
+- JSON 导出包含标签 Schema 快照和版本；
 - 导出包含相对和绝对时间；
-- 导出失败不留下正式半成品目录。
+- 导出失败不留下正式半成品文件。
 
 ---
 
@@ -2499,7 +2444,7 @@ FRAME_NOT_FOUND
 
 | 项目 | V1 决策 |
 |---|---|
-| 产品形态 | Ubuntu 本地桌面应用 |
+| 产品形态 | Ubuntu 本地 Web 应用 |
 | 主工作方式 | 人工同步回放与标注 |
 | 数据输入 | 按文件夹递归导入多 Episode |
 | 原始数据 | 默认只读 |
@@ -2510,9 +2455,9 @@ FRAME_NOT_FOUND
 | 标签范围 | Episode、区间、时间点 |
 | 标签目标 | 全局、相机、关节、流等 |
 | 进度 | SQLite 自动保存 |
-| 导出 | JSONL、CSV、Schema、Manifest |
+| 导出 | 每任务单个 JSON 或 CSV 文件 |
 | 自动质检 | 仅做基础提示，不替代人工结论 |
-| 技术栈 | Electron + React/TypeScript + Python/FastAPI + SQLite |
+| 技术栈 | 浏览器原生 JavaScript + Three.js + Python 本地 Web 服务 + SQLite |
 | 第一版完成标准 | 完成导入、播放、标注、结论、导出闭环 |
 
 ---
@@ -2696,7 +2641,7 @@ labels:
   → 使用导入标签“画面模糊”标记头部相机
   → 选择“有条件通过”
   → 切换下一条
-  → 导出 annotations.jsonl 和 episodes.csv
+  → 选择 JSON 或 CSV，导出一份“任务名_标注结果”文件
 ```
 
 这条链路打通后，再接入 Mocap 3D Adapter。这样即使骨架消息格式尚未完全明确，也不会阻塞导入、相机、标签和导出主体功能。

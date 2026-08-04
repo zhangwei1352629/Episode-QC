@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import io
 import json
 import tempfile
@@ -89,13 +88,16 @@ def main() -> int:
             quality_decision="pass_with_labels",
             last_playhead_ns=duration // 2,
         )
-        exported = export_workspace(db_path, test_root / "exports", episode_ids=[episode_id])
-        export_dir = Path(str(exported["output_dir"]))
-        jsonl_count = len((export_dir / "annotations.jsonl").read_text(encoding="utf-8").splitlines())
-        with (export_dir / "annotations.csv").open(encoding="utf-8-sig", newline="") as source:
-            csv_count = len(list(csv.DictReader(source)))
-        if jsonl_count != csv_count or jsonl_count != 1:
-            raise AssertionError("JSONL 与 CSV 标注数量不一致")
+        exported = export_workspace(
+            db_path,
+            test_root / "exports",
+            episode_ids=[episode_id],
+            export_format="json",
+        )
+        export_file = Path(str(exported["output_file"]))
+        export_document = json.loads(export_file.read_text(encoding="utf-8"))
+        if len(export_document["episodes"]) != 1 or len(export_document["annotations"]) != 1:
+            raise AssertionError("单文件 JSON 导出的 Episode 或标注数量不正确")
 
         after = {str(path): (path.stat().st_size, path.stat().st_mtime_ns) for path in source_files}
         if before != after:
@@ -116,6 +118,7 @@ def main() -> int:
             "annotation_id": annotation["annotation_id"],
             "export_episode_count": exported["episode_count"],
             "export_annotation_count": exported["annotation_count"],
+            "export_file": str(export_file),
             "source_files_unchanged": True,
         }
         print(json.dumps(result, ensure_ascii=False, indent=2))

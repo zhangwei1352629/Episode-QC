@@ -12,6 +12,8 @@ const WRIST_SOURCE_TO_G1 = {
 };
 
 const clamp = (value, minimum, maximum) => Math.max(minimum, Math.min(maximum, value));
+const SQRT_HALF = Math.SQRT1_2;
+const ROS_TO_THREE_WXYZ = [SQRT_HALF, -SQRT_HALF, 0, 0];
 
 function normalizedQuaternionWxyz(value) {
   if (!Array.isArray(value) || value.length !== 4 || value.some((item) => !Number.isFinite(Number(item)))) return null;
@@ -30,6 +32,38 @@ function multiplyQuaternionWxyz(first, second) {
     aw * by - ax * bz + ay * bw + az * bx,
     aw * bz + ax * by - ay * bx + az * bw,
   ];
+}
+
+export function robotRootPoseInThree(rootPosition, rootQuaternionWxyz, planarOriginRos = null) {
+  const sourceQuaternion = normalizedQuaternionWxyz(rootQuaternionWxyz) || [1, 0, 0, 0];
+  const inverseBasis = [ROS_TO_THREE_WXYZ[0], -ROS_TO_THREE_WXYZ[1], 0, 0];
+  const convertedQuaternion = normalizedQuaternionWxyz(
+    multiplyQuaternionWxyz(multiplyQuaternionWxyz(ROS_TO_THREE_WXYZ, sourceQuaternion), inverseBasis),
+  );
+  let position = null;
+  if (Array.isArray(rootPosition) && rootPosition.length === 3 && rootPosition.every((item) => Number.isFinite(Number(item)))) {
+    const source = rootPosition.map(Number);
+    const origin = Array.isArray(planarOriginRos) && planarOriginRos.length >= 2
+      ? planarOriginRos.map(Number)
+      : [0, 0];
+    position = [source[0] - (origin[0] || 0), source[2], -(source[1] - (origin[1] || 0))];
+  }
+  return {
+    position,
+    quaternionXyzw: [convertedQuaternion[1], convertedQuaternion[2], convertedQuaternion[3], convertedQuaternion[0]],
+  };
+}
+
+export function chooseSupportFoot(leftHeight, rightHeight, current = null, switchThreshold = 0.015) {
+  const heights = { left: Number(leftHeight), right: Number(rightHeight) };
+  const valid = Object.entries(heights).filter(([, value]) => Number.isFinite(value));
+  if (!valid.length) return null;
+  if (valid.length === 1) return valid[0][0];
+  if (current === "left" || current === "right") {
+    const other = current === "left" ? "right" : "left";
+    if (heights[current] <= heights[other] + Math.max(0, Number(switchThreshold) || 0)) return current;
+  }
+  return heights.left <= heights.right ? "left" : "right";
 }
 
 function rotationMatrixFromQuaternionWxyz(value) {

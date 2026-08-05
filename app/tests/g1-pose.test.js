@@ -35,3 +35,20 @@ test("人体手臂伸直时使用 G1 肘关节的九十度机械中立位", asyn
   closeTo(g1ElbowAngleFromHumanFlexion(0), Math.PI / 2);
   closeTo(g1ElbowAngleFromHumanFlexion(Math.PI / 2), 0);
 });
+
+test("SOMA 根位姿从 ROS 坐标转换到 Three 坐标并保留相对平移", async () => {
+  const { robotRootPoseInThree } = await import("../renderer/g1-pose.mjs");
+  const pose = robotRootPoseInThree([1.2, -0.4, 0.79], [1, 0, 0, 0], [1.0, -0.5]);
+  closeTo(pose.position[0], 0.2);
+  closeTo(pose.position[1], 0.79);
+  closeTo(pose.position[2], -0.1);
+  assert.deepEqual(pose.quaternionXyzw.map((item) => Math.abs(item) < 1e-12 ? 0 : item), [0, 0, 0, 1]);
+});
+
+test("支撑脚选择带滞回且在明显抬脚后切换", async () => {
+  const { chooseSupportFoot } = await import("../renderer/g1-pose.mjs");
+  assert.equal(chooseSupportFoot(0.001, 0.006), "left");
+  assert.equal(chooseSupportFoot(0.010, 0.000, "left"), "left");
+  assert.equal(chooseSupportFoot(0.030, 0.000, "left"), "right");
+  assert.equal(chooseSupportFoot(Number.NaN, 0.004, "left"), "right");
+});

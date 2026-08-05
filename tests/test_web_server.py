@@ -755,7 +755,20 @@ def test_web_api_streams_cached_binary_frames(tmp_path: Path):
         (manifest_dir / "robot_actions").mkdir()
         jpeg = b"\xff\xd8web-frame\xff\xd9"
         motion = struct.pack("<qq14f2B", -1, 7, *[float(index) for index in range(14)], 1, 0)
-        action = struct.pack("<qq29f", 123, 8, *[index / 10 for index in range(29)])
+        action = struct.pack(
+            "<qqI29f3f4f",
+            123,
+            8,
+            2,
+            *[index / 10 for index in range(29)],
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+        )
         (manifest_dir / "cameras" / "head.frames").write_bytes(jpeg)
         (manifest_dir / "mocap" / "motion.frames").write_bytes(motion)
         (manifest_dir / "robot_actions" / "policy.frames").write_bytes(action)

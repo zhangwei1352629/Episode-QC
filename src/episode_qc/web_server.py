@@ -61,7 +61,7 @@ from episode_qc.workspace import (
 
 
 ENTITY_ID = re.compile(r"^(?:ep|str|ann)_[a-f0-9]{24,32}$")
-ACTION_KEYS = {"policy", "policy_target", "soma"}
+ACTION_KEYS = {"policy", "policy_target", "policy_command", "soma"}
 WEB_TOKEN_FILE = ".web-token"
 WORKER_ID_FILE = ".worker-id"
 LOCAL_WEB_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
@@ -998,7 +998,7 @@ class EpisodeQcRequestHandler(BaseHTTPRequestHandler):
                 self._send_binary(frame[0], "application/vnd.episode-qc.motion", frame[1])
             return
         action_match = re.fullmatch(
-            r"/api/episodes/(ep_[a-f0-9]{24,32})/actions/(policy|policy_target|soma)/frame",
+            r"/api/episodes/(ep_[a-f0-9]{24,32})/actions/(policy|policy_target|policy_command|soma)/frame",
             path,
         )
         if method == "GET" and action_match:

@@ -988,15 +988,16 @@ function renderMotionAvailability() {
 function renderMotionSourceOptions() {
   const sourceNames = {
     policy: "Policy 实际执行姿态（默认）",
-    policy_target: "Policy 目标姿态",
+    policy_target: "PMG 目标姿态",
+    policy_command: "Policy 最终控制目标",
     soma: "SOMA 重定向动作"
   };
   const sources = state.cache?.robot_actions?.sources || [];
   const available = new Set(sources.filter((item) => item.available).map((item) => item.key));
   if (!available.has(state.motionSource)) {
-    state.motionSource = ["policy", "soma", "policy_target"].find((key) => available.has(key)) || "policy";
+    state.motionSource = ["policy", "policy_target", "policy_command", "soma"].find((key) => available.has(key)) || "policy";
   }
-  els.motionSource.innerHTML = ["policy", "policy_target", "soma"].map((key) =>
+  els.motionSource.innerHTML = ["policy", "policy_target", "policy_command", "soma"].map((key) =>
     `<option value="${key}"${available.has(key) ? "" : " disabled"}>${sourceNames[key]}${available.has(key) ? "" : "（不可用）"}</option>`
   ).join("");
   els.motionSource.value = state.motionSource;

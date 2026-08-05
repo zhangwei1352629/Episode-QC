@@ -15,6 +15,7 @@ from PIL import Image
 
 from episode_qc.playback import (
     G1_29_JOINT_NAMES,
+    G1_MUJOCO_TO_ISAACLAB_INDICES,
     prepare_episode_cache,
     read_cached_camera_frame,
     read_cached_motion_frame,
@@ -78,11 +79,11 @@ def test_v1_import_playback_annotation_and_export_round_trip(tmp_path: Path):
     assert len(manifest["cameras"]) == 1
     assert manifest["motion"]["available"] is True
     assert manifest["motion"]["joint_names"] == ["Hips", "Head"]
-    assert manifest["cache_version"] == 4
+    assert manifest["cache_version"] == 6
     assert manifest["motion"]["frame_encoding"] == "episode-qc-motion-f32-le-v1"
     assert manifest["robot_actions"]["default_source"] == "policy"
     assert {item["key"] for item in manifest["robot_actions"]["sources"] if item["available"]} == {
-        "policy", "policy_target", "soma",
+        "policy", "policy_target", "policy_command", "soma",
     }
     frame = read_cached_camera_frame(manifest["manifest_path"], manifest["cameras"][0]["stream_id"], 1_050_000_000)
     assert frame["frame_index"] == 1
@@ -92,10 +93,18 @@ def test_v1_import_playback_annotation_and_export_round_trip(tmp_path: Path):
     assert motion["parent_indices"] == [-1, -1]
     policy = read_cached_robot_action_frame(manifest["manifest_path"], "policy", 1_050_000_000)
     policy_target = read_cached_robot_action_frame(manifest["manifest_path"], "policy_target", 1_050_000_000)
+    policy_command = read_cached_robot_action_frame(manifest["manifest_path"], "policy_command", 1_050_000_000)
     soma = read_cached_robot_action_frame(manifest["manifest_path"], "soma", 1_050_000_000)
     assert policy["joint_names"] == G1_29_JOINT_NAMES
     assert policy["joint_positions"] == pytest.approx([1 + joint / 100 for joint in range(29)])
-    assert policy_target["joint_positions"] == pytest.approx([51 + joint / 100 for joint in range(29)])
+    assert "root_position" not in policy
+    assert policy["root_quaternion_wxyz"] == pytest.approx([1.0, 0.0, 0.0, 0.0])
+    assert policy_target["joint_positions"] == pytest.approx([
+        151 + isaaclab_index / 100 for isaaclab_index in G1_MUJOCO_TO_ISAACLAB_INDICES
+    ])
+    assert policy_target["root_position"] == pytest.approx([1.1, 1.2, 1.3])
+    assert policy_target["root_quaternion_wxyz"] == pytest.approx([0.5, 0.5, -0.5, -0.5])
+    assert policy_command["joint_positions"] == pytest.approx([51 + joint / 100 for joint in range(29)])
     assert soma["joint_positions"] == pytest.approx([101 + joint / 100 for joint in range(29)])
     assert soma["root_position"] == pytest.approx([0.1, 0.2, 0.3])
 
@@ -400,7 +409,9 @@ def test_v1_priority_cache_is_usable_before_full_cache(tmp_path: Path):
     assert full["cache_mode"] == "full"
     assert full["complete"] is True
     assert full["motion"]["available"] is True
-    assert {item["key"] for item in full["robot_actions"]["sources"]} == {"policy", "policy_target", "soma"}
+    assert {item["key"] for item in full["robot_actions"]["sources"]} == {
+        "policy", "policy_target", "policy_command", "soma",
+    }
     full_camera_file = Path(full["manifest_path"]).parent / full["cameras"][0]["frames_file"]
     assert priority_camera_file.stat().st_ino == full_camera_file.stat().st_ino
     reused = prepare_episode_cache(db_path, episode_id, cache_root, mode="priority")
@@ -612,14 +623,16 @@ def _write_sample_episode(directory: Path) -> Path:
         writer.register_channel("/camera/x5/panorama/image/jpeg", "protobuf", schema_id)
         mocap = writer.register_channel("/mocap/human_motion", "json", 0)
         policy = writer.register_channel("/g1/policy/controller_context", "msgpack", 0)
-        policy_target = writer.register_channel("/g1/policy/final_action", "msgpack", 0)
+        policy_target = writer.register_channel("/g1/policy/input_ref_motion_cmd", "msgpack", 0)
+        policy_command = writer.register_channel("/g1/policy/final_action", "msgpack", 0)
         soma = writer.register_channel("/soma/retarget/action", "msgpack", 0)
         for index in range(3):
             timestamp = start + index * 1_000_000_000
             writer.add_message(camera, timestamp, _compressed_image_payload(_jpeg(index)), timestamp, index)
             writer.add_message(mocap, timestamp + 10_000_000, _motion_payload(index), timestamp + 10_000_000, index)
             writer.add_message(policy, timestamp + 20_000_000, _policy_context_payload(index), timestamp + 20_000_000, index)
-            writer.add_message(policy_target, timestamp + 25_000_000, _policy_payload(index), timestamp + 25_000_000, index)
+            writer.add_message(policy_target, timestamp + 25_000_000, _policy_reference_payload(index), timestamp + 25_000_000, index)
+            writer.add_message(policy_command, timestamp + 27_000_000, _policy_payload(index), timestamp + 27_000_000, index)
             writer.add_message(soma, timestamp + 30_000_000, _soma_payload(index), timestamp + 30_000_000, index)
         writer.finish()
     (directory / "metadata.yaml").write_text("status: saved\n", encoding="utf-8")
@@ -770,6 +783,24 @@ def _policy_payload(index: int) -> bytes:
     )
 
 
+def _policy_reference_payload(index: int) -> bytes:
+    isaaclab_joints = [150 + index + joint / 100 for joint in range(29)]
+    return _messagepack(
+        {
+            "schema": "g1_policy_input_ref_motion_cmd.v1",
+            "sequence": index,
+            "source_timestamp_ns": 10_000_000_000 + index * 1_000_000_000,
+            "cmd": {
+                "reference_source": "pmg",
+                "reference_sequence": 100 + index,
+                "qpos": isaaclab_joints,
+                "body_pos": [[1 + index / 10, 1.2, 1.3]],
+                "body_quat": [[0.5, 0.5, -0.5, -0.5]],
+            },
+        }
+    )
+
+
 def _policy_context_payload(index: int) -> bytes:
     body_q = [index + joint / 100 for joint in range(29)]
     return _messagepack(
@@ -777,7 +808,7 @@ def _policy_context_payload(index: int) -> bytes:
             "schema": "g1_policy_controller_context.v1",
             "sequence": index,
             "source_timestamp_ns": 10_000_000_000 + index * 1_000_000_000,
-            "context": {"body_q": body_q},
+            "context": {"body_q": body_q, "base_quat": [1.0, 0.0, 0.0, 0.0]},
         }
     )
 

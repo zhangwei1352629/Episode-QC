@@ -230,7 +230,9 @@ uv run episode-qc workspace-scan /path/to/workspace.db \
 
 ### 5.3 打开和回放 Episode
 
-单击左侧 Episode 后，软件会先读取元信息。首次打开时优先生成默认头部相机和 Policy 实际执行姿态（`controller_context.body_q`）缓存，让画面尽快可用；其余相机、Mocap、Policy 目标姿态（`final_q_target`）和 SOMA 动作在后台补齐。完整缓存完成后会自动切换，以后再次打开会直接复用。
+单击左侧 Episode 后，软件会先读取元信息。首次打开时优先生成默认头部相机和 Policy 实际执行姿态（`controller_context.body_q`）缓存，让画面尽快可用；其余相机、Mocap、PMG 目标姿态（`input_ref_motion_cmd.cmd.qpos`）、Policy 最终控制目标（`final_action.action.final_q_target`）和 SOMA 动作在后台补齐。完整缓存完成后会自动切换，以后再次打开会直接复用。
+
+G1 动作回放会应用 SOMA `qpos` 中的完整根位置和根四元数；PMG 目标姿态会将 policy 内部的 IsaacLab 交错关节顺序转换为 G1/URDF 顺序，并应用 `body_pos[0]` 和 `body_quat[0]` 根位姿；Policy 实际姿态会同步应用 `controller_context.base_quat`。当动作源没有根高度时，查看器会选择支撑脚并将其约束在地面，同时使用滞回避免左右支撑脚频繁切换造成画面抖动。
 
 常用操作：
 

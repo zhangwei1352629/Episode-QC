@@ -34097,6 +34097,8 @@ var WRIST_SOURCE_TO_G1 = {
   ]
 };
 var clamp2 = (value, minimum, maximum) => Math.max(minimum, Math.min(maximum, value));
+var SQRT_HALF = Math.SQRT1_2;
+var ROS_TO_THREE_WXYZ = [SQRT_HALF, -SQRT_HALF, 0, 0];
 function normalizedQuaternionWxyz(value) {
   if (!Array.isArray(value) || value.length !== 4 || value.some((item) => !Number.isFinite(Number(item)))) return null;
   const quaternion = value.map(Number);
@@ -34113,6 +34115,34 @@ function multiplyQuaternionWxyz(first, second) {
     aw * by - ax * bz + ay * bw + az * bx,
     aw * bz + ax * by - ay * bx + az * bw
   ];
+}
+function robotRootPoseInThree(rootPosition, rootQuaternionWxyz, planarOriginRos = null) {
+  const sourceQuaternion = normalizedQuaternionWxyz(rootQuaternionWxyz) || [1, 0, 0, 0];
+  const inverseBasis = [ROS_TO_THREE_WXYZ[0], -ROS_TO_THREE_WXYZ[1], 0, 0];
+  const convertedQuaternion = normalizedQuaternionWxyz(
+    multiplyQuaternionWxyz(multiplyQuaternionWxyz(ROS_TO_THREE_WXYZ, sourceQuaternion), inverseBasis)
+  );
+  let position = null;
+  if (Array.isArray(rootPosition) && rootPosition.length === 3 && rootPosition.every((item) => Number.isFinite(Number(item)))) {
+    const source = rootPosition.map(Number);
+    const origin = Array.isArray(planarOriginRos) && planarOriginRos.length >= 2 ? planarOriginRos.map(Number) : [0, 0];
+    position = [source[0] - (origin[0] || 0), source[2], -(source[1] - (origin[1] || 0))];
+  }
+  return {
+    position,
+    quaternionXyzw: [convertedQuaternion[1], convertedQuaternion[2], convertedQuaternion[3], convertedQuaternion[0]]
+  };
+}
+function chooseSupportFoot(leftHeight, rightHeight, current = null, switchThreshold = 0.015) {
+  const heights = { left: Number(leftHeight), right: Number(rightHeight) };
+  const valid = Object.entries(heights).filter(([, value]) => Number.isFinite(value));
+  if (!valid.length) return null;
+  if (valid.length === 1) return valid[0][0];
+  if (current === "left" || current === "right") {
+    const other = current === "left" ? "right" : "left";
+    if (heights[current] <= heights[other] + Math.max(0, Number(switchThreshold) || 0)) return current;
+  }
+  return heights.left <= heights.right ? "left" : "right";
 }
 function rotationMatrixFromQuaternionWxyz(value) {
   const [w, x, y, z] = value;
@@ -34217,6 +34247,10 @@ var G1Viewer = class {
     this.robot = null;
     this.episodeId = null;
     this.footRestPitch = { left: null, right: null };
+    this.restPosition = new Vector3();
+    this.poseContextKey = null;
+    this.rootPlanarOriginRos = null;
+    this.supportFoot = null;
     this.modelRoot = new Group();
     this.scene = new Scene();
     this.scene.background = new Color(725012);
@@ -34277,10 +34311,9 @@ var G1Viewer = class {
       this.robot.updateMatrixWorld(true);
       const bounds = new Box3().setFromObject(this.robot);
       const center = bounds.getCenter(new Vector3());
-      this.robot.position.x -= center.x;
-      this.robot.position.z -= center.z;
-      this.robot.position.y -= bounds.min.y;
-      this.robot.updateMatrixWorld(true);
+      this.restPosition.set(-center.x, -bounds.min.y, -center.z);
+      this.modelRoot.position.copy(this.restPosition);
+      this.modelRoot.updateMatrixWorld(true);
       this.status = "ready";
       this.onStatusChange("ready");
     };
@@ -34303,9 +34336,13 @@ var G1Viewer = class {
     const hasFrame = Boolean(frame?.positions?.length);
     const robotAction = view?.robotAction;
     const hasRobotAction = Boolean(robotAction?.jointPositions?.length === 29);
-    if (view?.episodeId !== this.episodeId) {
+    const poseContextKey = `${view?.episodeId || ""}:${hasRobotAction ? robotAction.source_key || "action" : "mocap"}`;
+    if (view?.episodeId !== this.episodeId || poseContextKey !== this.poseContextKey) {
       this.episodeId = view?.episodeId || null;
+      this.poseContextKey = poseContextKey;
       this.footRestPitch = { left: null, right: null };
+      this.rootPlanarOriginRos = null;
+      this.supportFoot = null;
     }
     this.modelRoot.visible = (hasRobotAction || hasFrame) && this.status === "ready";
     if (hasRobotAction && this.robot) this.applyRobotAction(robotAction);
@@ -34316,9 +34353,36 @@ var G1Viewer = class {
     return hasFrame && this.robot ? this.projectJoints(frame) : [];
   }
   applyRobotAction(frame) {
-    this.modelRoot.rotation.set(0, 0, 0);
     frame.jointNames.forEach((name, index) => this.setJoint(name, frame.jointPositions[index]));
-    this.robot.updateMatrixWorld(true);
+    const rootPosition = frame.rootPosition || frame.root_position;
+    const rootQuaternion = frame.rootQuaternionWxyz || frame.root_quaternion_wxyz;
+    if (Array.isArray(rootPosition) && rootPosition.length === 3 && !this.rootPlanarOriginRos) {
+      this.rootPlanarOriginRos = [Number(rootPosition[0]), Number(rootPosition[1])];
+    }
+    const rootPose = robotRootPoseInThree(rootPosition, rootQuaternion, this.rootPlanarOriginRos);
+    this.modelRoot.quaternion.fromArray(rootPose.quaternionXyzw);
+    if (rootPose.position) {
+      this.modelRoot.position.fromArray(rootPose.position);
+      this.modelRoot.updateMatrixWorld(true);
+    } else {
+      this.modelRoot.position.set(this.restPosition.x, 0, this.restPosition.z);
+      this.groundToSupportFoot();
+    }
+  }
+  groundToSupportFoot() {
+    this.modelRoot.updateMatrixWorld(true);
+    const heights = {};
+    for (const side of ["left", "right"]) {
+      const link = this.robot?.links?.[`${side}_ankle_roll_link`];
+      if (!link) continue;
+      const bounds = new Box3().setFromObject(link);
+      if (!bounds.isEmpty() && Number.isFinite(bounds.min.y)) heights[side] = bounds.min.y;
+    }
+    this.supportFoot = chooseSupportFoot(heights.left, heights.right, this.supportFoot);
+    const supportHeight = heights[this.supportFoot];
+    if (Number.isFinite(supportHeight)) this.modelRoot.position.y -= supportHeight;
+    else this.modelRoot.position.y = this.restPosition.y;
+    this.modelRoot.updateMatrixWorld(true);
   }
   resize() {
     const rectangle = this.canvas.getBoundingClientRect();
@@ -34344,6 +34408,8 @@ var G1Viewer = class {
     this.camera.lookAt(target);
   }
   applyMocapPose(frame) {
+    this.modelRoot.position.set(this.restPosition.x, 0, this.restPosition.z);
+    this.modelRoot.quaternion.identity();
     const points = /* @__PURE__ */ new Map();
     const rotations = /* @__PURE__ */ new Map();
     frame.jointNames?.forEach((name, index) => {
@@ -34377,7 +34443,7 @@ var G1Viewer = class {
     this.setJoint("waist_pitch_joint", Math.atan2(torso.x, Math.max(1e-6, torso.z)));
     this.setJoint("waist_roll_joint", Math.atan2(-torso.y, Math.max(1e-6, torso.z)));
     this.setJoint("waist_yaw_joint", 0);
-    this.robot.updateMatrixWorld(true);
+    this.groundToSupportFoot();
   }
   applyLeg(side, hip, knee, ankle, toe) {
     const upper = pitchRollForDownwardLimb(hip, knee);

@@ -1,6 +1,11 @@
 import * as THREE from "three";
 import URDFLoader from "../../node_modules/urdf-loader/src/URDFLoader.js";
-import { g1ElbowAngleFromHumanFlexion, wristAnglesFromWorldQuaternions } from "./g1-pose.mjs";
+import {
+  chooseSupportFoot,
+  g1ElbowAngleFromHumanFlexion,
+  robotRootPoseInThree,
+  wristAnglesFromWorldQuaternions,
+} from "./g1-pose.mjs";
 
 const MODEL_URL = new URL("./assets/unitree-g1-29dof/g1_29dof.urdf", import.meta.url).href;
 const ROS_TO_THREE_X = -Math.PI / 2;
@@ -58,6 +63,10 @@ export class G1Viewer {
     this.robot = null;
     this.episodeId = null;
     this.footRestPitch = { left: null, right: null };
+    this.restPosition = new THREE.Vector3();
+    this.poseContextKey = null;
+    this.rootPlanarOriginRos = null;
+    this.supportFoot = null;
     this.modelRoot = new THREE.Group();
     this.scene = new THREE.Scene();
     this.scene.background = new THREE.Color(0x0b1014);
@@ -122,10 +131,9 @@ export class G1Viewer {
       this.robot.updateMatrixWorld(true);
       const bounds = new THREE.Box3().setFromObject(this.robot);
       const center = bounds.getCenter(new THREE.Vector3());
-      this.robot.position.x -= center.x;
-      this.robot.position.z -= center.z;
-      this.robot.position.y -= bounds.min.y;
-      this.robot.updateMatrixWorld(true);
+      this.restPosition.set(-center.x, -bounds.min.y, -center.z);
+      this.modelRoot.position.copy(this.restPosition);
+      this.modelRoot.updateMatrixWorld(true);
       this.status = "ready";
       this.onStatusChange("ready");
     };
@@ -149,9 +157,13 @@ export class G1Viewer {
     const hasFrame = Boolean(frame?.positions?.length);
     const robotAction = view?.robotAction;
     const hasRobotAction = Boolean(robotAction?.jointPositions?.length === 29);
-    if (view?.episodeId !== this.episodeId) {
+    const poseContextKey = `${view?.episodeId || ""}:${hasRobotAction ? robotAction.source_key || "action" : "mocap"}`;
+    if (view?.episodeId !== this.episodeId || poseContextKey !== this.poseContextKey) {
       this.episodeId = view?.episodeId || null;
+      this.poseContextKey = poseContextKey;
       this.footRestPitch = { left: null, right: null };
+      this.rootPlanarOriginRos = null;
+      this.supportFoot = null;
     }
     this.modelRoot.visible = (hasRobotAction || hasFrame) && this.status === "ready";
     if (hasRobotAction && this.robot) this.applyRobotAction(robotAction);
@@ -163,9 +175,37 @@ export class G1Viewer {
   }
 
   applyRobotAction(frame) {
-    this.modelRoot.rotation.set(0, 0, 0);
     frame.jointNames.forEach((name, index) => this.setJoint(name, frame.jointPositions[index]));
-    this.robot.updateMatrixWorld(true);
+    const rootPosition = frame.rootPosition || frame.root_position;
+    const rootQuaternion = frame.rootQuaternionWxyz || frame.root_quaternion_wxyz;
+    if (Array.isArray(rootPosition) && rootPosition.length === 3 && !this.rootPlanarOriginRos) {
+      this.rootPlanarOriginRos = [Number(rootPosition[0]), Number(rootPosition[1])];
+    }
+    const rootPose = robotRootPoseInThree(rootPosition, rootQuaternion, this.rootPlanarOriginRos);
+    this.modelRoot.quaternion.fromArray(rootPose.quaternionXyzw);
+    if (rootPose.position) {
+      this.modelRoot.position.fromArray(rootPose.position);
+      this.modelRoot.updateMatrixWorld(true);
+    } else {
+      this.modelRoot.position.set(this.restPosition.x, 0, this.restPosition.z);
+      this.groundToSupportFoot();
+    }
+  }
+
+  groundToSupportFoot() {
+    this.modelRoot.updateMatrixWorld(true);
+    const heights = {};
+    for (const side of ["left", "right"]) {
+      const link = this.robot?.links?.[`${side}_ankle_roll_link`];
+      if (!link) continue;
+      const bounds = new THREE.Box3().setFromObject(link);
+      if (!bounds.isEmpty() && Number.isFinite(bounds.min.y)) heights[side] = bounds.min.y;
+    }
+    this.supportFoot = chooseSupportFoot(heights.left, heights.right, this.supportFoot);
+    const supportHeight = heights[this.supportFoot];
+    if (Number.isFinite(supportHeight)) this.modelRoot.position.y -= supportHeight;
+    else this.modelRoot.position.y = this.restPosition.y;
+    this.modelRoot.updateMatrixWorld(true);
   }
 
   resize() {
@@ -194,6 +234,8 @@ export class G1Viewer {
   }
 
   applyMocapPose(frame) {
+    this.modelRoot.position.set(this.restPosition.x, 0, this.restPosition.z);
+    this.modelRoot.quaternion.identity();
     const points = new Map();
     const rotations = new Map();
     frame.jointNames?.forEach((name, index) => {
@@ -229,7 +271,7 @@ export class G1Viewer {
     this.setJoint("waist_pitch_joint", Math.atan2(torso.x, Math.max(1e-6, torso.z)));
     this.setJoint("waist_roll_joint", Math.atan2(-torso.y, Math.max(1e-6, torso.z)));
     this.setJoint("waist_yaw_joint", 0);
-    this.robot.updateMatrixWorld(true);
+    this.groundToSupportFoot();
   }
 
   applyLeg(side, hip, knee, ankle, toe) {

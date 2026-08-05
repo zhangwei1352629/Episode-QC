@@ -53,11 +53,19 @@ streams:
     encoding: json
     required: false
 
-  - key: policy_action
+  - key: policy_command
     type: policy
-    display_name: G1 策略动作
+    display_name: Policy 最终控制目标
     topic_patterns:
       - "/g1/policy/final_action"
+    encoding: msgpack
+    required: false
+
+  - key: policy_reference
+    type: policy
+    display_name: PMG 目标姿态
+    topic_patterns:
+      - "/g1/policy/input_ref_motion_cmd"
     encoding: msgpack
     required: false
 

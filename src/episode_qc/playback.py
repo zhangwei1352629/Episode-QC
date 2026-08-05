@@ -19,9 +19,11 @@ from episode_qc.messagepack import decode_messagepack
 from episode_qc.workspace import _json, _now, connect_workspace, episode_detail
 
 
-PLAYBACK_CACHE_VERSION = 4
+PLAYBACK_CACHE_VERSION = 6
 MOTION_FRAME_ENCODING = "episode-qc-motion-f32-le-v1"
-ACTION_FRAME_ENCODING = "episode-qc-action-f32-le-v1"
+ACTION_FRAME_ENCODING = "episode-qc-action-f32-le-v2"
+ACTION_ROOT_POSITION = 1
+ACTION_ROOT_QUATERNION = 2
 DEFAULT_CAMERA_TOPIC = "/camera/ego_head/image/jpeg"
 CACHE_MODES = {"priority", "full"}
 ROBOT_ACTION_SPECS = {
@@ -30,9 +32,14 @@ ROBOT_ACTION_SPECS = {
         "display_name": "Policy 实际执行姿态",
         "adapter_id": "g1_policy_controller_context_body_q_v1",
     },
-    "/g1/policy/final_action": {
+    "/g1/policy/input_ref_motion_cmd": {
         "key": "policy_target",
-        "display_name": "Policy 目标姿态",
+        "display_name": "PMG 目标姿态",
+        "adapter_id": "g1_policy_input_ref_motion_cmd_v1",
+    },
+    "/g1/policy/final_action": {
+        "key": "policy_command",
+        "display_name": "Policy 最终控制目标",
         "adapter_id": "g1_policy_final_action_v1",
     },
     "/soma/retarget/action": {
@@ -52,6 +59,16 @@ G1_29_JOINT_NAMES = [
     "right_shoulder_pitch_joint", "right_shoulder_roll_joint", "right_shoulder_yaw_joint",
     "right_elbow_joint", "right_wrist_roll_joint", "right_wrist_pitch_joint", "right_wrist_yaw_joint",
 ]
+# PMG reference joints are stored in the interleaved IsaacLab order used by the
+# policy observation. Each output (MuJoCo/URDF) joint selects this IsaacLab index.
+G1_MUJOCO_TO_ISAACLAB_INDICES = [
+    0, 3, 6, 9, 13, 17,
+    1, 4, 7, 10, 14, 18,
+    2, 5, 8,
+    11, 15, 19, 21, 23, 25, 27,
+    12, 16, 20, 22, 24, 26, 28,
+]
+ROBOT_ACTION_KEYS = frozenset(str(spec["key"]) for spec in ROBOT_ACTION_SPECS.values())
 
 
 HUMAN_PARENT_NAMES = {
@@ -467,7 +484,25 @@ def decode_robot_action(payload: bytes, source_key: str) -> dict[str, object]:
         if not isinstance(context, dict):
             raise ValueError("Policy controller context 消息缺少 context")
         positions = context.get("body_q")
+        if context.get("base_quat") is not None:
+            root_quaternion = _finite_float_list(context.get("base_quat"), 4, "Policy base quaternion")
     elif source_key == "policy_target":
+        if value.get("schema") != "g1_policy_input_ref_motion_cmd.v1":
+            raise ValueError("不支持的 PMG 参考动作 schema")
+        command = value.get("cmd")
+        if not isinstance(command, dict):
+            raise ValueError("PMG 参考动作消息缺少 cmd")
+        isaaclab_positions = _finite_float_list(
+            command.get("qpos") or command.get("motion_joint_positions"),
+            29,
+            "PMG joint positions",
+        )
+        positions = [isaaclab_positions[index] for index in G1_MUJOCO_TO_ISAACLAB_INDICES]
+        if command.get("body_pos") is not None:
+            root_position = _first_finite_vector(command.get("body_pos"), 3, "PMG root position")
+        if command.get("body_quat") is not None:
+            root_quaternion = _first_finite_vector(command.get("body_quat"), 4, "PMG root quaternion")
+    elif source_key == "policy_command":
         if value.get("schema") != "g1_policy_final_action.v1":
             raise ValueError("不支持的 Policy action schema")
         action = value.get("action")
@@ -485,6 +520,11 @@ def decode_robot_action(payload: bytes, source_key: str) -> dict[str, object]:
             raise ValueError("SOMA qpos 必须包含根姿态和 29 个关节")
         root_position = _finite_float_list(qpos[:3], 3, "SOMA root position")
         root_quaternion = _finite_float_list(qpos[3:7], 4, "SOMA root quaternion")
+        quaternion_order = str(action.get("root_quat_order") or "wxyz").lower()
+        if quaternion_order == "xyzw":
+            root_quaternion = [root_quaternion[3], *root_quaternion[:3]]
+        elif quaternion_order != "wxyz":
+            raise ValueError(f"不支持的 SOMA root quaternion 顺序: {quaternion_order}")
         positions = qpos[7:]
     else:
         raise ValueError(f"不支持的机器人动作源: {source_key}")
@@ -497,6 +537,7 @@ def decode_robot_action(payload: bytes, source_key: str) -> dict[str, object]:
     }
     if root_position is not None:
         frame["root_position"] = root_position
+    if root_quaternion is not None:
         frame["root_quaternion_wxyz"] = root_quaternion
     return frame
 
@@ -510,6 +551,13 @@ def _finite_float_list(value: object, size: int, field_name: str) -> list[float]
     return result
 
 
+def _first_finite_vector(value: object, size: int, field_name: str) -> list[float]:
+    if not isinstance(value, list) or not value:
+        raise ValueError(f"{field_name} 必须至少包含一个 {size} 维向量")
+    first = value[0] if isinstance(value[0], list) else value[:size]
+    return _finite_float_list(first, size, field_name)
+
+
 @lru_cache(maxsize=8)
 def _motion_frame_struct(joint_count: int) -> struct.Struct:
     if joint_count <= 0:
@@ -517,9 +565,11 @@ def _motion_frame_struct(joint_count: int) -> struct.Struct:
     return struct.Struct(f"<qq{joint_count * 7}f{joint_count}B")
 
 
-@lru_cache(maxsize=2)
-def _action_frame_struct(has_root_pose: bool) -> struct.Struct:
-    return struct.Struct("<qq29f7f" if has_root_pose else "<qq29f")
+@lru_cache(maxsize=1)
+def _action_frame_struct() -> struct.Struct:
+    # timestamp, sequence, root-field flags, 29 joints, optional root xyz + quaternion.
+    # Optional fields keep a fixed-width frame so all action sources share one decoder.
+    return struct.Struct("<qqI29f3f4f")
 
 
 def _optional_int64(value: object) -> int:
@@ -563,31 +613,47 @@ def decode_motion_frame(payload: bytes, joint_count: int) -> dict[str, object]:
 
 
 def encode_robot_action_frame(frame: dict[str, object], source_key: str) -> bytes:
-    has_root_pose = source_key == "soma"
+    if source_key not in ROBOT_ACTION_KEYS:
+        raise ValueError(f"不支持的机器人动作源: {source_key}")
+    root_position = frame.get("root_position")
+    root_quaternion = frame.get("root_quaternion_wxyz")
+    flags = 0
+    if root_position is not None:
+        flags |= ACTION_ROOT_POSITION
+    if root_quaternion is not None:
+        flags |= ACTION_ROOT_QUATERNION
     values = [
         _optional_int64(frame.get("source_timestamp_ns")),
         _optional_int64(frame.get("sequence")),
+        flags,
         *_finite_float_list(frame.get("joint_positions"), 29, "G1 joint positions"),
+        *(_finite_float_list(root_position, 3, "G1 root position") if root_position is not None else [0.0] * 3),
+        *(
+            _finite_float_list(root_quaternion, 4, "G1 root quaternion")
+            if root_quaternion is not None
+            else [1.0, 0.0, 0.0, 0.0]
+        ),
     ]
-    if has_root_pose:
-        values.extend(_finite_float_list(frame.get("root_position"), 3, "SOMA root position"))
-        values.extend(_finite_float_list(frame.get("root_quaternion_wxyz"), 4, "SOMA root quaternion"))
-    return _action_frame_struct(has_root_pose).pack(*values)
+    return _action_frame_struct().pack(*values)
 
 
 def decode_robot_action_frame(payload: bytes, source_key: str) -> dict[str, object]:
-    has_root_pose = source_key == "soma"
-    values = _action_frame_struct(has_root_pose).unpack(payload)
-    timestamp_ns, sequence = values[:2]
+    if source_key not in ROBOT_ACTION_KEYS:
+        raise ValueError(f"不支持的机器人动作源: {source_key}")
+    values = _action_frame_struct().unpack(payload)
+    timestamp_ns, sequence, flags = values[:3]
+    if flags & ~(ACTION_ROOT_POSITION | ACTION_ROOT_QUATERNION):
+        raise ValueError(f"机器人动作帧包含未知根位姿标志: {flags}")
     frame: dict[str, object] = {
         "source_key": source_key,
-        "joint_positions": list(values[2:31]),
+        "joint_positions": list(values[3:32]),
         "source_timestamp_ns": None if timestamp_ns == -1 else timestamp_ns,
         "sequence": None if sequence == -1 else sequence,
     }
-    if has_root_pose:
-        frame["root_position"] = list(values[31:34])
-        frame["root_quaternion_wxyz"] = list(values[34:38])
+    if flags & ACTION_ROOT_POSITION:
+        frame["root_position"] = list(values[32:35])
+    if flags & ACTION_ROOT_QUATERNION:
+        frame["root_quaternion_wxyz"] = list(values[35:39])
     return frame
 
 

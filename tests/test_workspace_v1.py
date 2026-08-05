@@ -21,11 +21,15 @@ from episode_qc.playback import (
     read_cached_robot_action_frame,
 )
 from episode_qc.workspace import (
+    activate_label_set,
+    clear_local_task_history,
+    delete_label_set,
     delete_annotation,
     episode_detail,
     export_workspace,
     import_label_schema,
     initialize_workspace,
+    list_label_sets,
     list_qc_tasks,
     preview_label_schema,
     qc_task_manifest,
@@ -621,6 +625,61 @@ def _write_sample_episode(directory: Path) -> Path:
     (directory / "metadata.yaml").write_text("status: saved\n", encoding="utf-8")
     (directory / "config_snapshot.yaml").write_text("streams: []\n", encoding="utf-8")
     return path
+
+
+def test_label_library_lists_activates_and_soft_deletes_versions(tmp_path: Path):
+    db_path = tmp_path / "workspace.db"
+    first_path = _write_label_schema(tmp_path / "labels-v1.yaml")
+    first = import_label_schema(db_path, first_path)
+    payload = yaml.safe_load(first_path.read_text(encoding="utf-8"))
+    payload["schema"]["schema_version"] = "2.0.0"
+    payload["schema"]["label_set_name"] = "测试标签新版"
+    second_path = tmp_path / "labels-v2.yaml"
+    second_path.write_text(yaml.safe_dump(payload, allow_unicode=True), encoding="utf-8")
+    second = import_label_schema(db_path, second_path)
+
+    label_sets = list_label_sets(db_path)
+    assert len(label_sets) == 2
+    assert label_sets[0]["active"] is True
+    assert label_sets[0]["label_count"] == 2
+    first_id = next(item["id"] for item in label_sets if item["version"] == first["version"])
+    second_id = next(item["id"] for item in label_sets if item["version"] == second["version"])
+
+    activated = activate_label_set(db_path, first_id)
+    assert activated["active"] is True
+    deleted = delete_label_set(db_path, first_id)
+    assert deleted["replacement_id"] == second_id
+    assert [item["id"] for item in list_label_sets(db_path)] == [second_id]
+    with pytest.raises(ValueError, match="至少保留一个"):
+        delete_label_set(db_path, second_id)
+
+
+def test_clear_local_task_history_keeps_current_and_flow_tasks_and_source_files(tmp_path: Path):
+    db_path = tmp_path / "workspace.db"
+    first_source = tmp_path / "local-current"
+    second_source = tmp_path / "local-history"
+    flow_source = tmp_path / "flow-cache"
+    _write_sample_episode(first_source / "episode_000001")
+    _write_sample_episode(second_source / "episode_000002")
+    _write_sample_episode(flow_source / "episode_000003")
+    current = scan_data_source(db_path, first_source)
+    historical = scan_data_source(db_path, second_source)
+    flow = scan_data_source(
+        db_path,
+        flow_source,
+        task_code="QCJ-TEST-001",
+        task_name="Flow 任务",
+        origin="flow",
+        flow_job_code="QCJ-TEST-001",
+    )
+
+    cleared = clear_local_task_history(db_path, keep_task_id=current["task_id"])
+    assert cleared["removed_count"] == 1
+    assert cleared["removed_tasks"][0]["id"] == historical["task_id"]
+    assert cleared["source_files_deleted"] is False
+    assert second_source.is_dir()
+    remaining_ids = {item["id"] for item in list_qc_tasks(db_path)}
+    assert remaining_ids == {current["task_id"], flow["task_id"]}
 
 
 def _write_label_schema(path: Path) -> Path:

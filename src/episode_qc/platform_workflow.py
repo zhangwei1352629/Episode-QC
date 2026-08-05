@@ -42,15 +42,26 @@ class QualityCacheError(RuntimeError):
 
 
 class FlowClient:
-    def __init__(self, base_url: str, username: str, password: str, *, timeout: int = 30):
+    def __init__(
+        self,
+        base_url: str,
+        username: str | None = None,
+        password: str | None = None,
+        *,
+        token: str | None = None,
+        timeout: int = 30,
+    ):
         self.base_url = str(base_url).strip().rstrip("/")
         if not self.base_url.startswith(("http://", "https://")):
             raise FlowClientError("Flow 地址必须以 http:// 或 https:// 开头")
-        token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
-        self.headers = {
-            "Authorization": f"Basic {token}",
-            "Content-Type": "application/json",
-        }
+        self.headers = {"Content-Type": "application/json"}
+        if token:
+            self.headers["Authorization"] = f"Bearer {token}"
+        elif username is not None and password is not None:
+            basic_token = base64.b64encode(
+                f"{username}:{password}".encode("utf-8")
+            ).decode("ascii")
+            self.headers["Authorization"] = f"Basic {basic_token}"
         self.timeout = timeout
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
@@ -73,11 +84,26 @@ class FlowClient:
         except (urllib.error.URLError, TimeoutError, OSError) as error:
             raise FlowClientError(f"无法连接 Flow：{error}") from error
 
-    def jobs(self, statuses: list[str] | None = None) -> list[dict]:
+    def jobs_response(self, statuses: list[str] | None = None) -> dict:
         suffix = ""
         if statuses:
             suffix = "?status=" + ",".join(statuses)
-        return self.request("GET", f"/api/v1/qc/jobs{suffix}")["jobs"]
+        return self.request("GET", f"/api/v1/qc/jobs{suffix}")
+
+    def reviewers(self) -> dict:
+        return self.request("GET", "/api/v1/reviewers")
+
+    def login_reviewer(self, employee_no: str) -> dict:
+        result = self.request(
+            "POST", "/api/v1/qc-reviewer-login", {"employee_no": employee_no}
+        )
+        self.headers["Authorization"] = (
+            f"{result.get('token_type', 'Bearer')} {result['token']}"
+        )
+        return result
+
+    def jobs(self, statuses: list[str] | None = None) -> list[dict]:
+        return self.jobs_response(statuses)["jobs"]
 
     def claim(self, job_code: str) -> dict:
         return self.request("POST", f"/api/v1/qc/jobs/{job_code}/claim", {})

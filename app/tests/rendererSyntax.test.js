@@ -47,3 +47,49 @@ test("客户端 Data Worker 链路由浏览器本机读取并由中央保存任�
   assert.match(webApi, /onWorkerEpisodeCacheReady/);
   assert.match(webApi, /episodeQcWorker:/);
 });
+
+test("Flow 任务中心包含登录、领取、缓存和提交入口", () => {
+  const html = fs.readFileSync(path.resolve(__dirname, "../renderer/index.html"), "utf8");
+  const renderer = fs.readFileSync(path.resolve(__dirname, "../renderer/renderer.js"), "utf8");
+  const webApi = fs.readFileSync(path.resolve(__dirname, "../renderer/web-api.js"), "utf8");
+
+  assert.match(html, /id="flow-login-form"/);
+  assert.match(html, /id="refresh-flow-reviewers"/);
+  assert.match(html, /id="flow-reviewer-select"/);
+  assert.match(html, /id="flow-task-list"/);
+  assert.match(html, /id="submit-flow-task"/);
+  assert.match(renderer, /refreshPlatformJobs/);
+  assert.match(renderer, /loadPlatformReviewers/);
+  assert.match(renderer, /function flowJobStatusName/);
+  assert.match(renderer, /claimPlatformJob/);
+  assert.match(webApi, /\/api\/platform\/reviewers/);
+  assert.match(webApi, /\/api\/platform\/login/);
+  assert.match(webApi, /\/api\/platform\/jobs/);
+});
+
+test("标签库菜单和本地任务历史管理入口完整", () => {
+  const html = fs.readFileSync(path.resolve(__dirname, "../renderer/index.html"), "utf8");
+  const renderer = fs.readFileSync(path.resolve(__dirname, "../renderer/renderer.js"), "utf8");
+  const webApi = fs.readFileSync(path.resolve(__dirname, "../renderer/web-api.js"), "utf8");
+
+  assert.match(html, /<summary class="button secondary">标签库<\/summary>/);
+  assert.match(html, /id="label-set-list"/);
+  assert.match(html, /id="clear-local-task-history"/);
+  assert.match(renderer, /handleLabelSetAction/);
+  assert.match(renderer, /clearLocalTaskHistory/);
+  assert.match(webApi, /\/api\/label-sets/);
+  assert.match(webApi, /\/api\/tasks\/history/);
+});
+
+test("收起任务栏后标注区使用双栏布局并优化备注、当前标注和结论", () => {
+  const html = fs.readFileSync(path.resolve(__dirname, "../renderer/index.html"), "utf8");
+  const css = fs.readFileSync(path.resolve(__dirname, "../renderer/styles.css"), "utf8");
+
+  assert.match(html, /class="annotation-note"/);
+  assert.match(html, /id="decision-current"/);
+  assert.match(css, /body\.episodes-collapsed \.label-sidebar\s*\{[^}]*grid-template-columns:/s);
+  assert.match(css, /body\.episodes-collapsed \.label-section\s*\{[^}]*grid-column:\s*1/s);
+  assert.match(css, /body\.episodes-collapsed \.annotations-section\s*\{[^}]*grid-column:\s*2/s);
+  assert.match(css, /\.annotation-note textarea:focus\s*\{[^}]*min-height:/s);
+  assert.match(css, /\.decision-copy small\s*\{[^}]*display:\s*none/s);
+});

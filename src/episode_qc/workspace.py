@@ -1119,6 +1119,184 @@ def get_qc_task(db_path: str | Path, task_id: str) -> dict[str, object]:
         return _task_row(connection, task_id)
 
 
+def mark_qc_task_submitted(db_path: str | Path, flow_job_code: str) -> dict[str, object]:
+    initialize_workspace(db_path)
+    with connect_workspace(db_path) as connection:
+        task = connection.execute(
+            "SELECT id FROM qc_task WHERE flow_job_code = ?",
+            (flow_job_code,),
+        ).fetchone()
+        if task is None:
+            raise KeyError(f"本地不存在 Flow 质检任务: {flow_job_code}")
+        connection.execute(
+            "UPDATE qc_task SET status = 'submitted', updated_at = ? WHERE id = ?",
+            (_now(), task["id"]),
+        )
+        return _task_row(connection, str(task["id"]))
+
+
+def clear_local_task_history(
+    db_path: str | Path, *, keep_task_id: str | None = None
+) -> dict[str, object]:
+    """Remove non-Flow task indexes while leaving every source directory untouched."""
+
+    initialize_workspace(db_path)
+    with connect_workspace(db_path) as connection:
+        where = "WHERE t.origin != 'flow'"
+        parameters: tuple[object, ...] = ()
+        if keep_task_id:
+            where += " AND t.id != ?"
+            parameters = (keep_task_id,)
+        tasks = _task_rows(connection, where, parameters)
+        removed_episode_ids: list[str] = []
+        for task in tasks:
+            episode_rows = connection.execute(
+                """
+                SELECT e.id FROM episode e
+                JOIN data_source ds ON ds.id = e.data_source_id
+                WHERE ds.task_id = ?
+                """,
+                (task["id"],),
+            ).fetchall()
+            episode_ids = [str(row["id"]) for row in episode_rows]
+            removed_episode_ids.extend(episode_ids)
+            if episode_ids:
+                placeholders = ",".join("?" for _ in episode_ids)
+                annotation_rows = connection.execute(
+                    f"SELECT id FROM annotation WHERE episode_id IN ({placeholders})",
+                    tuple(episode_ids),
+                ).fetchall()
+                annotation_ids = [str(row["id"]) for row in annotation_rows]
+                if annotation_ids:
+                    annotation_placeholders = ",".join("?" for _ in annotation_ids)
+                    connection.execute(
+                        f"DELETE FROM change_log WHERE entity_type = 'annotation' "
+                        f"AND entity_id IN ({annotation_placeholders})",
+                        tuple(annotation_ids),
+                    )
+                connection.execute(
+                    f"DELETE FROM annotation WHERE episode_id IN ({placeholders})",
+                    tuple(episode_ids),
+                )
+                connection.execute(
+                    f"DELETE FROM episode WHERE id IN ({placeholders})",
+                    tuple(episode_ids),
+                )
+            connection.execute("DELETE FROM data_source WHERE task_id = ?", (task["id"],))
+            connection.execute("DELETE FROM qc_task WHERE id = ?", (task["id"],))
+        return {
+            "removed_count": len(tasks),
+            "removed_tasks": tasks,
+            "removed_episode_ids": removed_episode_ids,
+            "source_files_deleted": False,
+        }
+
+
+def list_label_sets(db_path: str | Path) -> list[dict[str, object]]:
+    initialize_workspace(db_path)
+    with connect_workspace(db_path) as connection:
+        workspace = connection.execute(
+            "SELECT active_label_set_id FROM workspace LIMIT 1"
+        ).fetchone()
+        active_id = str(workspace["active_label_set_id"] or "")
+        rows = connection.execute(
+            """
+            SELECT ls.*,
+                   COUNT(ld.id) AS label_count,
+                   (
+                       SELECT COUNT(*) FROM annotation a
+                       WHERE a.label_set_key = ls.label_set_key
+                         AND a.label_schema_version = ls.version
+                         AND a.deleted_at IS NULL
+                   ) AS annotation_count
+            FROM label_set ls
+            LEFT JOIN label_definition ld ON ld.label_set_id = ls.id AND ld.enabled = 1
+            WHERE ls.enabled = 1
+            GROUP BY ls.id
+            ORDER BY ls.created_at DESC, ls.name COLLATE NOCASE
+            """
+        ).fetchall()
+        return [
+            {
+                "id": str(row["id"]),
+                "label_set_id": str(row["label_set_key"]),
+                "name": str(row["name"]),
+                "version": str(row["version"]),
+                "language": str(row["language"]),
+                "source_format": str(row["source_format"]),
+                "label_count": int(row["label_count"] or 0),
+                "annotation_count": int(row["annotation_count"] or 0),
+                "active": str(row["id"]) == active_id,
+                "created_at": str(row["created_at"]),
+            }
+            for row in rows
+        ]
+
+
+def activate_label_set(db_path: str | Path, label_set_id: str) -> dict[str, object]:
+    initialize_workspace(db_path)
+    with connect_workspace(db_path) as connection:
+        label_set = connection.execute(
+            "SELECT id FROM label_set WHERE id = ? AND enabled = 1",
+            (label_set_id,),
+        ).fetchone()
+        if label_set is None:
+            raise KeyError(f"标签库不存在: {label_set_id}")
+        connection.execute(
+            "UPDATE workspace SET active_label_set_id = ?, updated_at = ?",
+            (label_set_id, _now()),
+        )
+    return next(item for item in list_label_sets(db_path) if item["id"] == label_set_id)
+
+
+def delete_label_set(db_path: str | Path, label_set_id: str) -> dict[str, object]:
+    """Hide a label set while retaining definitions used by historical annotations."""
+
+    initialize_workspace(db_path)
+    with connect_workspace(db_path) as connection:
+        workspace = connection.execute(
+            "SELECT active_label_set_id FROM workspace LIMIT 1"
+        ).fetchone()
+        label_set = connection.execute(
+            "SELECT id, name FROM label_set WHERE id = ? AND enabled = 1",
+            (label_set_id,),
+        ).fetchone()
+        if label_set is None:
+            raise KeyError(f"标签库不存在: {label_set_id}")
+        enabled_count = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM label_set WHERE enabled = 1"
+            ).fetchone()[0]
+        )
+        if enabled_count <= 1:
+            raise ValueError("至少保留一个可用标签库")
+        replacement_id = None
+        if str(workspace["active_label_set_id"] or "") == label_set_id:
+            replacement = connection.execute(
+                """
+                SELECT id FROM label_set
+                WHERE enabled = 1 AND id != ?
+                ORDER BY created_at DESC, name COLLATE NOCASE
+                LIMIT 1
+                """,
+                (label_set_id,),
+            ).fetchone()
+            replacement_id = str(replacement["id"])
+            connection.execute(
+                "UPDATE workspace SET active_label_set_id = ?, updated_at = ?",
+                (replacement_id, _now()),
+            )
+        connection.execute(
+            "UPDATE label_set SET enabled = 0 WHERE id = ?", (label_set_id,)
+        )
+        deleted = {"id": label_set_id, "name": str(label_set["name"])}
+    return {
+        "deleted": deleted,
+        "replacement_id": replacement_id,
+        "label_sets": list_label_sets(db_path),
+    }
+
+
 def qc_task_manifest(db_path: str | Path, task_id: str) -> dict[str, object]:
     state = workspace_state(db_path, task_id=task_id)
     episodes = []

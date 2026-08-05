@@ -24,7 +24,7 @@ const els = {
   labelSearch: $("label-search"), labelGroupFilter: $("label-group-filter"), labelCount: $("label-count"),
   labelSetMeta: $("label-set-meta"), targetContext: $("target-context"), labelList: $("label-list"),
   annotationComment: $("annotation-comment"), undo: $("undo"), redo: $("redo"),
-  annotationCount: $("annotation-count"), annotationList: $("annotation-list"), decisionGrid: $("decision-grid"),
+  annotationCount: $("annotation-count"), annotationList: $("annotation-list"), decisionGrid: $("decision-grid"), decisionCurrent: $("decision-current"),
   needsRecheck: $("needs-recheck"), toastStack: $("toast-stack"), annotationEditor: $("annotation-editor"),
   editId: $("edit-id"), editStart: $("edit-start"), editEnd: $("edit-end"), editSeverity: $("edit-severity"),
   editAction: $("edit-action"), editComment: $("edit-comment"), deleteAnnotation: $("delete-annotation"),
@@ -32,7 +32,13 @@ const els = {
   currentTaskPath: $("current-task-path"), currentTaskStatus: $("current-task-status"),
   openTaskCenter: $("open-task-center"), rescanTask: $("rescan-task"), taskCenter: $("task-center"),
   closeTaskCenter: $("close-task-center"), taskCenterSummary: $("task-center-summary"),
-  taskList: $("task-list"), taskCenterImport: $("task-center-import")
+  taskList: $("task-list"), taskCenterImport: $("task-center-import"), submitFlowTask: $("submit-flow-task"),
+  clearLocalTaskHistory: $("clear-local-task-history"),
+  flowTaskStatus: $("flow-task-status"), flowTaskList: $("flow-task-list"),
+  flowLoginForm: $("flow-login-form"), flowBaseUrl: $("flow-base-url"),
+  flowReviewerSelect: $("flow-reviewer-select"), refreshFlowReviewers: $("refresh-flow-reviewers"), flowLogin: $("flow-login"),
+  flowLogout: $("flow-logout"), refreshFlowJobs: $("refresh-flow-jobs"),
+  labelLibraryStatus: $("label-library-status"), labelSetList: $("label-set-list"), refreshLabelSets: $("refresh-label-sets")
 };
 
 const state = {
@@ -73,7 +79,12 @@ const state = {
   drag: null,
   timelineSelecting: false,
   timelineAnchorNs: null,
-  reviewerTimer: null
+  reviewerTimer: null,
+  platform: { connected: false, jobs: [] },
+  platformReviewers: [],
+  labelSets: [],
+  pendingFlowJobCode: null,
+  flowPollTimer: null
 };
 
 const g1Viewer = new G1Viewer(els.motionCanvas, (status, error) => {
@@ -103,6 +114,8 @@ async function initialize() {
       ? savedTaskId
       : state.tasks.find((item) => item.last_episode_id)?.id || state.tasks[0]?.id || null;
     await refreshWorkspace({ preserveEpisode: false });
+    await refreshLabelSets({ quiet: true });
+    await refreshPlatformJobs({ quiet: true });
     setSaveState("saved", "已保存");
     const recentEpisodeId = state.currentTask?.last_episode_id;
     if (recentEpisodeId && state.episodes.some((item) => item.id === recentEpisodeId)) {
@@ -148,15 +161,27 @@ function bindEvents() {
   els.toolMenu.addEventListener("click", (event) => {
     if (event.target.closest("#import-labels, .download-button")) window.setTimeout(() => { els.toolMenu.open = false; }, 0);
   });
+  els.toolMenu.addEventListener("toggle", () => {
+    if (els.toolMenu.open) refreshLabelSets({ quiet: true });
+  });
+  els.refreshLabelSets.addEventListener("click", () => refreshLabelSets());
+  els.labelSetList.addEventListener("click", handleLabelSetAction);
   els.addSource.addEventListener("click", addSource);
   els.taskCenterImport.addEventListener("click", addSource);
-  els.openTaskCenter.addEventListener("click", () => { renderTaskContext(); els.taskCenter.showModal(); });
+  els.openTaskCenter.addEventListener("click", () => { renderTaskContext(); refreshPlatformJobs({ quiet: true }); els.taskCenter.showModal(); });
   els.closeTaskCenter.addEventListener("click", () => els.taskCenter.close());
   els.rescanTask.addEventListener("click", rescanCurrentTask);
+  els.submitFlowTask.addEventListener("click", submitCurrentFlowTask);
+  els.flowLoginForm.addEventListener("submit", loginPlatform);
+  els.refreshFlowReviewers.addEventListener("click", loadPlatformReviewers);
+  els.flowLogout.addEventListener("click", logoutPlatform);
+  els.refreshFlowJobs.addEventListener("click", () => refreshPlatformJobs());
+  els.flowTaskList.addEventListener("click", handleFlowTaskAction);
   els.taskList.addEventListener("click", (event) => {
     const item = event.target.closest("[data-task-id]");
     if (item) switchTask(item.dataset.taskId);
   });
+  els.clearLocalTaskHistory.addEventListener("click", clearLocalTaskHistory);
   els.importLabels.addEventListener("click", importLabels);
   els.exportResults.addEventListener("click", exportResults);
   els.episodeSearch.addEventListener("input", renderEpisodeList);
@@ -244,6 +269,7 @@ function bindEvents() {
   els.deleteAnnotation.addEventListener("click", deleteCurrentAnnotation);
   window.addEventListener("beforeunload", () => {
     state.workerEventsClose?.();
+    if (state.flowPollTimer) window.clearInterval(state.flowPollTimer);
     savePlayhead();
   });
 }
@@ -296,9 +322,20 @@ function renderTaskContext() {
     : "未加载";
   els.currentTaskStatus.dataset.status = task?.status || "empty";
   els.rescanTask.disabled = !task;
+  const flowTask = Boolean(task?.origin === "flow" && task?.flow_job_code);
+  els.submitFlowTask.hidden = !flowTask || !["completed", "submitted"].includes(task.status);
+  els.submitFlowTask.disabled = task?.status === "submitted";
+  els.submitFlowTask.textContent = task?.status === "submitted" ? "已提交 Flow" : "提交到 Flow";
 
   const completedTasks = state.tasks.filter((item) => ["completed", "submitted", "archived"].includes(item.status)).length;
   const failedTasks = state.tasks.filter((item) => item.status === "failed").length;
+  const clearableLocalTasks = state.tasks.filter(
+    (item) => item.origin !== "flow" && item.id !== state.currentTaskId,
+  );
+  els.clearLocalTaskHistory.disabled = !clearableLocalTasks.length;
+  els.clearLocalTaskHistory.textContent = clearableLocalTasks.length
+    ? `清空历史导入 (${clearableLocalTasks.length})`
+    : "无历史导入";
   els.taskCenterSummary.innerHTML = [
     `<span>任务 ${state.tasks.length}</span>`,
     `<span>进行中 ${state.tasks.length - completedTasks - failedTasks}</span>`,
@@ -324,6 +361,185 @@ function renderTaskContext() {
   }).join("");
 }
 
+async function refreshPlatformJobs({ quiet = false } = {}) {
+  try {
+    const payload = await window.episodeQc.getPlatformJobs();
+    state.platform = payload;
+    renderPlatformJobs();
+    const claimed = payload.jobs?.find(
+      (item) => item.code === state.pendingFlowJobCode && item.local_task_id && !item.local_caching,
+    );
+    if (claimed) {
+      state.pendingFlowJobCode = null;
+      stopFlowPolling();
+      toast(`任务 ${claimed.code} 已缓存并进入质检`, "success", 5500);
+      await switchTask(claimed.local_task_id);
+      return;
+    }
+    const stillCaching = payload.jobs?.some(
+      (item) => item.local_caching || (!item.local_task_id && ["claimed", "caching", "cache_ready"].includes(item.status)),
+    );
+    if (!stillCaching) stopFlowPolling();
+  } catch (error) {
+    if (!quiet) toast(error.message || String(error), "error", 6500);
+    els.flowTaskStatus.textContent = "连接失败";
+  }
+}
+
+function renderPlatformJobs() {
+  const platform = state.platform || { connected: false, jobs: [] };
+  els.flowLoginForm.hidden = Boolean(platform.connected);
+  els.flowLogout.hidden = !platform.connected;
+  els.refreshFlowJobs.hidden = !platform.connected;
+  if (!platform.connected) {
+    els.flowTaskStatus.textContent = platform.error || "尚未选择质检员";
+    els.flowTaskList.innerHTML = '<div class="empty-panel">刷新并选择质检员后显示可领取任务</div>';
+    if (!els.flowBaseUrl.value) {
+      els.flowBaseUrl.value = window.localStorage.getItem("episodeQcFlowUrl") || platform.default_base_url || "http://127.0.0.1:8000";
+    }
+    return;
+  }
+  els.flowTaskStatus.textContent = `${platform.reviewer || platform.username} · ${platform.jobs.length} 个批次`;
+  if (!platform.jobs.length) {
+    els.flowTaskList.innerHTML = '<div class="empty-panel">当前没有可见的 Flow 质检任务</div>';
+    return;
+  }
+  els.flowTaskList.innerHTML = platform.jobs.map((job) => {
+    const action = flowJobAction(job);
+    const progress = ["claimed", "caching", "cache_ready"].includes(job.status)
+      ? ` · 缓存 ${Number(job.cache_progress || 0)}%`
+      : "";
+    return `
+      <div class="flow-task-item">
+        <div>
+          <strong>${escapeHtml(job.task_name || job.asset_id || job.code)}</strong>
+          <small>${escapeHtml(job.code)} · ${escapeHtml(flowJobStatusName(job.status))}${escapeHtml(progress)}</small>
+          <span>${escapeHtml(job.collector || "未知采集员")} · ${job.required_episode_count || job.episodes?.length || 0} Episode · ${formatBytes(job.asset_size_bytes)}</span>
+        </div>
+        <button type="button" data-flow-job-code="${escapeHtml(job.code)}" data-flow-action="${action.name}" ${action.disabled ? "disabled" : ""}>${escapeHtml(action.label)}</button>
+      </div>`;
+  }).join("");
+}
+
+function flowJobAction(job) {
+  if (job.local_caching) return { name: "none", label: `缓存 ${Number(job.cache_progress || 0)}%`, disabled: true };
+  if (job.local_task_id) return { name: "open", label: job.local_task_status === "submitted" ? "已提交" : "打开任务", disabled: false };
+  if (["claimed", "caching", "cache_ready"].includes(job.status)) return { name: "claim", label: "继续缓存", disabled: false };
+  if (job.status === "pending") return { name: "claim", label: "领取并缓存", disabled: false };
+  if (job.status === "failed") return { name: "claim", label: "重试缓存", disabled: false };
+  if (job.status === "completed") return { name: "none", label: "已完成", disabled: true };
+  return { name: "none", label: "等待数据", disabled: true };
+}
+
+async function loginPlatform(event) {
+  event.preventDefault();
+  const employeeNo = els.flowReviewerSelect.value;
+  if (!employeeNo) return toast("请先刷新并选择质检员", "error");
+  setBusyButton(els.flowLogin, true, "加载中…");
+  try {
+    const baseUrl = els.flowBaseUrl.value.trim();
+    state.platform = await window.episodeQc.loginPlatform({ baseUrl, employeeNo });
+    window.localStorage.setItem("episodeQcFlowUrl", baseUrl);
+    window.localStorage.setItem("episodeQcFlowReviewer", employeeNo);
+    renderPlatformJobs();
+    if (!els.reviewerName.value.trim() && state.platform.reviewer) {
+      els.reviewerName.value = state.platform.reviewer;
+      scheduleReviewerSave();
+    }
+    toast(`已选择质检员：${state.platform.reviewer || employeeNo}`, "success");
+  } catch (error) {
+    toast(error.message || String(error), "error", 6500);
+  } finally {
+    setBusyButton(els.flowLogin, false, "选择并加载任务");
+  }
+}
+
+async function loadPlatformReviewers() {
+  const baseUrl = els.flowBaseUrl.value.trim();
+  if (!baseUrl) return toast("请填写 Flow 地址", "error");
+  setBusyButton(els.refreshFlowReviewers, true, "刷新中…");
+  try {
+    const payload = await window.episodeQc.getPlatformReviewers(baseUrl);
+    state.platformReviewers = payload.reviewers || [];
+    const saved = window.localStorage.getItem("episodeQcFlowReviewer") || "";
+    els.flowReviewerSelect.innerHTML = [
+      '<option value="">请选择质检员</option>',
+      ...state.platformReviewers.map((reviewer) => `<option value="${escapeHtml(reviewer.employee_no)}">${escapeHtml(reviewer.display_name)} · ${escapeHtml(reviewer.team_name || reviewer.employee_no)}</option>`),
+    ].join("");
+    if (state.platformReviewers.some((item) => item.employee_no === saved)) {
+      els.flowReviewerSelect.value = saved;
+    } else if (state.platformReviewers.length === 1) {
+      els.flowReviewerSelect.value = state.platformReviewers[0].employee_no;
+    }
+    window.localStorage.setItem("episodeQcFlowUrl", baseUrl);
+    els.flowTaskStatus.textContent = `已加载 ${state.platformReviewers.length} 名质检员`;
+    toast(`已刷新 ${state.platformReviewers.length} 名质检员`, "success");
+  } catch (error) {
+    toast(error.message || String(error), "error", 6500);
+  } finally {
+    setBusyButton(els.refreshFlowReviewers, false, "刷新质检员");
+  }
+}
+
+async function logoutPlatform() {
+  try {
+    state.platform = await window.episodeQc.logoutPlatform();
+    renderPlatformJobs();
+    toast("已退出 Flow");
+  } catch (error) { toast(error.message || String(error), "error", 6500); }
+}
+
+async function handleFlowTaskAction(event) {
+  const button = event.target.closest("[data-flow-job-code]");
+  if (!button || button.disabled) return;
+  const job = state.platform.jobs.find((item) => item.code === button.dataset.flowJobCode);
+  if (!job) return;
+  if (button.dataset.flowAction === "open" && job.local_task_id) {
+    await switchTask(job.local_task_id);
+    return;
+  }
+  if (button.dataset.flowAction !== "claim") return;
+  setBusyButton(button, true, "领取中…");
+  try {
+    const result = await window.episodeQc.claimPlatformJob(job.code);
+    state.pendingFlowJobCode = job.code;
+    toast(result.accepted ? `已领取 ${job.code}，正在后台完整缓存` : `${job.code} 已在本机处理`, "success", 5500);
+    startFlowPolling();
+    await refreshPlatformJobs({ quiet: true });
+  } catch (error) {
+    toast(error.message || String(error), "error", 7000);
+    await refreshPlatformJobs({ quiet: true });
+  }
+}
+
+function startFlowPolling() {
+  if (state.flowPollTimer) return;
+  state.flowPollTimer = window.setInterval(() => refreshPlatformJobs({ quiet: true }), 1500);
+}
+
+function stopFlowPolling() {
+  if (!state.flowPollTimer) return;
+  window.clearInterval(state.flowPollTimer);
+  state.flowPollTimer = null;
+}
+
+async function submitCurrentFlowTask() {
+  const task = state.currentTask;
+  if (!task?.flow_job_code || task.status !== "completed") return;
+  if (!window.confirm(`确认把 ${task.flow_job_code} 的全部 Episode 质检结论提交到 Flow？`)) return;
+  setBusyButton(els.submitFlowTask, true, "提交中…");
+  try {
+    await window.episodeQc.submitPlatformJob(task.flow_job_code);
+    await refreshWorkspace();
+    await refreshPlatformJobs({ quiet: true });
+    toast(`质检结果已提交到 Flow：${task.flow_job_code}`, "success", 6000);
+  } catch (error) {
+    toast(error.message || String(error), "error", 7000);
+  } finally {
+    renderTaskContext();
+  }
+}
+
 async function switchTask(taskId) {
   if (!taskId || taskId === state.currentTaskId) {
     els.taskCenter.close();
@@ -344,6 +560,26 @@ async function switchTask(taskId) {
   } catch (error) {
     setSaveState("error", "切换失败");
     toast(error.message || String(error), "error", 7000);
+  }
+}
+
+async function clearLocalTaskHistory() {
+  const candidates = state.tasks.filter(
+    (item) => item.origin !== "flow" && item.id !== state.currentTaskId,
+  );
+  if (!candidates.length) return;
+  if (!window.confirm(
+    `确认清空 ${candidates.length} 个历史导入任务？\n\n只删除 QC 本地索引和派生缓存，原始数据目录不会被删除；当前任务和 Flow 任务会保留。`,
+  )) return;
+  setBusyButton(els.clearLocalTaskHistory, true, "清理中…");
+  try {
+    const result = await window.episodeQc.clearLocalTaskHistory(state.currentTaskId);
+    await refreshWorkspace({ preserveEpisode: true });
+    toast(`已清空 ${result.removed_count} 个历史导入；原始数据未删除`, "success", 6000);
+  } catch (error) {
+    toast(error.message || String(error), "error", 7000);
+  } finally {
+    renderTaskContext();
   }
 }
 
@@ -428,11 +664,74 @@ async function importLabels() {
     const imported = await window.episodeQc.confirmLabelSchema();
     toast(`标签库 ${imported.label_set_id} ${imported.version} 已导入：新增 ${imported.added.length}，更新 ${imported.updated.length}`, "success", 6000);
     await refreshWorkspace();
+    await refreshLabelSets({ quiet: true });
     if (state.currentEpisodeId) await reloadCurrentEpisode();
   } catch (error) {
     toast(error.message || String(error), "error", 7000);
   } finally {
     setBusyButton(els.importLabels, false, "导入标签库");
+  }
+}
+
+async function refreshLabelSets({ quiet = false } = {}) {
+  try {
+    const payload = await window.episodeQc.getLabelSets();
+    state.labelSets = payload.label_sets || [];
+    renderLabelSets();
+  } catch (error) {
+    els.labelLibraryStatus.textContent = "读取失败";
+    if (!quiet) toast(error.message || String(error), "error", 6500);
+  }
+}
+
+function renderLabelSets() {
+  const labelSets = state.labelSets || [];
+  els.labelLibraryStatus.textContent = labelSets.length
+    ? `${labelSets.length} 个版本 · ${labelSets.reduce((total, item) => total + item.label_count, 0)} 个标签`
+    : "尚未导入";
+  if (!labelSets.length) {
+    els.labelSetList.innerHTML = '<div class="empty-panel">尚未导入标签库</div>';
+    return;
+  }
+  els.labelSetList.innerHTML = labelSets.map((item) => `
+    <div class="label-set-item${item.active ? " active" : ""}">
+      <div class="label-set-copy">
+        <div class="label-set-title"><strong>${escapeHtml(item.name)}</strong>${item.active ? "<em>当前启用</em>" : ""}</div>
+        <small>v${escapeHtml(item.version)} · ${item.label_count} 标签 · ${item.annotation_count} 条标注引用</small>
+      </div>
+      <div class="label-set-actions">
+        ${item.active ? "" : `<button type="button" data-label-set-id="${escapeHtml(item.id)}" data-label-set-action="activate">启用</button>`}
+        <button type="button" data-label-set-id="${escapeHtml(item.id)}" data-label-set-action="delete" ${labelSets.length <= 1 ? "disabled title=\"至少保留一个标签库\"" : ""}>删除</button>
+      </div>
+    </div>`).join("");
+}
+
+async function handleLabelSetAction(event) {
+  const button = event.target.closest("[data-label-set-id]");
+  if (!button || button.disabled) return;
+  const item = state.labelSets.find((entry) => entry.id === button.dataset.labelSetId);
+  if (!item) return;
+  setBusyButton(button, true, button.dataset.labelSetAction === "delete" ? "删除中…" : "启用中…");
+  try {
+    if (button.dataset.labelSetAction === "delete") {
+      if (!window.confirm(`确认删除标签库“${item.name}” v${item.version}？\n历史标注不会被删除。`)) {
+        renderLabelSets();
+        return;
+      }
+      const result = await window.episodeQc.deleteLabelSet(item.id);
+      state.labelSets = result.label_sets || [];
+      toast(`已删除标签库：${item.name} v${item.version}`, "success");
+    } else {
+      const result = await window.episodeQc.activateLabelSet(item.id);
+      state.labelSets = result.label_sets || [];
+      toast(`已启用标签库：${item.name} v${item.version}`, "success");
+    }
+    await refreshWorkspace();
+    if (state.currentEpisodeId) await reloadCurrentEpisode();
+    renderLabelSets();
+  } catch (error) {
+    toast(error.message || String(error), "error", 7000);
+    await refreshLabelSets({ quiet: true });
   }
 }
 
@@ -1143,10 +1442,13 @@ async function setReviewStatus(status, showToast = true) {
 
 function renderDecision() {
   const episode = state.detail?.episode;
+  const decision = episode?.quality_decision || "";
   els.decisionGrid.querySelectorAll("[data-decision]").forEach((button) => {
-    button.classList.toggle("active", button.dataset.decision === episode?.quality_decision);
+    button.classList.toggle("active", button.dataset.decision === decision);
     button.disabled = !episode;
   });
+  els.decisionCurrent.textContent = decision ? decisionName(decision) : "未选择";
+  els.decisionCurrent.classList.toggle("selected", Boolean(decision));
   els.needsRecheck.classList.toggle("active", episode?.review_status === "needs_recheck");
   els.needsRecheck.disabled = !episode;
 }
@@ -1573,6 +1875,18 @@ function taskStatusName(status) {
     submitted: "已提交",
     archived: "已归档",
     failed: "导入失败",
+  })[status] || status || "未知状态";
+}
+function flowJobStatusName(status) {
+  return ({
+    waiting_data: "等待数据",
+    pending: "待领取",
+    claimed: "已领取",
+    caching: "缓存中",
+    cache_ready: "缓存就绪",
+    in_progress: "质检中",
+    completed: "已完成",
+    failed: "异常",
   })[status] || status || "未知状态";
 }
 function formatSkew(ns) { const ms = Number(ns) / 1e6; return `${ms >= 0 ? "+" : ""}${ms.toFixed(1)} ms`; }

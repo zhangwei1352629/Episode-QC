@@ -154,6 +154,34 @@ function installWebApi() {
       `/api/workspace${taskId ? `?task_id=${encodeURIComponent(taskId)}` : ""}`,
     ),
     getTasks: () => request("/api/tasks"),
+    clearLocalTaskHistory: (keepTaskId) => request(
+      `/api/tasks/history${keepTaskId ? `?keep_task_id=${encodeURIComponent(keepTaskId)}` : ""}`,
+      { method: "DELETE" },
+    ),
+    getPlatformJobs: () => request("/api/platform/jobs"),
+    getPlatformReviewers: (baseUrl) => request("/api/platform/reviewers", {
+      method: "POST",
+      body: { baseUrl },
+    }),
+    loginPlatform: (value) => request("/api/platform/login", { method: "POST", body: value }),
+    logoutPlatform: () => request("/api/platform/logout", { method: "POST" }),
+    getLabelSets: () => request("/api/label-sets"),
+    activateLabelSet: (labelSetId) => request(
+      `/api/label-sets/${encodeURIComponent(labelSetId)}/activate`,
+      { method: "POST" },
+    ),
+    deleteLabelSet: (labelSetId) => request(
+      `/api/label-sets/${encodeURIComponent(labelSetId)}`,
+      { method: "DELETE" },
+    ),
+    claimPlatformJob: (jobCode) => request(
+      `/api/platform/jobs/${encodeURIComponent(jobCode)}/claim`,
+      { method: "POST" },
+    ),
+    submitPlatformJob: (jobCode) => request(
+      `/api/platform/jobs/${encodeURIComponent(jobCode)}/submit`,
+      { method: "POST" },
+    ),
     updateWorkspaceSettings: (value) => request("/api/workspace/settings", { method: "POST", body: value }),
     addSource: async () => {
       const previous = window.localStorage.getItem("episodeQcSourcePath") || "";

@@ -16,10 +16,17 @@ import secrets
 import socket
 import threading
 import traceback
+import shutil
 from typing import Any
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 import webbrowser
 
+from episode_qc.platform_workflow import (
+    FlowClient,
+    FlowClientError,
+    QualityCacheError,
+    QualityCacheManager,
+)
 from episode_qc.playback import (
     ACTION_FRAME_ENCODING,
     MOTION_FRAME_ENCODING,
@@ -31,8 +38,13 @@ from episode_qc.workspace import (
     episode_detail,
     export_workspace,
     import_label_schema,
+    activate_label_set,
+    clear_local_task_history,
+    delete_label_set,
     initialize_workspace,
     list_qc_tasks,
+    list_label_sets,
+    mark_qc_task_submitted,
     preview_label_schema,
     qc_task_manifest,
     register_worker_task,
@@ -161,6 +173,10 @@ class PlaybackRegistry:
         with self._lock:
             self._items[episode_id] = (manifest_path, manifest)
 
+    def remove(self, episode_id: str) -> None:
+        with self._lock:
+            self._items.pop(episode_id, None)
+
     def camera_frame(self, episode_id: str, stream_id: str, time_ns: int) -> tuple[bytes, dict[str, int | bool]]:
         manifest_path, manifest = self._get(episode_id)
         camera = next((item for item in manifest.get("cameras", []) if item.get("stream_id") == stream_id), None)
@@ -215,15 +231,26 @@ class EpisodeQcWebApplication:
         self.playback = PlaybackRegistry(paths.cache_root)
         self.pending_label_schema: Path | None = None
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="episode-qc-cache")
+        self._platform_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="episode-qc-platform"
+        )
         self._jobs: set[str] = set()
         self._jobs_lock = threading.Lock()
+        self._platform_jobs: set[str] = set()
+        self._platform_lock = threading.RLock()
+        self._flow_client_factory = FlowClient
+        self._flow_client: FlowClient | None = None
+        self._flow_connection: dict[str, str] = {}
+        self._flow_error = ""
         self.session_id = f"web-{self.token[:12]}"
         self.worker_info = worker_info
         paths.root.mkdir(parents=True, exist_ok=True)
         initialize_workspace(paths.db_path)
+        self._connect_platform_from_environment()
 
     def close(self) -> None:
         self._executor.shutdown(wait=False, cancel_futures=True)
+        self._platform_executor.shutdown(wait=False, cancel_futures=True)
 
     def get_workspace_state(self, task_id: str | None = None) -> dict[str, object]:
         if task_id is None:
@@ -246,6 +273,314 @@ class EpisodeQcWebApplication:
 
     def get_tasks(self) -> dict[str, object]:
         return {"tasks": list_qc_tasks(self.paths.db_path)}
+
+    def clear_local_task_history(self, keep_task_id: str | None) -> dict[str, object]:
+        result = clear_local_task_history(
+            self.paths.db_path, keep_task_id=keep_task_id
+        )
+        for episode_id in result["removed_episode_ids"]:
+            self.playback.remove(str(episode_id))
+            cache_path = self.paths.cache_root / "episodes" / str(episode_id)
+            if cache_path.is_dir():
+                shutil.rmtree(cache_path)
+        return result
+
+    def get_label_sets(self) -> dict[str, object]:
+        return {"label_sets": list_label_sets(self.paths.db_path)}
+
+    def activate_label_set(self, label_set_id: str) -> dict[str, object]:
+        return {
+            "active": activate_label_set(self.paths.db_path, label_set_id),
+            "label_sets": list_label_sets(self.paths.db_path),
+        }
+
+    def delete_label_set(self, label_set_id: str) -> dict[str, object]:
+        return delete_label_set(self.paths.db_path, label_set_id)
+
+    def get_platform_reviewers(self, request: dict[str, object]) -> dict[str, object]:
+        if self.worker_info is not None:
+            raise ValueError("Data Worker 不能连接 Flow 领取质检任务")
+        base_url = str(request.get("baseUrl") or "").strip().rstrip("/")
+        if not base_url:
+            raise ValueError("请填写 Flow 地址")
+        client = self._flow_client_factory(base_url, None, None)
+        response = client.reviewers()
+        return {"base_url": base_url, **response}
+
+    def connect_platform(self, request: dict[str, object]) -> dict[str, object]:
+        if self.worker_info is not None:
+            raise ValueError("Data Worker 不能连接 Flow 领取质检任务")
+        base_url = str(request.get("baseUrl") or "").strip().rstrip("/")
+        employee_no = str(request.get("employeeNo") or "").strip()
+        username = str(request.get("username") or "").strip()
+        password = str(request.get("password") or "")
+        if not base_url:
+            raise ValueError("请填写 Flow 地址")
+        if employee_no:
+            client = self._flow_client_factory(base_url, None, None)
+            login = client.login_reviewer(employee_no)
+            reviewer = login.get("reviewer") or {}
+            username = employee_no
+            reviewer_name = str(
+                reviewer.get("display_name") if isinstance(reviewer, dict) else reviewer
+            )
+        else:
+            if not username or not password:
+                raise ValueError("请刷新并选择质检员")
+            client = self._flow_client_factory(base_url, username, password)
+            reviewer_name = username
+        response = client.jobs_response()
+        with self._platform_lock:
+            self._flow_client = client
+            self._flow_connection = {
+                "base_url": base_url,
+                "username": username,
+                "employee_no": employee_no,
+                "reviewer": str(response.get("reviewer") or reviewer_name),
+            }
+            self._flow_error = ""
+        return self._platform_payload(response)
+
+    def disconnect_platform(self) -> dict[str, object]:
+        with self._platform_lock:
+            if self._platform_jobs:
+                raise ValueError("仍有质检任务正在缓存，暂时不能退出 Flow")
+            self._flow_client = None
+            self._flow_connection = {}
+            self._flow_error = ""
+        return {"connected": False, "jobs": []}
+
+    def get_platform_jobs(self) -> dict[str, object]:
+        client = self._require_flow_client(allow_missing=True)
+        if client is None:
+            return {
+                "connected": False,
+                "jobs": [],
+                "error": self._flow_error,
+                "default_base_url": os.environ.get(
+                    "EPISODE_QC_FLOW_URL", "http://127.0.0.1:8000"
+                ),
+                "default_username": os.environ.get("EPISODE_QC_FLOW_USERNAME", ""),
+            }
+        return self._platform_payload(client.jobs_response())
+
+    def claim_platform_job(self, job_code: str) -> dict[str, object]:
+        client = self._require_flow_client()
+        job = self._platform_job(client, job_code)
+        if job.get("status") == "waiting_data":
+            raise ValueError("质检批次的数据尚未完成 NAS 传输和校验")
+        if job.get("status") == "completed":
+            raise ValueError("质检任务已经完成")
+        local_task = self._local_task_for_job(job_code)
+        if local_task and local_task.get("status") != "failed":
+            return {"accepted": False, "job": job, "local_task": local_task}
+        claimed = client.claim(job_code)
+        with self._platform_lock:
+            if job_code in self._platform_jobs:
+                return {"accepted": False, "job": claimed, "caching": True}
+            self._platform_jobs.add(job_code)
+        self._platform_executor.submit(self._cache_platform_job, client, job_code)
+        return {"accepted": True, "job": claimed, "caching": True}
+
+    def submit_platform_job(self, job_code: str) -> dict[str, object]:
+        client = self._require_flow_client()
+        job = self._platform_job(client, job_code)
+        task = self._local_task_for_job(job_code)
+        if task is None:
+            raise ValueError("质检任务尚未领取并缓存到本地")
+        manager = self._quality_cache_manager()
+        mappings = manager.local_episode_mappings(job_code)
+        if not mappings:
+            raise ValueError("质检任务缺少本地 Episode 映射")
+        episode_results = []
+        for mapping in mappings:
+            detail = episode_detail(self.paths.db_path, mapping["local_episode_id"])
+            episode = detail["episode"]
+            decision = episode.get("quality_decision")
+            if not decision or episode.get("review_status") not in {"completed", "reviewed"}:
+                raise ValueError(f"Episode {mapping['episode_id']} 尚未完成质检")
+            episode_results.append(
+                {
+                    "episode_id": mapping["episode_id"],
+                    "decision": decision,
+                    "annotation_count": int(episode.get("annotation_count") or 0),
+                    "result": {
+                        "local_episode_id": mapping["local_episode_id"],
+                        "review_status": episode.get("review_status"),
+                        "reviewer_name": episode.get("reviewer_name"),
+                        "annotations": detail["annotations"],
+                    },
+                }
+            )
+        response = manager.submit_result(
+            client,
+            job,
+            episode_results=episode_results,
+            result={"episode_count": len(episode_results)},
+        )
+        local_task = mark_qc_task_submitted(self.paths.db_path, job_code)
+        return {"job": response, "local_task": local_task}
+
+    def _connect_platform_from_environment(self) -> None:
+        base_url = os.environ.get("EPISODE_QC_FLOW_URL", "").strip()
+        username = os.environ.get("EPISODE_QC_FLOW_USERNAME", "").strip()
+        password = os.environ.get("EPISODE_QC_FLOW_PASSWORD", "")
+        if not (base_url and username and password):
+            return
+        try:
+            self.connect_platform(
+                {"baseUrl": base_url, "username": username, "password": password}
+            )
+        except (FlowClientError, ValueError) as exc:
+            self._flow_error = str(exc)
+
+    def _require_flow_client(self, *, allow_missing: bool = False):
+        with self._platform_lock:
+            client = self._flow_client
+        if client is None and not allow_missing:
+            raise ValueError("请先登录 Flow 质检账号")
+        return client
+
+    def _platform_payload(self, response: dict[str, object]) -> dict[str, object]:
+        tasks = list_qc_tasks(self.paths.db_path)
+        local_by_job = {
+            str(task["flow_job_code"]): task
+            for task in tasks
+            if task.get("flow_job_code")
+        }
+        with self._platform_lock:
+            caching = set(self._platform_jobs)
+            if response.get("reviewer"):
+                self._flow_connection["reviewer"] = str(response["reviewer"])
+            connection = dict(self._flow_connection)
+        jobs = []
+        for item in response.get("jobs", []):
+            if not isinstance(item, dict):
+                continue
+            code = str(item.get("code") or "")
+            local_task = local_by_job.get(code)
+            jobs.append(
+                {
+                    **item,
+                    "local_task_id": local_task.get("id") if local_task else None,
+                    "local_task_status": local_task.get("status") if local_task else None,
+                    "local_caching": code in caching,
+                }
+            )
+        return {"connected": True, **connection, "jobs": jobs}
+
+    def _local_task_for_job(self, job_code: str) -> dict[str, object] | None:
+        return next(
+            (
+                task
+                for task in list_qc_tasks(self.paths.db_path)
+                if task.get("flow_job_code") == job_code
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _platform_job(client, job_code: str) -> dict[str, object]:
+        job = next((item for item in client.jobs() if item.get("code") == job_code), None)
+        if job is None:
+            raise ValueError(f"Flow 中不存在或当前账号无权访问质检任务：{job_code}")
+        return job
+
+    def _quality_cache_manager(self) -> QualityCacheManager:
+        try:
+            reserve_gb = max(
+                0.0, float(os.environ.get("EPISODE_QC_CACHE_RESERVE_GB", "10"))
+            )
+        except ValueError:
+            reserve_gb = 10.0
+        return QualityCacheManager(
+            self.paths.root / "platform-cache",
+            reserve_bytes=int(reserve_gb * 1024**3),
+        )
+
+    def _cache_platform_job(self, client, job_code: str) -> None:
+        manager = self._quality_cache_manager()
+
+        def publish_progress(values: dict[str, object]) -> None:
+            self.events.publish(
+                {"type": "platform_job", "jobCode": job_code, **values}
+            )
+
+        try:
+            job = self._platform_job(client, job_code)
+            cached = manager.cache_job(client, job, progress_callback=publish_progress)
+            profile_path = (
+                self.paths.default_profile
+                if self.paths.default_profile.is_file()
+                else None
+            )
+            indexed = scan_data_source(
+                self.paths.db_path,
+                cached["cache_dir"],
+                profile_path=profile_path,
+                task_code=job_code,
+                task_name=str(job.get("task_name") or job.get("asset_id") or job_code),
+                origin="flow",
+                flow_job_code=job_code,
+                asset_id=str(job.get("asset_id") or "") or None,
+                source_uri=str(job.get("source_uri") or job.get("asset_nas_uri") or ""),
+                task_metadata={"flow_job": job},
+            )
+            ready = [
+                item
+                for item in indexed["episodes"]
+                if item["import_status"] == "ready"
+            ]
+            ready_by_path = {
+                str(Path(item["relative_path"]).as_posix()).strip("./"): item
+                for item in ready
+            }
+            mappings = []
+            for platform_episode in job.get("episodes", []):
+                relative_path = str(
+                    Path(platform_episode["relative_path"]).as_posix()
+                ).strip("./")
+                local_episode = ready_by_path.get(relative_path)
+                if local_episode is None:
+                    raise QualityCacheError(
+                        "本地缓存未索引到 Flow Episode："
+                        f"{platform_episode['episode_id']} ({relative_path})"
+                    )
+                mappings.append(
+                    {
+                        "episode_id": platform_episode["episode_id"],
+                        "local_episode_id": local_episode["id"],
+                        "relative_path": relative_path,
+                    }
+                )
+            if len(mappings) != len(ready):
+                raise QualityCacheError(
+                    f"资产缓存包含未登记的 Episode：Flow {len(mappings)} 个，"
+                    f"本地 {len(ready)} 个"
+                )
+            manager.record_local_episodes(job_code, mappings)
+            started = manager.start_review(client, job_code)
+            publish_progress(
+                {
+                    "status": "ready",
+                    "progress": 100,
+                    "taskId": indexed["task_id"],
+                    "job": started,
+                }
+            )
+        except Exception as exc:
+            try:
+                client.report_cache(
+                    job_code,
+                    status="failed",
+                    cache_error=str(exc),
+                )
+            except Exception:
+                pass
+            publish_progress({"status": "failed", "error": str(exc)})
+        finally:
+            with self._platform_lock:
+                self._platform_jobs.discard(job_code)
 
     def get_worker_info(self) -> dict[str, object]:
         if self.worker_info is None:
@@ -470,7 +805,13 @@ class EpisodeQcRequestHandler(BaseHTTPRequestHandler):
             self._send_json({"error": str(exc)}, HTTPStatus.CONFLICT)
         except KeyError as exc:
             self._send_json({"error": str(exc).strip("'")}, HTTPStatus.NOT_FOUND)
-        except (FileNotFoundError, ValueError, json.JSONDecodeError) as exc:
+        except (
+            FileNotFoundError,
+            FlowClientError,
+            QualityCacheError,
+            ValueError,
+            json.JSONDecodeError,
+        ) as exc:
             self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
         except Exception as exc:
             traceback.print_exc()
@@ -533,6 +874,40 @@ class EpisodeQcRequestHandler(BaseHTTPRequestHandler):
         if method == "GET" and path == "/api/tasks":
             self._send_json(app.get_tasks())
             return
+        if method == "DELETE" and path == "/api/tasks/history":
+            keep_task_id = query.get("keep_task_id", [None])[0]
+            self._send_json(app.clear_local_task_history(keep_task_id))
+            return
+        if method == "POST" and path == "/api/platform/reviewers":
+            self._send_json(app.get_platform_reviewers(self._json_body()))
+            return
+        if method == "POST" and path == "/api/platform/login":
+            self._send_json(app.connect_platform(self._json_body()))
+            return
+        if method == "POST" and path == "/api/platform/logout":
+            self._discard_body()
+            self._send_json(app.disconnect_platform())
+            return
+        if method == "GET" and path == "/api/platform/jobs":
+            self._send_json(app.get_platform_jobs())
+            return
+        platform_claim_match = re.fullmatch(
+            r"/api/platform/jobs/([A-Za-z0-9._-]+)/claim", path
+        )
+        if method == "POST" and platform_claim_match:
+            self._discard_body()
+            self._send_json(
+                app.claim_platform_job(platform_claim_match.group(1)),
+                HTTPStatus.ACCEPTED,
+            )
+            return
+        platform_submit_match = re.fullmatch(
+            r"/api/platform/jobs/([A-Za-z0-9._-]+)/submit", path
+        )
+        if method == "POST" and platform_submit_match:
+            self._discard_body()
+            self._send_json(app.submit_platform_job(platform_submit_match.group(1)))
+            return
         if method == "GET" and path == "/api/worker/info":
             self._send_json(app.get_worker_info())
             return
@@ -560,6 +935,21 @@ class EpisodeQcRequestHandler(BaseHTTPRequestHandler):
         if method == "POST" and path == "/api/label-schema/import":
             self._discard_body()
             self._send_json(app.import_pending_labels())
+            return
+        if method == "GET" and path == "/api/label-sets":
+            self._send_json(app.get_label_sets())
+            return
+        label_set_match = re.fullmatch(r"/api/label-sets/(ls_[a-f0-9]{24,32})", path)
+        if method == "DELETE" and label_set_match:
+            self._discard_body()
+            self._send_json(app.delete_label_set(label_set_match.group(1)))
+            return
+        label_set_activate_match = re.fullmatch(
+            r"/api/label-sets/(ls_[a-f0-9]{24,32})/activate", path
+        )
+        if method == "POST" and label_set_activate_match:
+            self._discard_body()
+            self._send_json(app.activate_label_set(label_set_activate_match.group(1)))
             return
         if method == "POST" and path == "/api/annotations":
             self._send_json(app.save_annotation(self._json_body()))

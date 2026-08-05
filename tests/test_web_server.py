@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import hashlib
 from http.client import HTTPConnection
 import json
 from pathlib import Path
@@ -14,6 +15,7 @@ from urllib.request import build_opener, ProxyHandler, Request
 import pytest
 
 from episode_qc.playback import ACTION_FRAME_ENCODING, MOTION_FRAME_ENCODING
+from episode_qc.platform_workflow import QualityCacheManager
 from episode_qc.web_server import (
     WebPaths,
     create_web_server,
@@ -136,6 +138,320 @@ def test_web_api_requires_token_and_serves_workspace(tmp_path: Path):
             assert response.status == 200
             assert response.headers["Content-Type"].startswith("text/javascript")
             assert b"resolveSelectedTarget" in response.read()
+
+
+def test_web_claims_caches_and_submits_flow_job(tmp_path: Path):
+    source = tmp_path / "nas" / "AST-WEB-001"
+    episode_root = source / "episodes" / "episode_000001"
+    episode_root.mkdir(parents=True)
+    payload = b"""HIERARCHY
+ROOT Hips
+{
+  OFFSET 0 0 0
+  CHANNELS 6 Xposition Yposition Zposition Zrotation Yrotation Xrotation
+  End Site
+  {
+    OFFSET 0 10 0
+  }
+}
+MOTION
+Frames: 2
+Frame Time: 0.010000
+0 0 0 0 0 0
+1 0 0 0 0 0
+"""
+    primary = episode_root / "motion.bvh"
+    primary.write_bytes(payload)
+    (episode_root / "metadata.json").write_text(
+        '{"schema_version": 1}', encoding="utf-8"
+    )
+    checksum = hashlib.sha256(payload).hexdigest()
+    size_bytes = sum(path.stat().st_size for path in source.rglob("*") if path.is_file())
+    job = {
+        "code": "QCJ-WEB-001",
+        "version": 1,
+        "status": "pending",
+        "asset_id": "AST-WEB-001",
+        "asset_size_bytes": size_bytes,
+        "asset_file_count": 2,
+        "task_code": "TASK-WEB-001",
+        "task_name": "Web Flow 领取测试",
+        "collector": "采集测试员",
+        "reviewer_name": "",
+        "source_uri": str(source),
+        "asset_nas_uri": str(source),
+        "required_episode_count": 1,
+        "episodes": [
+            {
+                "episode_id": "AST-WEB-001-EP0001",
+                "relative_path": "episodes/episode_000001",
+                "primary_file": "motion.bvh",
+                "checksum_sha256": checksum,
+            }
+        ],
+        "cache_progress": 0,
+    }
+
+    class FakeWebFlowClient:
+        def jobs_response(self):
+            return {"reviewer": "Web 质检员", "jobs": [dict(job)]}
+
+        def jobs(self):
+            return [dict(job)]
+
+        def claim(self, job_code):
+            assert job_code == job["code"]
+            job.update(status="claimed", reviewer_name="Web 质检员")
+            return dict(job)
+
+        def report_cache(self, job_code, **values):
+            assert job_code == job["code"]
+            job.update(values)
+            return dict(job)
+
+        def report_work(self, job_code, *, action, **values):
+            assert job_code == job["code"]
+            job.update(status="in_progress", **values)
+            return {**job, "action": action}
+
+        def submit_result(self, job_code, **values):
+            assert job_code == job["code"]
+            job.update(status="completed", submitted=values)
+            return dict(job)
+
+    fake_client = FakeWebFlowClient()
+    with running_server(tmp_path) as (server, base_url):
+        server.application._flow_client_factory = (
+            lambda base_url, username, password: fake_client
+        )
+        server.application._quality_cache_manager = lambda: QualityCacheManager(
+            server.application.paths.root / "platform-cache",
+            reserve_bytes=0,
+            workspace_name="QC-WEB-TEST",
+        )
+
+        status, login = request_json(
+            f"{base_url}/api/platform/login",
+            method="POST",
+            payload={
+                "baseUrl": "http://flow.test:8000",
+                "username": "reviewer",
+                "password": "secret",
+            },
+        )
+        assert status == 200
+        assert login["connected"] is True
+        assert login["reviewer"] == "Web 质检员"
+        assert "password" not in login
+
+        status, accepted = request_json(
+            f"{base_url}/api/platform/jobs/{job['code']}/claim",
+            method="POST",
+        )
+        assert status == 202
+        assert accepted["accepted"] is True
+
+        local_task_id = None
+        for _ in range(200):
+            _status, platform = request_json(f"{base_url}/api/platform/jobs")
+            visible_job = platform["jobs"][0]
+            local_task_id = visible_job.get("local_task_id")
+            if local_task_id and not visible_job["local_caching"]:
+                break
+            time.sleep(0.01)
+        assert local_task_id
+        assert job["status"] == "in_progress"
+
+        status, state = request_json(
+            f"{base_url}/api/workspace?task_id={local_task_id}"
+        )
+        assert status == 200
+        assert state["selected_task"]["origin"] == "flow"
+        assert state["selected_task"]["flow_job_code"] == job["code"]
+        local_episode_id = state["episodes"][0]["id"]
+
+        status, reviewed = request_json(
+            f"{base_url}/api/episodes/{local_episode_id}/review",
+            method="POST",
+            payload={
+                "status": "completed",
+                "decision": "pass",
+                "reviewer": "Web 质检员",
+            },
+        )
+        assert status == 200
+        assert reviewed["review_status"] == "completed"
+
+        status, submitted = request_json(
+            f"{base_url}/api/platform/jobs/{job['code']}/submit",
+            method="POST",
+        )
+        assert status == 200
+        assert submitted["job"]["status"] == "completed"
+        assert submitted["local_task"]["status"] == "submitted"
+        assert (source / "qc" / "v1" / "qc_result.json").is_file()
+
+
+def test_web_platform_refreshes_and_selects_reviewer_without_password(tmp_path: Path):
+    class FakeReviewerClient:
+        def __init__(self):
+            self.selected = ""
+
+        def reviewers(self):
+            return {
+                "date": "2026-08-05",
+                "reviewers": [
+                    {
+                        "employee_no": "QC001",
+                        "display_name": "Web 质检员",
+                        "team_code": "QC",
+                        "team_name": "质检组",
+                    }
+                ],
+            }
+
+        def login_reviewer(self, employee_no):
+            self.selected = employee_no
+            return {
+                "token": "signed-reviewer-token",
+                "token_type": "Bearer",
+                "reviewer": {
+                    "employee_no": employee_no,
+                    "display_name": "Web 质检员",
+                },
+            }
+
+        def jobs_response(self, statuses=None):
+            assert self.selected == "QC001"
+            return {"reviewer": "Web 质检员", "jobs": []}
+
+    fake_client = FakeReviewerClient()
+    with running_server(tmp_path) as (server, base_url):
+        server.application._flow_client_factory = (
+            lambda flow_url, username, password: fake_client
+        )
+        status, reviewers = request_json(
+            f"{base_url}/api/platform/reviewers",
+            method="POST",
+            payload={"baseUrl": "http://flow.test:8000"},
+        )
+        assert status == 200
+        assert reviewers["reviewers"][0]["employee_no"] == "QC001"
+        status, login = request_json(
+            f"{base_url}/api/platform/login",
+            method="POST",
+            payload={
+                "baseUrl": "http://flow.test:8000",
+                "employeeNo": "QC001",
+            },
+        )
+        assert status == 200
+        assert login["connected"] is True
+        assert login["reviewer"] == "Web 质检员"
+        assert login["employee_no"] == "QC001"
+
+
+def test_web_manages_label_sets_and_clears_local_task_history(tmp_path: Path):
+    bvh = """HIERARCHY
+ROOT Hips
+{
+  OFFSET 0 0 0
+  CHANNELS 6 Xposition Yposition Zposition Zrotation Yrotation Xrotation
+  End Site
+  {
+    OFFSET 0 10 0
+  }
+}
+MOTION
+Frames: 2
+Frame Time: 0.010000
+0 0 0 0 0 0
+1 0 0 0 0 0
+"""
+    sources = []
+    for name in ("task-one", "task-two"):
+        source = tmp_path / name
+        episode = source / "episode_000001"
+        episode.mkdir(parents=True)
+        (episode / "motion.bvh").write_text(bvh, encoding="utf-8")
+        sources.append(source)
+    schema = {
+        "schema": {
+            "schema_type": "annotation_label_schema",
+            "schema_version": "1.0.0",
+            "label_set_id": "web_labels",
+            "label_set_name": "Web 标签",
+            "language": "zh-CN",
+        },
+        "severity_levels": [{"code": "normal", "name": "一般", "order": 1}],
+        "actions": [{"code": "keep", "name": "保留"}],
+        "groups": [{"code": "general", "name": "通用", "order": 1}],
+        "labels": [
+            {
+                "code": "web_label",
+                "name": "Web 标签",
+                "group": "general",
+                "enabled": True,
+                "annotation_scopes": ["episode"],
+                "target_types": ["global"],
+                "default_severity": "normal",
+                "default_action": "keep",
+                "color": "#8844EE",
+            }
+        ],
+    }
+    label_paths = []
+    for version in ("1.0.0", "2.0.0"):
+        schema["schema"]["schema_version"] = version
+        path = tmp_path / f"labels-{version}.json"
+        path.write_text(json.dumps(schema, ensure_ascii=False), encoding="utf-8")
+        label_paths.append(path)
+
+    with running_server(tmp_path) as (_server, base_url):
+        task_results = []
+        for source in sources:
+            status, indexed = request_json(
+                f"{base_url}/api/tasks/import",
+                method="POST",
+                payload={"rootPath": str(source)},
+            )
+            assert status == 200
+            task_results.append(indexed)
+        for label_path in label_paths:
+            status, preview = request_json(
+                f"{base_url}/api/label-schema/preview",
+                method="POST",
+                payload={"schemaPath": str(label_path)},
+            )
+            assert status == 200 and preview["readyToConfirm"]
+            status, _ = request_json(
+                f"{base_url}/api/label-schema/import", method="POST"
+            )
+            assert status == 200
+
+        status, libraries = request_json(f"{base_url}/api/label-sets")
+        assert status == 200
+        assert len(libraries["label_sets"]) == 2
+        inactive = next(item for item in libraries["label_sets"] if not item["active"])
+        status, activated = request_json(
+            f"{base_url}/api/label-sets/{inactive['id']}/activate",
+            method="POST",
+        )
+        assert status == 200 and activated["active"]["id"] == inactive["id"]
+        other = next(item for item in activated["label_sets"] if not item["active"])
+        status, deleted = request_json(
+            f"{base_url}/api/label-sets/{other['id']}", method="DELETE"
+        )
+        assert status == 200 and len(deleted["label_sets"]) == 1
+
+        status, cleared = request_json(
+            f"{base_url}/api/tasks/history?keep_task_id={task_results[0]['task_id']}",
+            method="DELETE",
+        )
+        assert status == 200
+        assert cleared["removed_count"] == 1
+        assert cleared["removed_tasks"][0]["id"] == task_results[1]["task_id"]
+        assert sources[1].is_dir()
 
 
 def test_web_server_allows_declared_lan_hosts_and_origins_only(tmp_path: Path):

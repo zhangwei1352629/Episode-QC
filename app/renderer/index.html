@@ -24,14 +24,19 @@
             <button class="panel-toggle" id="toggle-labels" type="button" title="显示或隐藏标注面板" aria-pressed="true"><span>◇</span><b>标注栏</b></button>
           </div>
           <button class="button primary" id="add-source" type="button">导入新任务</button>
-          <button class="button secondary" id="export-results" type="button">导出结果</button>
-          <details class="tool-menu" id="tool-menu">
-            <summary class="button secondary">工具</summary>
+          <div class="export-control">
+            <button class="button secondary" id="export-results" type="button">导出结果</button>
+            <select class="export-format" id="export-format" aria-label="标注结果导出格式" title="每个任务导出一个文件"><option value="json">JSON</option><option value="csv">CSV</option></select>
+          </div>
+          <details class="tool-menu label-library-menu" id="tool-menu">
+            <summary class="button secondary">标签库</summary>
             <div class="tool-menu-panel">
-              <label class="reviewer-field"><span>质检员</span><input id="reviewer-name" placeholder="输入姓名" /></label>
-              <label class="tool-field"><span>导出格式</span><select class="export-format" id="export-format" aria-label="标注结果导出格式" title="每个任务导出一个文件"><option value="json">JSON</option><option value="csv">CSV</option></select></label>
-              <button class="button secondary" id="import-labels" type="button">导入标签库</button>
-              <a class="button secondary download-button" href="./label-template-simple.yaml" download="标签库简易模板.yaml" title="下载后填写英文编码、中文名称和判断标准">下载标签模板</a>
+              <div class="label-library-heading"><div><strong>已导入标签库</strong><span id="label-library-status">正在读取…</span></div><button id="refresh-label-sets" type="button" title="刷新标签库">↻</button></div>
+              <div class="label-set-list" id="label-set-list"><div class="empty-panel">尚未导入标签库</div></div>
+              <div class="label-library-actions">
+                <button class="button primary" id="import-labels" type="button">导入标签库</button>
+                <a class="button secondary download-button" href="./label-template-simple.yaml" download="标签库简易模板.yaml" title="下载后填写英文编码、中文名称和判断标准">下载模板</a>
+              </div>
             </div>
           </details>
           <div class="save-state" id="save-state" role="status" aria-live="polite"><span></span>已保存</div>
@@ -42,14 +47,17 @@
         <section class="current-task-card">
           <div class="current-task-heading">
             <span class="eyebrow">当前 QC 任务</span>
-            <button id="open-task-center" type="button">切换任务</button>
+            <button id="open-task-center" type="button">任务中心</button>
           </div>
           <strong id="current-task-name">尚未导入任务</strong>
           <span id="current-task-code">—</span>
           <p id="current-task-path" title="">点击“导入新任务”选择数据目录</p>
           <div class="current-task-footer">
             <span class="task-status" id="current-task-status">未加载</span>
-            <button id="rescan-task" type="button" disabled>重新扫描</button>
+            <div class="current-task-actions">
+              <button id="submit-flow-task" type="button" hidden>提交到 Flow</button>
+              <button id="rescan-task" type="button" disabled>重新扫描</button>
+            </div>
           </div>
         </section>
         <div class="source-summary">
@@ -160,28 +168,38 @@
             <select id="label-group-filter" aria-label="筛选标签分组"><option value="all">全部分组</option></select>
           </div>
           <div class="target-context" id="target-context">目标：全局</div>
+          <label class="annotation-note" for="annotation-comment">
+            <span class="annotation-note-heading"><strong>备注</strong><small>随下一个标签保存 · 可选</small></span>
+            <textarea id="annotation-comment" rows="1" placeholder="补充这次标注的说明…"></textarea>
+          </label>
           <div class="label-list" id="label-list">
             <div class="empty-panel">请先导入标签库</div>
           </div>
-          <label class="form-field"><span>备注</span><textarea id="annotation-comment" rows="2" placeholder="可选说明"></textarea></label>
         </section>
 
         <section class="panel-section annotations-section">
-          <div class="section-heading compact"><h3>当前标注</h3><span id="annotation-count">0</span></div>
+          <div class="section-heading annotation-heading">
+            <div><span class="eyebrow">已添加</span><h3>当前标注</h3></div>
+            <span class="section-count" id="annotation-count">0</span>
+          </div>
+          <p class="section-helper">单击标注可修改时间、级别和备注</p>
           <div class="annotation-list" id="annotation-list"><div class="empty-panel">暂无标注</div></div>
         </section>
 
         <section class="panel-section decision-section">
-          <span class="eyebrow">Episode 结论</span>
-          <div class="decision-grid" id="decision-grid">
-            <button data-decision="pass" type="button" title="通过（Alt 1）"><span>✓</span>通过<kbd>1</kbd></button>
-            <button data-decision="pass_with_labels" type="button" title="有条件通过（Alt 2）"><span>◐</span>有条件<kbd>2</kbd></button>
-            <button data-decision="trim" type="button" title="需裁剪（Alt 3）"><span>✂</span>裁剪<kbd>3</kbd></button>
-            <button data-decision="repair" type="button" title="需修复（Alt 4）"><span>◇</span>修复<kbd>4</kbd></button>
-            <button data-decision="recollect" type="button" title="需重采（Alt 5）"><span>↻</span>重采<kbd>5</kbd></button>
-            <button data-decision="reject" type="button" title="废弃（Alt 6）"><span>×</span>废弃<kbd>6</kbd></button>
+          <div class="decision-heading">
+            <div><span class="eyebrow">Episode 结论</span><strong>选择处理结果</strong></div>
+            <span class="decision-current" id="decision-current">未选择</span>
           </div>
-          <button class="needs-recheck" id="needs-recheck" type="button">标记为待复核</button>
+          <div class="decision-grid" id="decision-grid">
+            <button data-decision="pass" data-tone="positive" type="button" title="通过（Alt 1）"><span class="decision-icon">✓</span><span class="decision-copy"><strong>通过</strong><small>直接交付</small></span><kbd>1</kbd></button>
+            <button data-decision="pass_with_labels" data-tone="positive" type="button" title="有条件通过（Alt 2）"><span class="decision-icon">◐</span><span class="decision-copy"><strong>有条件</strong><small>带标注交付</small></span><kbd>2</kbd></button>
+            <button data-decision="trim" data-tone="warning" type="button" title="需裁剪（Alt 3）"><span class="decision-icon">✂</span><span class="decision-copy"><strong>裁剪</strong><small>调整区间</small></span><kbd>3</kbd></button>
+            <button data-decision="repair" data-tone="warning" type="button" title="需修复（Alt 4）"><span class="decision-icon">◇</span><span class="decision-copy"><strong>修复</strong><small>修复后交付</small></span><kbd>4</kbd></button>
+            <button data-decision="recollect" data-tone="danger" type="button" title="需重采（Alt 5）"><span class="decision-icon">↻</span><span class="decision-copy"><strong>重采</strong><small>重新采集</small></span><kbd>5</kbd></button>
+            <button data-decision="reject" data-tone="danger" type="button" title="废弃（Alt 6）"><span class="decision-icon">×</span><span class="decision-copy"><strong>废弃</strong><small>不可使用</small></span><kbd>6</kbd></button>
+          </div>
+          <button class="needs-recheck" id="needs-recheck" type="button"><strong>标记为待复核</strong><small>暂不设置最终结论</small></button>
         </section>
       </aside>
     </div>
@@ -194,9 +212,34 @@
           <button id="close-task-center" type="button" aria-label="关闭">×</button>
         </div>
         <div class="task-center-summary" id="task-center-summary"></div>
-        <div class="task-list" id="task-list"><div class="empty-panel">暂无任务</div></div>
+        <div class="task-center-columns">
+          <section class="flow-task-panel">
+            <div class="flow-task-heading">
+              <div><strong>Flow 待领取任务</strong><span id="flow-task-status">尚未选择质检员</span></div>
+              <div>
+                <button id="refresh-flow-jobs" type="button" hidden>刷新任务</button>
+                <button id="flow-logout" type="button" hidden>重新选择</button>
+              </div>
+            </div>
+            <form class="flow-login-form" id="flow-login-form">
+              <input id="flow-base-url" type="url" placeholder="Flow 地址，例如 http://127.0.0.1:8000" required />
+              <select id="flow-reviewer-select" required><option value="">请先刷新质检员</option></select>
+              <button class="button secondary" id="refresh-flow-reviewers" type="button">刷新质检员</button>
+              <button class="button primary" id="flow-login" type="submit">选择并加载任务</button>
+            </form>
+            <div class="flow-task-list" id="flow-task-list"><div class="empty-panel">刷新并选择质检员后显示可领取任务</div></div>
+          </section>
+          <section class="local-task-panel">
+            <div class="local-task-heading">
+              <div><strong>本地 QC 任务</strong><span>已领取任务和手工导入任务</span></div>
+              <button id="clear-local-task-history" type="button" disabled>清空历史导入</button>
+            </div>
+            <label class="reviewer-field local-reviewer-field"><span>本地质检员署名</span><input id="reviewer-name" placeholder="选择 Flow 质检员后自动填写" /></label>
+            <div class="task-list" id="task-list"><div class="empty-panel">暂无任务</div></div>
+          </section>
+        </div>
         <div class="task-center-actions">
-          <p>切换任务不会删除以前的 Episode、标注或质检结论。</p>
+          <p>清空历史导入只删除本地索引和派生缓存，不删除原始数据，也不影响 Flow 任务。</p>
           <button class="button primary" id="task-center-import" type="button">导入新任务</button>
         </div>
       </div>

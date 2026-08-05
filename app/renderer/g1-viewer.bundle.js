@@ -34219,10 +34219,11 @@ var G1Viewer = class {
     this.footRestPitch = { left: null, right: null };
     this.modelRoot = new Group();
     this.scene = new Scene();
+    this.scene.background = new Color(725012);
     this.scene.add(this.modelRoot);
     this.camera = new PerspectiveCamera(28, 1, 0.01, 30);
-    this.renderer = new WebGLRenderer({ canvas, antialias: true, alpha: true, powerPreference: "high-performance" });
-    this.renderer.setClearColor(0, 0);
+    this.renderer = new WebGLRenderer({ canvas, antialias: true, alpha: false, powerPreference: "high-performance" });
+    this.renderer.setClearColor(725012, 1);
     this.renderer.outputColorSpace = SRGBColorSpace;
     this.renderer.toneMapping = ACESFilmicToneMapping;
     this.renderer.toneMappingExposure = 1.12;

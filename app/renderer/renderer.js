@@ -10,6 +10,7 @@ const $ = (id) => document.getElementById(id);
 const els = {
   workspaceName: $("workspace-name"), reviewerName: $("reviewer-name"), importLabels: $("import-labels"),
   exportFormat: $("export-format"), exportResults: $("export-results"), addSource: $("add-source"), saveState: $("save-state"),
+  toggleEpisodes: $("toggle-episodes"), toggleLabels: $("toggle-labels"), toolMenu: $("tool-menu"),
   episodeTotal: $("episode-total"), episodeDone: $("episode-done"), episodeErrors: $("episode-errors"),
   episodeSearch: $("episode-search"), statusFilter: $("status-filter"), episodeList: $("episode-list"),
   currentEpisode: $("current-episode"), episodeMeta: $("episode-meta"), previousEpisode: $("previous-episode"),
@@ -90,7 +91,9 @@ const g1Viewer = new G1Viewer(els.motionCanvas, (status, error) => {
 const WHOLE_BODY_JOINT = "whole_body";
 
 async function initialize() {
+  restoreWorkspaceLayout();
   bindEvents();
+  syncInteractiveState();
   setSaveState("saving", "打开中…");
   try {
     const taskPayload = await window.episodeQc.getTasks();
@@ -137,6 +140,14 @@ async function refreshWorkspace({ preserveEpisode = true } = {}) {
 
 function bindEvents() {
   window.episodeQc.onEpisodeCacheReady(handleEpisodeCacheReady);
+  els.toggleEpisodes.addEventListener("click", () => toggleWorkspacePanel("episodes"));
+  els.toggleLabels.addEventListener("click", () => toggleWorkspacePanel("labels"));
+  document.addEventListener("pointerdown", (event) => {
+    if (els.toolMenu.open && !els.toolMenu.contains(event.target)) els.toolMenu.open = false;
+  });
+  els.toolMenu.addEventListener("click", (event) => {
+    if (event.target.closest("#import-labels, .download-button")) window.setTimeout(() => { els.toolMenu.open = false; }, 0);
+  });
   els.addSource.addEventListener("click", addSource);
   els.taskCenterImport.addEventListener("click", addSource);
   els.openTaskCenter.addEventListener("click", () => { renderTaskContext(); els.taskCenter.showModal(); });
@@ -237,6 +248,27 @@ function bindEvents() {
   });
 }
 
+function restoreWorkspaceLayout() {
+  setWorkspacePanel("episodes", window.localStorage.getItem("episodeQcEpisodesVisible") !== "false", false);
+  setWorkspacePanel("labels", window.localStorage.getItem("episodeQcLabelsVisible") !== "false", false);
+}
+
+function toggleWorkspacePanel(panel) {
+  const hiddenClass = panel === "episodes" ? "episodes-collapsed" : "labels-collapsed";
+  setWorkspacePanel(panel, document.body.classList.contains(hiddenClass));
+}
+
+function setWorkspacePanel(panel, visible, persist = true) {
+  const isEpisodes = panel === "episodes";
+  const hiddenClass = isEpisodes ? "episodes-collapsed" : "labels-collapsed";
+  const button = isEpisodes ? els.toggleEpisodes : els.toggleLabels;
+  document.body.classList.toggle(hiddenClass, !visible);
+  button.setAttribute("aria-pressed", String(visible));
+  button.classList.toggle("active", visible);
+  if (persist) window.localStorage.setItem(isEpisodes ? "episodeQcEpisodesVisible" : "episodeQcLabelsVisible", String(visible));
+  window.setTimeout(drawMotion, 190);
+}
+
 function handleEpisodeCacheReady(payload) {
   if (!payload || payload.episodeId !== state.playbackEpisodeId) return;
   if (payload.error) {
@@ -245,6 +277,7 @@ function handleEpisodeCacheReady(payload) {
     return;
   }
   state.cache = payload.cache;
+  syncInteractiveState();
   renderCameras();
   renderMotionAvailability();
   setCacheStatus("ready", "完整播放缓存已就绪");
@@ -436,6 +469,7 @@ function renderEpisodeList() {
   els.episodeErrors.textContent = state.episodes.filter((item) => item.import_status !== "ready").length;
   if (!state.filteredEpisodes.length) {
     els.episodeList.innerHTML = `<div class="empty-panel">${state.episodes.length ? "没有符合筛选的 Episode" : "添加数据目录后开始质检"}</div>`;
+    syncInteractiveState();
     return;
   }
   els.episodeList.innerHTML = state.filteredEpisodes.map((episode) => `
@@ -448,6 +482,7 @@ function renderEpisodeList() {
       </span>
       <time>${formatDuration(episode.duration_sec || 0)}</time>
     </button>`).join("");
+  syncInteractiveState();
 }
 
 async function openEpisode(episodeId) {
@@ -473,6 +508,7 @@ async function openEpisode(episodeId) {
   state.motionSource = "policy";
   syncJointSelectionUi();
   updatePlaybackButton();
+  syncInteractiveState();
   renderEpisodeList();
   setCacheStatus("busy", "读取 Episode 元信息…");
   try {
@@ -503,6 +539,7 @@ async function openEpisode(episodeId) {
     const cache = await window.episodeQc.prepareEpisode(state.playbackEpisodeId, state.dataProvider);
     if (token !== state.loadToken) return;
     state.cache = cache;
+    syncInteractiveState();
     renderCameras();
     renderMotionAvailability();
     const cacheMessage = cache.complete
@@ -539,6 +576,7 @@ function renderEpisodeDetail() {
   renderLabels();
   renderDecision();
   renderTargetContext();
+  syncInteractiveState();
 }
 
 function clearEpisodeView() {
@@ -550,6 +588,9 @@ function clearEpisodeView() {
   state.cache = null;
   state.motionFrame = null;
   state.robotActionFrame = null;
+  state.playing = false;
+  state.selectionStartNs = null;
+  state.selectionEndNs = null;
   state.durationNs = 0;
   state.playheadNs = 0;
   els.currentEpisode.textContent = "未选择 Episode";
@@ -559,6 +600,8 @@ function clearEpisodeView() {
   els.motionEmpty.textContent = "选择 Episode 后显示 G1 29DOF 机器人";
   els.coverageTracks.innerHTML = "";
   els.annotationTrack.innerHTML = "";
+  els.annotationList.innerHTML = '<div class="empty-panel">暂无标注</div>';
+  els.annotationCount.textContent = "0";
   renderJointOptions([]);
   renderMotionSourceOptions();
   state.selectedCameraId = null;
@@ -567,7 +610,30 @@ function clearEpisodeView() {
   renderTargetContext();
   renderLabels();
   renderClock();
+  renderSelection();
+  renderDecision();
+  updatePlaybackButton();
+  syncInteractiveState();
   drawMotion();
+}
+
+function syncInteractiveState() {
+  const hasEpisode = Boolean(state.detail && state.currentEpisodeId);
+  const playbackReady = Boolean(state.cache && state.durationNs > 0);
+  const currentIndex = state.filteredEpisodes.findIndex((item) => item.id === state.currentEpisodeId);
+  els.previousEpisode.disabled = !state.filteredEpisodes.length || currentIndex <= 0;
+  els.nextEpisode.disabled = !state.filteredEpisodes.length || currentIndex < 0 || currentIndex >= state.filteredEpisodes.length - 1;
+  els.togglePlay.disabled = !playbackReady;
+  els.playbackRate.disabled = !playbackReady;
+  els.timelineRange.disabled = !hasEpisode;
+  els.markIn.disabled = !hasEpisode;
+  els.markOut.disabled = !hasEpisode;
+  els.loopSelection.disabled = !hasEpisode;
+  els.undo.disabled = !hasEpisode;
+  els.redo.disabled = !hasEpisode;
+  els.decisionGrid.querySelectorAll("button").forEach((button) => { button.disabled = !hasEpisode; });
+  els.needsRecheck.disabled = !hasEpisode;
+  els.exportResults.disabled = !state.currentTaskId;
 }
 
 function renderCameras() {
@@ -808,12 +874,13 @@ function renderLabels() {
   }
   els.labelList.innerHTML = visible.map((label) => {
     const supported = labelSupportsTarget(label, currentTarget);
+    const enabledForEpisode = supported && Boolean(state.detail);
     const targetHint = targetTypesDescription(label.target_types || []);
     const title = supported
       ? `${label.name} · ${groups.get(label.group) || groupDisplayName(label.group)}${label.description ? `\n${label.description}` : ""}`
       : `当前对象“${currentTarget.displayName}”不可用；该标签支持：${targetHint}`;
     return `
-    <button class="label-button${supported ? "" : " target-disabled"}" data-label-code="${escapeHtml(label.code)}" style="--label-color:${escapeHtml(label.color || "#8c959f")}" title="${escapeHtml(title)}" type="button"${supported ? "" : " disabled"}>
+    <button class="label-button${enabledForEpisode ? "" : " target-disabled"}" data-label-code="${escapeHtml(label.code)}" style="--label-color:${escapeHtml(label.color || "#8c959f")}" title="${escapeHtml(state.detail ? title : "请先选择 Episode")}" type="button"${enabledForEpisode ? "" : " disabled"}>
       <i class="label-color"></i><span class="label-copy"><strong>${escapeHtml(label.name)}</strong><small>${escapeHtml(supported ? (groups.get(label.group) || label.group) : `仅支持：${targetHint}`)}</small></span>${label.shortcut ? `<kbd>${escapeHtml(label.shortcut)}</kbd>` : ""}
     </button>`;
   }).join("");
@@ -1076,8 +1143,12 @@ async function setReviewStatus(status, showToast = true) {
 
 function renderDecision() {
   const episode = state.detail?.episode;
-  els.decisionGrid.querySelectorAll("[data-decision]").forEach((button) => button.classList.toggle("active", button.dataset.decision === episode?.quality_decision));
+  els.decisionGrid.querySelectorAll("[data-decision]").forEach((button) => {
+    button.classList.toggle("active", button.dataset.decision === episode?.quality_decision);
+    button.disabled = !episode;
+  });
   els.needsRecheck.classList.toggle("active", episode?.review_status === "needs_recheck");
+  els.needsRecheck.disabled = !episode;
 }
 
 function updateEpisodeFromDetail() {
@@ -1312,23 +1383,36 @@ function selectJointAtPointer(event) {
 }
 
 function handleKeyboard(event) {
-  const editing = ["INPUT", "TEXTAREA", "SELECT"].includes(event.target.tagName) || els.annotationEditor.open;
-  if (editing && !(event.ctrlKey && event.key.toLowerCase() === "z")) return;
-  if (event.ctrlKey && event.key.toLowerCase() === "z") { event.preventDefault(); event.shiftKey ? redo() : undo(); return; }
-  if (event.altKey && /^[1-6]$/.test(event.key)) {
-    event.preventDefault();
-    setDecision(["pass", "pass_with_labels", "trim", "repair", "recollect", "reject"][Number(event.key) - 1]);
+  if (event.key === "Escape" && els.toolMenu.open) {
+    els.toolMenu.open = false;
     return;
   }
-  if (event.code === "Space") { event.preventDefault(); togglePlayback(); return; }
+  const editing = ["INPUT", "TEXTAREA", "SELECT"].includes(event.target.tagName) || els.annotationEditor.open;
+  if (editing && !(event.ctrlKey && event.key.toLowerCase() === "z")) return;
+  if (event.ctrlKey && event.key.toLowerCase() === "z") {
+    const action = event.shiftKey ? els.redo : els.undo;
+    if (!action.disabled) { event.preventDefault(); event.shiftKey ? redo() : undo(); }
+    return;
+  }
+  if (event.altKey && /^[1-6]$/.test(event.key)) {
+    const decision = ["pass", "pass_with_labels", "trim", "repair", "recollect", "reject"][Number(event.key) - 1];
+    const button = els.decisionGrid.querySelector(`[data-decision="${decision}"]`);
+    if (!button?.disabled) { event.preventDefault(); setDecision(decision); }
+    return;
+  }
+  if (event.code === "Space") { if (!els.togglePlay.disabled) { event.preventDefault(); togglePlayback(); } return; }
   if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
-    event.preventDefault(); seekTo(state.playheadNs + (event.key === "ArrowRight" ? 1 : -1) * (event.shiftKey ? 1e9 : 1e9 / 30)); return;
+    if (!els.timelineRange.disabled) {
+      event.preventDefault();
+      seekTo(state.playheadNs + (event.key === "ArrowRight" ? 1 : -1) * (event.shiftKey ? 1e9 : 1e9 / 30));
+    }
+    return;
   }
   const key = event.key.toUpperCase();
-  if (key === "I") return markSelectionStart();
-  if (key === "O") return markSelectionEnd();
-  if (key === "N") return moveEpisode(1);
-  if (key === "P") return moveEpisode(-1);
+  if (key === "I" && !els.markIn.disabled) return markSelectionStart();
+  if (key === "O" && !els.markOut.disabled) return markSelectionEnd();
+  if (key === "N" && !els.nextEpisode.disabled) return moveEpisode(1);
+  if (key === "P" && !els.previousEpisode.disabled) return moveEpisode(-1);
   if (key === "F") {
     const streamId = state.selectedCameraId || state.cache?.cameras?.[0]?.stream_id;
     if (streamId) toggleCameraFullscreen(streamId);

@@ -13,6 +13,7 @@ class FakeFlowClient:
     def __init__(self, job):
         self.job = job
         self.cache_reports = []
+        self.work_reports = []
         self.results = []
 
     def claim(self, job_code):
@@ -23,6 +24,11 @@ class FakeFlowClient:
         assert job_code == self.job["code"]
         self.cache_reports.append(values)
         return {**self.job, **values}
+
+    def report_work(self, job_code, *, action, **values):
+        assert job_code == self.job["code"]
+        self.work_reports.append({"action": action, **values})
+        return {**self.job, "status": "in_progress", "action": action, **values}
 
     def submit_result(self, job_code, **values):
         assert job_code == self.job["code"]
@@ -87,6 +93,7 @@ def test_flow_job_is_fully_cached_verified_submitted_and_safely_evicted(tmp_path
     assert reused["primary_files"] == cached["primary_files"]
 
     cache.start_review(client, job["code"])
+    assert client.work_reports == [{"action": "start", "workstation": "QC-WS-TEST"}]
     with pytest.raises(QualityCacheError, match="尚未同步"):
         cache.evict(job["code"])
 
@@ -112,6 +119,7 @@ def test_flow_job_is_fully_cached_verified_submitted_and_safely_evicted(tmp_path
     )
 
     assert submitted["status"] == "completed"
+    assert client.work_reports[-1] == {"action": "heartbeat"}
     result_path = asset_root / "qc" / "v1" / "qc_result.json"
     result = json.loads(result_path.read_text(encoding="utf-8"))
     assert [item["decision"] for item in result["episode_results"]] == [

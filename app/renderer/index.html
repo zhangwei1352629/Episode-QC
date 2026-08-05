@@ -4,30 +4,37 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: file: blob:; connect-src 'self' http://127.0.0.1:* http://localhost:* http://[::1]:*; object-src 'none'; base-uri 'none'" />
-    <title>Mocap QC Annotator</title>
+    <title>DataOps · Episode QC</title>
+    <link rel="icon" href="./favicon.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>
     <div class="app-shell">
       <header class="topbar">
         <div class="brand">
-          <div class="brand-mark">MQ</div>
+          <div class="brand-mark">DQ</div>
           <div>
-            <h1>Episode QC</h1>
+            <div class="brand-title"><h1>DataOps</h1><span>EPISODE QC</span></div>
             <p id="workspace-name">正在打开工作区…</p>
           </div>
         </div>
         <div class="top-actions">
-          <label class="reviewer-field">质检员 <input id="reviewer-name" placeholder="输入姓名" /></label>
-          <a class="button secondary download-button" href="./label-template-simple.yaml" download="标签库简易模板.yaml" title="下载后填写英文编码、中文名称和判断标准">下载标签模板</a>
-          <button class="button secondary" id="import-labels" type="button">导入标签库</button>
-          <select class="export-format" id="export-format" aria-label="标注结果导出格式" title="每个任务导出一个文件">
-            <option value="json">JSON</option>
-            <option value="csv">CSV</option>
-          </select>
-          <button class="button secondary" id="export-results" type="button">导出结果</button>
+          <div class="panel-toggles" aria-label="工作区面板">
+            <button class="panel-toggle" id="toggle-episodes" type="button" title="显示或隐藏任务列表" aria-pressed="true"><span>☷</span><b>任务栏</b></button>
+            <button class="panel-toggle" id="toggle-labels" type="button" title="显示或隐藏标注面板" aria-pressed="true"><span>◇</span><b>标注栏</b></button>
+          </div>
           <button class="button primary" id="add-source" type="button">导入新任务</button>
-          <div class="save-state" id="save-state"><span></span>已保存</div>
+          <button class="button secondary" id="export-results" type="button">导出结果</button>
+          <details class="tool-menu" id="tool-menu">
+            <summary class="button secondary">工具</summary>
+            <div class="tool-menu-panel">
+              <label class="reviewer-field"><span>质检员</span><input id="reviewer-name" placeholder="输入姓名" /></label>
+              <label class="tool-field"><span>导出格式</span><select class="export-format" id="export-format" aria-label="标注结果导出格式" title="每个任务导出一个文件"><option value="json">JSON</option><option value="csv">CSV</option></select></label>
+              <button class="button secondary" id="import-labels" type="button">导入标签库</button>
+              <a class="button secondary download-button" href="./label-template-simple.yaml" download="标签库简易模板.yaml" title="下载后填写英文编码、中文名称和判断标准">下载标签模板</a>
+            </div>
+          </details>
+          <div class="save-state" id="save-state" role="status" aria-live="polite"><span></span>已保存</div>
         </div>
       </header>
 
@@ -179,7 +186,7 @@
       </aside>
     </div>
 
-    <div class="toast-stack" id="toast-stack"></div>
+    <div class="toast-stack" id="toast-stack" role="status" aria-live="polite" aria-atomic="true"></div>
     <dialog id="task-center" class="task-center-dialog">
       <div class="task-center-shell">
         <div class="dialog-heading">

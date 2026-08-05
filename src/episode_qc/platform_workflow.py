@@ -85,6 +85,13 @@ class FlowClient:
     def report_cache(self, job_code: str, **values) -> dict:
         return self.request("POST", f"/api/v1/qc/jobs/{job_code}/cache", values)
 
+    def report_work(self, job_code: str, *, action: str, **values) -> dict:
+        return self.request(
+            "POST",
+            f"/api/v1/qc/jobs/{job_code}/work",
+            {"action": action, **values},
+        )
+
     def submit_result(
         self,
         job_code: str,
@@ -248,6 +255,12 @@ class QualityCacheManager:
 
     def start_review(self, client: FlowClient, job_code: str) -> dict:
         job_code = self._safe_component(job_code, "质检任务编号")
+        if hasattr(client, "report_work"):
+            return client.report_work(
+                job_code,
+                action="start",
+                workstation=self.workspace_name,
+            )
         return client.report_cache(
             job_code,
             status="in_progress",
@@ -307,6 +320,8 @@ class QualityCacheManager:
             encoding="utf-8",
         )
         result_nas_path = self._publish_result(job, local_result)
+        if hasattr(client, "report_work"):
+            client.report_work(job_code, action="heartbeat")
         response = client.submit_result(
             job_code,
             episode_results=episode_results,

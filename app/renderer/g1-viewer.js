@@ -60,10 +60,11 @@ export class G1Viewer {
     this.footRestPitch = { left: null, right: null };
     this.modelRoot = new THREE.Group();
     this.scene = new THREE.Scene();
+    this.scene.background = new THREE.Color(0x0b1014);
     this.scene.add(this.modelRoot);
     this.camera = new THREE.PerspectiveCamera(28, 1, 0.01, 30);
-    this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true, powerPreference: "high-performance" });
-    this.renderer.setClearColor(0x000000, 0);
+    this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: false, powerPreference: "high-performance" });
+    this.renderer.setClearColor(0x0b1014, 1);
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
     this.renderer.toneMappingExposure = 1.12;

@@ -27,32 +27,14 @@ def test_web_cli_accepts_multiple_lan_hosts():
             "10.1.11.155",
             "--port",
             "8765",
+            "--standalone",
         ]
     )
 
     assert args.host == "0.0.0.0"
     assert args.public_host == ["192.168.123.222", "10.1.11.155"]
     assert args.port == 8765
-
-
-def test_data_worker_cli_requires_and_accepts_central_origins():
-    args = cli.build_parser().parse_args(
-        [
-            "data-worker",
-            "--port",
-            "8766",
-            "--allow-origin",
-            "http://192.168.123.222:8765",
-            "--allow-origin",
-            "http://10.1.11.155:8765",
-        ]
-    )
-
-    assert args.port == 8766
-    assert args.allow_origin == [
-        "http://192.168.123.222:8765",
-        "http://10.1.11.155:8765",
-    ]
+    assert args.standalone is True
 
 
 def test_cli_does_not_load_image_detection_by_default():

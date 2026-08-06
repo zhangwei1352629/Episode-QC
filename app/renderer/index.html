@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: file: blob:; connect-src 'self' http://127.0.0.1:* http://localhost:* http://[::1]:*; object-src 'none'; base-uri 'none'" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: file: blob:; connect-src 'self'; object-src 'none'; base-uri 'none'" />
     <title>DataOps · Episode QC</title>
     <link rel="icon" href="./favicon.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="./styles.css" />
@@ -213,7 +213,7 @@
         </div>
         <div class="task-center-summary" id="task-center-summary"></div>
         <div class="task-center-columns">
-          <section class="flow-task-panel">
+          <section class="flow-task-panel" id="flow-task-panel">
             <div class="flow-task-heading">
               <div><strong>Flow 待领取任务</strong><span id="flow-task-status">尚未选择质检员</span></div>
               <div>
@@ -229,9 +229,9 @@
             </form>
             <div class="flow-task-list" id="flow-task-list"><div class="empty-panel">刷新并选择质检员后显示可领取任务</div></div>
           </section>
-          <section class="local-task-panel">
+          <section class="local-task-panel" id="local-task-panel">
             <div class="local-task-heading">
-              <div><strong>本地 QC 任务</strong><span>已领取任务和手工导入任务</span></div>
+              <div><strong id="local-task-title">本地 QC 任务</strong><span id="local-task-description">已领取任务和手工导入任务</span></div>
               <button id="clear-local-task-history" type="button" disabled>清空历史导入</button>
             </div>
             <label class="reviewer-field local-reviewer-field"><span>本地质检员署名</span><input id="reviewer-name" placeholder="选择 Flow 质检员后自动填写" /></label>
@@ -239,7 +239,7 @@
           </section>
         </div>
         <div class="task-center-actions">
-          <p>清空历史导入只删除本地索引和派生缓存，不删除原始数据，也不影响 Flow 任务。</p>
+          <p id="task-center-note">清空历史导入只删除本地索引和派生缓存，不删除原始数据，也不影响 Flow 任务。</p>
           <button class="button primary" id="task-center-import" type="button">导入新任务</button>
         </div>
       </div>

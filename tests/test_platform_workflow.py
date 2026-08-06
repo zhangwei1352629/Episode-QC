@@ -6,7 +6,53 @@ from pathlib import Path
 
 import pytest
 
-from episode_qc.platform_workflow import QualityCacheError, QualityCacheManager
+from episode_qc.platform_workflow import (
+    QualityCacheError,
+    QualityCacheManager,
+    canonical_json_sha256,
+)
+
+
+def publish_asset_manifest(asset_root: Path, job: dict, relative_files: list[str]) -> dict:
+    episode_manifests = {}
+    for relative_text in relative_files:
+        relative = Path(relative_text)
+        source = asset_root / relative
+        episode_directory = relative.parent.as_posix()
+        episode_manifests.setdefault(episode_directory, []).append(
+            {
+                "relative_path": relative.as_posix(),
+                "size_bytes": source.stat().st_size,
+                "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+            }
+        )
+    manifest_episodes = []
+    for episode in job["episodes"]:
+        copied = dict(episode)
+        copied["manifest"] = {
+            "schema_version": 1,
+            "files": episode_manifests.get(episode["relative_path"], []),
+        }
+        manifest_episodes.append(copied)
+    manifest = {
+        "schema_version": 1,
+        "asset_id": job["asset_id"],
+        "episodes": manifest_episodes,
+    }
+    (asset_root / "asset_manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    job["asset_manifest"] = manifest
+    job["asset_manifest_sha256"] = canonical_json_sha256(manifest)
+    job["result_upload_uri"] = str(
+        asset_root.parent / "qc-results" / job["asset_id"] / job["code"]
+    )
+    job["result_staging_uri"] = str(
+        asset_root.parent / "incoming" / "qc-results" / job["asset_id"] / job["code"]
+    )
+    job["next_attempt"] = 1
+    return manifest
 
 
 class FakeFlowClient:
@@ -50,12 +96,11 @@ def test_flow_job_is_fully_cached_verified_submitted_and_safely_evicted(tmp_path
     (first_source / "metadata.json").write_text('{"schema_version": 1}', encoding="utf-8")
     checksum = hashlib.sha256(payload).hexdigest()
     second_checksum = hashlib.sha256(second_payload).hexdigest()
-    total_bytes = sum(path.stat().st_size for path in asset_root.rglob("*") if path.is_file())
     job = {
         "code": "QCJ-001",
         "version": 1,
         "asset_id": "AST-001",
-        "asset_size_bytes": total_bytes,
+        "asset_size_bytes": 0,
         "asset_nas_uri": str(asset_root),
         "source_uri": str(asset_root),
         "episodes": [
@@ -73,6 +118,17 @@ def test_flow_job_is_fully_cached_verified_submitted_and_safely_evicted(tmp_path
             },
         ],
     }
+    publish_asset_manifest(
+        asset_root,
+        job,
+        [
+            "episodes/episode_000001/motion.bvh",
+            "episodes/episode_000001/metadata.json",
+            "episodes/episode_000002/motion.bvh",
+        ],
+    )
+    total_bytes = sum(path.stat().st_size for path in asset_root.rglob("*") if path.is_file())
+    job["asset_size_bytes"] = total_bytes
     client = FakeFlowClient(job)
     cache = QualityCacheManager(
         tmp_path / "qc-cache", reserve_bytes=0, workspace_name="QC-WS-TEST", chunk_size=4096
@@ -120,13 +176,23 @@ def test_flow_job_is_fully_cached_verified_submitted_and_safely_evicted(tmp_path
 
     assert submitted["status"] == "completed"
     assert client.work_reports[-1] == {"action": "heartbeat"}
-    result_path = asset_root / "qc" / "v1" / "qc_result.json"
+    result_path = (
+        Path(job["result_upload_uri"])
+        / "attempt-0001"
+        / "qc_result.json"
+    )
     result = json.loads(result_path.read_text(encoding="utf-8"))
     assert [item["decision"] for item in result["episode_results"]] == [
         "pass_with_labels",
         "discard",
     ]
     assert client.results[0]["result_nas_path"] == str(result_path)
+    assert client.results[0]["result_id"].startswith("QCR-")
+    assert client.results[0]["result_manifest"]["result_sha256"] == client.results[0][
+        "result_sha256"
+    ]
+    assert (result_path.parent / "result_manifest.json").is_file()
+    assert not any(Path(job["result_staging_uri"]).glob("*.partial"))
 
     cache.evict(job["code"])
     assert not (tmp_path / "qc-cache" / "ready" / job["code"]).exists()
@@ -151,6 +217,11 @@ def test_cache_rejects_wrong_manifest_checksum(tmp_path: Path):
             "checksum_sha256": "0" * 64,
         }],
     }
+    publish_asset_manifest(
+        asset_root,
+        job,
+        ["episodes/episode_000001/motion.bvh"],
+    )
 
     with pytest.raises(QualityCacheError, match="SHA-256"):
         QualityCacheManager(tmp_path / "cache", reserve_bytes=0).cache_job(
@@ -176,8 +247,110 @@ def test_cache_rejects_unsafe_platform_paths(tmp_path: Path):
             "checksum_sha256": "",
         }],
     }
+    safe_manifest = {
+        "schema_version": 1,
+        "asset_id": "AST-003",
+        "episodes": [
+            {
+                "episode_id": "AST-003-EP0001",
+                "relative_path": "episode_000001",
+                "primary_file": "motion.bvh",
+                "manifest": {
+                    "files": [
+                        {
+                            "relative_path": "episode_000001/motion.bvh",
+                            "size_bytes": 4,
+                            "sha256": hashlib.sha256(b"data").hexdigest(),
+                        }
+                    ]
+                },
+            }
+        ],
+    }
+    (source.parent / "asset_manifest.json").write_text(json.dumps(safe_manifest))
+    job["asset_manifest"] = safe_manifest
+    job["asset_manifest_sha256"] = canonical_json_sha256(safe_manifest)
 
     with pytest.raises(QualityCacheError, match="安全的相对路径"):
+        QualityCacheManager(tmp_path / "cache", reserve_bytes=0).cache_job(
+            FakeFlowClient(job), job
+        )
+
+
+def test_cache_uses_manifest_and_ignores_unlisted_nas_files(tmp_path: Path):
+    asset_root = tmp_path / "nas" / "AST-004"
+    episode_root = asset_root / "episodes" / "episode_000001"
+    episode_root.mkdir(parents=True)
+    primary = episode_root / "motion.bvh"
+    primary.write_bytes(b"published-data")
+    checksum = hashlib.sha256(primary.read_bytes()).hexdigest()
+    job = {
+        "code": "QCJ-004",
+        "asset_id": "AST-004",
+        "asset_nas_uri": str(asset_root),
+        "source_uri": str(asset_root),
+        "episodes": [
+            {
+                "episode_id": "AST-004-EP0001",
+                "relative_path": "episodes/episode_000001",
+                "primary_file": "motion.bvh",
+                "checksum_sha256": checksum,
+            }
+        ],
+    }
+    publish_asset_manifest(
+        asset_root,
+        job,
+        ["episodes/episode_000001/motion.bvh"],
+    )
+    old_result = asset_root / "qc" / "v1" / "qc_result.json"
+    old_result.parent.mkdir(parents=True)
+    old_result.write_text("old result", encoding="utf-8")
+    (asset_root / "orphan.partial").write_text("partial", encoding="utf-8")
+
+    cached = QualityCacheManager(tmp_path / "cache", reserve_bytes=0).cache_job(
+        FakeFlowClient(job), job
+    )
+
+    cache_root = Path(cached["cache_dir"])
+    assert (cache_root / "episodes/episode_000001/motion.bvh").is_file()
+    assert not (cache_root / "qc").exists()
+    assert not (cache_root / "orphan.partial").exists()
+
+
+def test_cache_rejects_corrupted_metadata_listed_by_manifest(tmp_path: Path):
+    asset_root = tmp_path / "nas" / "AST-005"
+    episode_root = asset_root / "episodes" / "episode_000001"
+    episode_root.mkdir(parents=True)
+    primary = episode_root / "motion.bvh"
+    metadata = episode_root / "metadata.json"
+    primary.write_bytes(b"motion")
+    metadata.write_bytes(b"good")
+    job = {
+        "code": "QCJ-005",
+        "asset_id": "AST-005",
+        "asset_nas_uri": str(asset_root),
+        "source_uri": str(asset_root),
+        "episodes": [
+            {
+                "episode_id": "AST-005-EP0001",
+                "relative_path": "episodes/episode_000001",
+                "primary_file": "motion.bvh",
+                "checksum_sha256": hashlib.sha256(b"motion").hexdigest(),
+            }
+        ],
+    }
+    publish_asset_manifest(
+        asset_root,
+        job,
+        [
+            "episodes/episode_000001/motion.bvh",
+            "episodes/episode_000001/metadata.json",
+        ],
+    )
+    metadata.write_bytes(b"evil")
+
+    with pytest.raises(QualityCacheError, match="SHA-256"):
         QualityCacheManager(tmp_path / "cache", reserve_bytes=0).cache_job(
             FakeFlowClient(job), job
         )

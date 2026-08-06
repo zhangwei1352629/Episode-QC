@@ -9,14 +9,15 @@ import os
 import re
 import shutil
 import socket
-import tempfile
 import urllib.error
 import urllib.request
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from pathlib import PurePosixPath
 from typing import Callable
 
-from episode_qc.source_paths import resolve_source_directory
+from episode_qc.source_paths import resolve_source_directory, resolve_target_directory
 
 
 ProgressCallback = Callable[[dict[str, object]], None]
@@ -108,6 +109,9 @@ class FlowClient:
     def claim(self, job_code: str) -> dict:
         return self.request("POST", f"/api/v1/qc/jobs/{job_code}/claim", {})
 
+    def release(self, job_code: str) -> dict:
+        return self.request("POST", f"/api/v1/qc/jobs/{job_code}/release", {})
+
     def report_cache(self, job_code: str, **values) -> dict:
         return self.request("POST", f"/api/v1/qc/jobs/{job_code}/cache", values)
 
@@ -125,6 +129,9 @@ class FlowClient:
         episode_results: list[dict],
         result: dict | None = None,
         result_nas_path: str = "",
+        result_id: str = "",
+        result_sha256: str = "",
+        result_manifest: dict | None = None,
     ) -> dict:
         normalized_results = []
         for episode_result in episode_results:
@@ -146,6 +153,9 @@ class FlowClient:
             "episode_results": normalized_results,
             "result": result or {},
             "result_nas_path": result_nas_path,
+            "result_id": result_id,
+            "result_sha256": result_sha256,
+            "result_manifest": result_manifest or {},
         }
         return self.request("POST", f"/api/v1/qc/jobs/{job_code}/result", payload)
 
@@ -159,6 +169,16 @@ def sha256_file(path: str | Path, chunk_size: int = 8 * 1024 * 1024) -> str:
                 break
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def canonical_json_sha256(value: object) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 class QualityCacheManager:
@@ -186,15 +206,8 @@ class QualityCacheManager:
         job_code = self._safe_component(job["code"], "质检任务编号")
         claimed = client.claim(job_code)
         source = resolve_source_directory(str(claimed["source_uri"]))
-        files = sorted(path for path in source.rglob("*") if path.is_file())
-        if not files:
-            raise QualityCacheError(f"NAS 资产目录没有文件：{source}")
-        total_bytes = sum(path.stat().st_size for path in files)
-        expected_bytes = int(claimed.get("asset_size_bytes") or 0)
-        if expected_bytes and total_bytes < expected_bytes:
-            raise QualityCacheError(
-                f"NAS 文件不完整：实际 {total_bytes} 字节，小于清单 {expected_bytes} 字节"
-            )
+        files, asset_manifest_sha256 = self._manifest_file_specs(claimed, source)
+        total_bytes = sum(int(item["size_bytes"]) for item in files)
         asset_directory = self._asset_directory_name(claimed)
         partial_job_root = self.cache_root / "downloading" / f"{job_code}.partial"
         partial_root = partial_job_root / asset_directory
@@ -206,12 +219,14 @@ class QualityCacheManager:
             ready_job_root,
             ready_root,
             total_bytes=total_bytes,
+            files=files,
+            asset_manifest_sha256=asset_manifest_sha256,
         )
         if reused is not None:
             return reused
         self._ensure_disk_space(total_bytes)
         partial_root.mkdir(parents=True, exist_ok=True)
-        copied_bytes = self._existing_bytes(partial_root, source, files)
+        copied_bytes = self._existing_bytes(partial_root, files)
         client.report_cache(
             job_code,
             status="caching",
@@ -220,8 +235,9 @@ class QualityCacheManager:
             cache_workstation=self.workspace_name,
         )
         last_reported_percent = -1
-        for source_file in files:
-            relative = source_file.relative_to(source)
+        for file_spec in files:
+            relative = Path(file_spec["relative_path"])
+            source_file = source / relative
             target = partial_root / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             copied_bytes = self._copy_resumable(
@@ -230,6 +246,7 @@ class QualityCacheManager:
                 copied_bytes=copied_bytes,
                 total_bytes=total_bytes,
                 callback=lambda state: self._emit(progress_callback, state),
+                expected_size=int(file_spec["size_bytes"]),
             )
             percent = min(99, int(copied_bytes * 100 / total_bytes)) if total_bytes else 99
             if percent >= last_reported_percent + 5:
@@ -242,6 +259,7 @@ class QualityCacheManager:
                 )
                 last_reported_percent = percent
 
+        self._verify_manifest_files(partial_root, files)
         primary_files = self._verify_episode_primary_files(claimed, partial_root)
 
         state = {
@@ -250,9 +268,13 @@ class QualityCacheManager:
             "asset_id": claimed["asset_id"],
             "episode_ids": [item["episode_id"] for item in claimed.get("episodes", [])],
             "source_uri": claimed["source_uri"],
+            "asset_manifest_sha256": asset_manifest_sha256,
             "total_bytes": total_bytes,
             "primary_files": primary_files,
             "result_synced": False,
+            "result_upload_uri": claimed.get("result_upload_uri", ""),
+            "result_staging_uri": claimed.get("result_staging_uri", ""),
+            "next_attempt": int(claimed.get("next_attempt") or 1),
         }
         state["asset_directory"] = asset_directory
         (partial_job_root / ".qc-cache.json").write_text(
@@ -331,21 +353,66 @@ class QualityCacheManager:
             }
             for item in episode_results
         ]
+        pending_result = state.get("pending_result") or {}
+        result_id = str(pending_result.get("result_id") or f"QCR-{uuid.uuid4().hex}")
+        attempt = int(state.get("next_attempt") or job.get("next_attempt") or 1)
+        created_at = str(
+            pending_result.get("created_at")
+            or datetime.now(timezone.utc).isoformat()
+        )
         result_document = {
             "schema_version": 2,
+            "result_id": result_id,
             "job_code": job_code,
             "asset_id": job["asset_id"],
+            "attempt": attempt,
+            "source_manifest_sha256": state.get("asset_manifest_sha256", ""),
             "episode_results": normalized_results,
             "result": result or {},
         }
         local_results = self.cache_root / "results-pending" / job_code
         local_results.mkdir(parents=True, exist_ok=True)
         local_result = local_results / "qc_result.json"
-        local_result.write_text(
-            json.dumps(result_document, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
+        encoded_result = (
+            json.dumps(result_document, ensure_ascii=False, indent=2) + "\n"
+        ).encode("utf-8")
+        result_sha256 = hashlib.sha256(encoded_result).hexdigest()
+        if pending_result and (
+            pending_result.get("result_id") != result_id
+            or pending_result.get("result_sha256") != result_sha256
+        ):
+            raise QualityCacheError("已有待同步质检结果且内容不同，禁止覆盖")
+        self._write_json_atomic(local_result, result_document)
+        result_manifest = {
+            "schema_version": 1,
+            "result_id": result_id,
+            "result_sha256": result_sha256,
+            "job_code": job_code,
+            "asset_id": job["asset_id"],
+            "attempt": attempt,
+            "source_manifest_sha256": state.get("asset_manifest_sha256", ""),
+            "created_at": created_at,
+            "files": [
+                {
+                    "relative_path": "qc_result.json",
+                    "size_bytes": local_result.stat().st_size,
+                    "sha256": result_sha256,
+                }
+            ],
+        }
+        state["pending_result"] = {
+            "result_id": result_id,
+            "result_sha256": result_sha256,
+            "attempt": attempt,
+            "created_at": created_at,
+        }
+        self._write_json_atomic(state_path, state)
+        result_nas_path = self._publish_result(
+            job,
+            state,
+            local_result,
+            result_manifest,
         )
-        result_nas_path = self._publish_result(job, local_result)
         if hasattr(client, "report_work"):
             client.report_work(job_code, action="heartbeat")
         response = client.submit_result(
@@ -353,12 +420,15 @@ class QualityCacheManager:
             episode_results=episode_results,
             result=result or {},
             result_nas_path=result_nas_path,
+            result_id=result_id,
+            result_sha256=result_sha256,
+            result_manifest=result_manifest,
         )
         state["result_synced"] = True
         state["result_nas_path"] = result_nas_path
-        state_path.write_text(
-            json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-        )
+        state["result_id"] = result_id
+        state["result_sha256"] = result_sha256
+        self._write_json_atomic(state_path, state)
         shutil.rmtree(local_results)
         return response
 
@@ -366,9 +436,7 @@ class QualityCacheManager:
         state_path = self._state_path(job_code)
         state = json.loads(state_path.read_text(encoding="utf-8"))
         state["local_episodes"] = mappings
-        state_path.write_text(
-            json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-        )
+        self._write_json_atomic(state_path, state)
 
     def local_episode_mappings(self, job_code: str) -> list[dict]:
         state_path = self._state_path(job_code)
@@ -393,25 +461,72 @@ class QualityCacheManager:
             raise QualityCacheError("质检结果尚未同步，禁止清理本地缓存")
         shutil.rmtree(ready_root)
 
-    def _publish_result(self, job: dict, local_result: Path) -> str:
-        asset_root = resolve_source_directory(str(job["asset_nas_uri"]))
-        destination = (
-            asset_root
-            / "qc"
-            / f"v{int(job.get('version') or 1)}"
-            / "qc_result.json"
-        )
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(
-            dir=destination.parent, prefix=".qc-result-", delete=False
-        ) as temporary:
-            temporary_path = Path(temporary.name)
+    def _publish_result(
+        self,
+        job: dict,
+        state: dict,
+        local_result: Path,
+        result_manifest: dict,
+    ) -> str:
+        upload_uri = str(
+            job.get("result_upload_uri")
+            or state.get("result_upload_uri")
+            or ""
+        ).rstrip("/")
+        if not upload_uri:
+            raise QualityCacheError("Flow 没有返回独立的质检结果上传目录")
+        result_root = resolve_target_directory(upload_uri)
+        attempt_name = f"attempt-{int(result_manifest['attempt']):04d}"
+        destination = result_root / attempt_name
+        manifest_path = destination / "result_manifest.json"
+        if destination.exists():
+            try:
+                existing = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise QualityCacheError(f"已有质检结果目录不完整：{destination}") from exc
+            if (
+                existing.get("result_id") == result_manifest["result_id"]
+                and existing.get("result_sha256") == result_manifest["result_sha256"]
+            ):
+                return f"{upload_uri}/{attempt_name}/qc_result.json"
+            raise QualityCacheError(f"质检结果轮次已经存在，禁止覆盖：{destination}")
+
+        staging_uri = str(
+            job.get("result_staging_uri")
+            or state.get("result_staging_uri")
+            or ""
+        ).rstrip("/")
+        if staging_uri:
+            staging_root = resolve_target_directory(staging_uri)
+            staging = staging_root / (
+                f"{attempt_name}.{result_manifest['result_id']}.partial"
+            )
+        else:
+            staging = result_root / (
+                f".{attempt_name}.{result_manifest['result_id']}.partial"
+            )
+        result_root.mkdir(parents=True, exist_ok=True)
+        staging.mkdir(parents=True, exist_ok=True)
+        staged_result = staging / "qc_result.json"
+        temporary_result = staging / "qc_result.json.partial"
+        shutil.copy2(local_result, temporary_result)
+        if sha256_file(temporary_result) != result_manifest["result_sha256"]:
+            raise QualityCacheError("质检结果上传后 SHA-256 校验失败")
+        os.replace(temporary_result, staged_result)
+        self._write_json_atomic(staging / "result_manifest.json", result_manifest)
         try:
-            shutil.copy2(local_result, temporary_path)
-            os.replace(temporary_path, destination)
-        finally:
-            temporary_path.unlink(missing_ok=True)
-        return str(destination)
+            os.replace(staging, destination)
+        except OSError as exc:
+            try:
+                existing = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                raise QualityCacheError(f"无法原子发布质检结果：{exc}") from exc
+            if (
+                existing.get("result_id") != result_manifest["result_id"]
+                or existing.get("result_sha256") != result_manifest["result_sha256"]
+            ):
+                raise QualityCacheError(f"质检结果轮次发生并发冲突：{destination}") from exc
+        return f"{upload_uri}/{attempt_name}/qc_result.json"
 
     def _ensure_disk_space(self, source_bytes: int) -> None:
         free = shutil.disk_usage(self.cache_root).free
@@ -446,6 +561,98 @@ class QualityCacheManager:
             raise QualityCacheError(f"{field_name} 不是安全的相对路径")
         return Path(*path.parts)
 
+    def _manifest_file_specs(
+        self,
+        job: dict,
+        source_root: Path,
+    ) -> tuple[list[dict], str]:
+        manifest = job.get("asset_manifest") or {}
+        if not isinstance(manifest, dict) or not manifest.get("episodes"):
+            raise QualityCacheError("Flow 任务缺少完整 asset_manifest，禁止下载")
+        manifest_digest = canonical_json_sha256(manifest)
+        expected_digest = str(job.get("asset_manifest_sha256") or "")
+        if expected_digest and expected_digest != manifest_digest:
+            raise QualityCacheError("Flow 返回的资产清单摘要不一致")
+
+        published_manifest = source_root / "asset_manifest.json"
+        try:
+            stored_manifest = json.loads(published_manifest.read_text(encoding="utf-8"))
+        except FileNotFoundError as exc:
+            raise QualityCacheError("NAS 资产尚未发布 asset_manifest.json") from exc
+        except (OSError, json.JSONDecodeError) as exc:
+            raise QualityCacheError("NAS asset_manifest.json 无法读取") from exc
+        if canonical_json_sha256(stored_manifest) != manifest_digest:
+            raise QualityCacheError("NAS 资产清单与 Flow 登记内容不一致")
+
+        specs = []
+        seen = set()
+        for episode in manifest.get("episodes") or []:
+            files = (episode.get("manifest") or {}).get("files") or []
+            if not files:
+                raise QualityCacheError(
+                    f"Episode {episode.get('episode_id') or '?'} 缺少逐文件清单"
+                )
+            for item in files:
+                relative = self._safe_relative_path(
+                    item.get("relative_path"), "资产清单文件路径"
+                )
+                normalized = relative.as_posix()
+                if normalized in seen:
+                    raise QualityCacheError(f"资产清单包含重复文件：{normalized}")
+                seen.add(normalized)
+                try:
+                    expected_size = int(item["size_bytes"])
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise QualityCacheError(f"资产清单文件大小无效：{normalized}") from exc
+                expected_sha256 = str(item.get("sha256") or "").lower()
+                if expected_size < 0 or not re.fullmatch(r"[a-f0-9]{64}", expected_sha256):
+                    raise QualityCacheError(f"资产清单文件校验信息无效：{normalized}")
+                source = source_root / relative
+                if not source.is_file():
+                    raise QualityCacheError(f"NAS 缺少清单文件：{normalized}")
+                if source.stat().st_size != expected_size:
+                    raise QualityCacheError(f"NAS 文件大小与清单不一致：{normalized}")
+                specs.append(
+                    {
+                        "relative_path": normalized,
+                        "size_bytes": expected_size,
+                        "sha256": expected_sha256,
+                    }
+                )
+
+        primary_paths = {
+            (
+                self._safe_relative_path(item["relative_path"], "Episode 相对目录")
+                / self._safe_relative_path(item["primary_file"], "Episode 主文件")
+            ).as_posix()
+            for item in job.get("episodes") or []
+        }
+        missing_primaries = sorted(primary_paths - seen)
+        if missing_primaries:
+            raise QualityCacheError(
+                f"资产清单缺少 Episode 主文件：{', '.join(missing_primaries)}"
+            )
+
+        specs.append(
+            {
+                "relative_path": "asset_manifest.json",
+                "size_bytes": published_manifest.stat().st_size,
+                "sha256": sha256_file(published_manifest),
+            }
+        )
+        return sorted(specs, key=lambda item: item["relative_path"]), manifest_digest
+
+    @staticmethod
+    def _verify_manifest_files(asset_root: Path, files: list[dict]) -> None:
+        for item in files:
+            relative = Path(item["relative_path"])
+            target = asset_root / relative
+            if not target.is_file() or target.stat().st_size != int(item["size_bytes"]):
+                raise QualityCacheError(f"缓存文件大小校验失败：{relative}")
+            if sha256_file(target) != item["sha256"]:
+                target.unlink(missing_ok=True)
+                raise QualityCacheError(f"缓存文件 SHA-256 校验失败：{relative}")
+
     def _reuse_ready_cache(
         self,
         client: FlowClient,
@@ -454,6 +661,8 @@ class QualityCacheManager:
         ready_asset_root: Path,
         *,
         total_bytes: int,
+        files: list[dict],
+        asset_manifest_sha256: str,
     ) -> dict | None:
         if not ready_job_root.exists():
             return None
@@ -468,9 +677,11 @@ class QualityCacheManager:
             and set(state.get("episode_ids") or [])
             == {item["episode_id"] for item in job.get("episodes", [])}
             and int(state.get("total_bytes") or 0) == total_bytes
+            and state.get("asset_manifest_sha256") == asset_manifest_sha256
         )
         if matches:
             try:
+                self._verify_manifest_files(ready_asset_root, files)
                 primary_files = self._verify_episode_primary_files(job, ready_asset_root)
             except QualityCacheError:
                 matches = False
@@ -525,14 +736,18 @@ class QualityCacheManager:
         return verified
 
     @staticmethod
-    def _existing_bytes(partial_root: Path, source_root: Path, files: list[Path]) -> int:
+    def _existing_bytes(partial_root: Path, files: list[dict]) -> int:
         copied = 0
-        for source in files:
-            target = partial_root / source.relative_to(source_root)
+        for item in files:
+            target = partial_root / item["relative_path"]
             partial = target.with_name(target.name + ".partial")
-            if target.is_file() and target.stat().st_size == source.stat().st_size:
-                copied += target.stat().st_size
-            elif partial.is_file() and partial.stat().st_size <= source.stat().st_size:
+            expected_size = int(item["size_bytes"])
+            if target.is_file() and target.stat().st_size == expected_size:
+                if sha256_file(target) == item["sha256"]:
+                    copied += target.stat().st_size
+                else:
+                    target.unlink()
+            elif partial.is_file() and partial.stat().st_size <= expected_size:
                 copied += partial.stat().st_size
         return copied
 
@@ -544,8 +759,11 @@ class QualityCacheManager:
         copied_bytes: int,
         total_bytes: int,
         callback: ProgressCallback,
+        expected_size: int,
     ) -> int:
         source_size = source.stat().st_size
+        if source_size != expected_size:
+            raise QualityCacheError(f"NAS 文件在下载前发生变化：{source.name}")
         if target.is_file() and target.stat().st_size == source_size:
             return copied_bytes
         partial = target.with_name(target.name + ".partial")
@@ -574,6 +792,18 @@ class QualityCacheManager:
             raise QualityCacheError(f"缓存文件大小校验失败：{source.name}")
         os.replace(partial, target)
         return copied_bytes
+
+    @staticmethod
+    def _write_json_atomic(path: Path, value: object) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(path.name + ".partial")
+        # Write the exact UTF-8 bytes used by result SHA-256 calculation.
+        # Text-mode writes translate LF to CRLF on Windows, which made the
+        # uploaded result differ from the digest calculated before writing.
+        temporary.write_bytes(
+            (json.dumps(value, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+        )
+        os.replace(temporary, path)
 
     @staticmethod
     def _emit(callback: ProgressCallback | None, state: dict[str, object]) -> None:

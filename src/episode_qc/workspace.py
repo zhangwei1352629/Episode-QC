@@ -10,7 +10,6 @@ from datetime import datetime, timezone
 from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any, Iterable
-from urllib.parse import urlsplit
 
 import yaml
 from mcap.reader import make_reader
@@ -178,9 +177,6 @@ def initialize_workspace(
                 source_uri TEXT NOT NULL,
                 local_source_path TEXT NOT NULL,
                 source_type TEXT NOT NULL DEFAULT 'server_path',
-                worker_id TEXT,
-                worker_url TEXT,
-                remote_task_id TEXT,
                 status TEXT NOT NULL DEFAULT 'importing',
                 import_error TEXT,
                 metadata_json TEXT NOT NULL DEFAULT '{}',
@@ -204,7 +200,6 @@ def initialize_workspace(
             CREATE TABLE IF NOT EXISTS episode (
                 id TEXT PRIMARY KEY,
                 data_source_id TEXT NOT NULL REFERENCES data_source(id),
-                remote_episode_id TEXT,
                 relative_path TEXT NOT NULL,
                 episode_name TEXT NOT NULL,
                 data_group TEXT NOT NULL,
@@ -234,7 +229,6 @@ def initialize_workspace(
             CREATE TABLE IF NOT EXISTS stream (
                 id TEXT PRIMARY KEY,
                 episode_id TEXT NOT NULL REFERENCES episode(id) ON DELETE CASCADE,
-                remote_stream_id TEXT,
                 topic TEXT NOT NULL,
                 stream_key TEXT,
                 stream_type TEXT NOT NULL,
@@ -342,11 +336,6 @@ def initialize_workspace(
         )
         _ensure_column(connection, "data_source", "task_id", "TEXT REFERENCES qc_task(id)")
         _ensure_column(connection, "qc_task", "source_type", "TEXT NOT NULL DEFAULT 'server_path'")
-        _ensure_column(connection, "qc_task", "worker_id", "TEXT")
-        _ensure_column(connection, "qc_task", "worker_url", "TEXT")
-        _ensure_column(connection, "qc_task", "remote_task_id", "TEXT")
-        _ensure_column(connection, "episode", "remote_episode_id", "TEXT")
-        _ensure_column(connection, "stream", "remote_stream_id", "TEXT")
         row = connection.execute("SELECT * FROM workspace LIMIT 1").fetchone()
         if row is None:
             workspace_id = _new_id("ws")
@@ -1006,7 +995,7 @@ def _episode_rows(connection: sqlite3.Connection, where: str = "", parameters: t
     query = f"""
         SELECT e.*, ds.root_path AS source_root, ds.task_id,
                t.task_code, t.task_name, t.origin AS task_origin,
-               t.source_type, t.worker_id, t.worker_url, t.remote_task_id,
+               t.source_type,
                SUM(CASE WHEN s.stream_type = 'camera' AND s.available = 1 THEN 1 ELSE 0 END) AS camera_count,
                MAX(CASE WHEN s.stream_type = 'mocap' AND s.available = 1 THEN 1 ELSE 0 END) AS mocap_available
         FROM episode e
@@ -1297,242 +1286,6 @@ def delete_label_set(db_path: str | Path, label_set_id: str) -> dict[str, object
     }
 
 
-def qc_task_manifest(db_path: str | Path, task_id: str) -> dict[str, object]:
-    state = workspace_state(db_path, task_id=task_id)
-    episodes = []
-    for episode in state["episodes"]:
-        detail = episode_detail(db_path, str(episode["id"]))
-        episodes.append({"episode": detail["episode"], "streams": detail["streams"]})
-    return {"task": state["selected_task"], "episodes": episodes}
-
-
-def register_worker_task(
-    db_path: str | Path,
-    *,
-    worker: dict[str, object],
-    manifest: dict[str, object],
-) -> dict[str, object]:
-    initialize_workspace(db_path)
-    worker_id = str(worker.get("id") or "").strip()
-    worker_name = str(worker.get("name") or worker_id).strip()[:96]
-    worker_url = str(worker.get("url") or "").strip().rstrip("/")
-    if not re.fullmatch(r"wrk_[a-f0-9]{24,32}", worker_id):
-        raise ValueError("客户端 Worker ID 无效")
-    parsed_url = urlsplit(worker_url)
-    if (
-        parsed_url.scheme != "http"
-        or parsed_url.hostname not in {"127.0.0.1", "localhost", "::1"}
-        or parsed_url.username
-        or parsed_url.password
-        or parsed_url.path not in {"", "/"}
-        or parsed_url.query
-        or parsed_url.fragment
-    ):
-        raise ValueError("客户端 Worker 地址必须是本机 http://127.0.0.1 或 localhost 地址")
-    try:
-        if parsed_url.port is None:
-            raise ValueError
-    except ValueError:
-        raise ValueError("客户端 Worker 地址必须包含有效端口") from None
-
-    remote_task = manifest.get("task")
-    remote_episodes = manifest.get("episodes")
-    if not isinstance(remote_task, dict) or not isinstance(remote_episodes, list):
-        raise ValueError("客户端任务清单格式无效")
-    remote_task_id = str(remote_task.get("id") or "")
-    if not re.fullmatch(r"tsk_[a-f0-9]{24,32}", remote_task_id):
-        raise ValueError("客户端任务 ID 无效")
-    task_id = _stable_id("tsk", worker_id, remote_task_id)
-    source_id = _stable_id("src", task_id)
-    source_root = f"client-worker://{worker_id}/{remote_task_id}"
-    task_name = str(remote_task.get("task_name") or remote_task.get("task_code") or remote_task_id).strip()[:128]
-    task_code = f"CLIENT-{worker_id[-6:].upper()}-{remote_task_id[-6:].upper()}"
-    remote_source_path = str(
-        remote_task.get("local_source_path") or remote_task.get("source_uri") or ""
-    ).strip()
-    if not task_name or not remote_source_path:
-        raise ValueError("客户端任务缺少名称或数据目录")
-
-    with connect_workspace(db_path) as connection:
-        workspace = connection.execute("SELECT id FROM workspace LIMIT 1").fetchone()
-        existing_task = connection.execute("SELECT 1 FROM qc_task WHERE id = ?", (task_id,)).fetchone()
-        now = _now()
-        connection.execute(
-            """
-            INSERT INTO qc_task(
-                id, workspace_id, task_code, task_name, origin, flow_job_code, asset_id,
-                source_uri, local_source_path, source_type, worker_id, worker_url, remote_task_id,
-                status, import_error, metadata_json, last_episode_id, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, 'client', NULL, NULL, ?, ?, 'client_worker', ?, ?, ?,
-                      'ready', NULL, ?, NULL, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                task_name = excluded.task_name,
-                source_uri = excluded.source_uri,
-                local_source_path = excluded.local_source_path,
-                source_type = 'client_worker',
-                worker_id = excluded.worker_id,
-                worker_url = excluded.worker_url,
-                remote_task_id = excluded.remote_task_id,
-                metadata_json = excluded.metadata_json,
-                import_error = NULL,
-                updated_at = excluded.updated_at
-            """,
-            (
-                task_id,
-                workspace["id"],
-                task_code,
-                task_name,
-                remote_source_path,
-                remote_source_path,
-                worker_id,
-                worker_url,
-                remote_task_id,
-                _json({"worker_name": worker_name}),
-                now,
-                now,
-            ),
-        )
-        connection.execute(
-            """
-            INSERT INTO data_source(
-                id, workspace_id, task_id, root_path, profile_id, profile_json,
-                enabled, last_scanned_at, created_at
-            ) VALUES (?, ?, ?, ?, 'client_worker_v1', '{}', 1, ?, ?)
-            ON CONFLICT(root_path) DO UPDATE SET
-                task_id = excluded.task_id,
-                enabled = 1,
-                last_scanned_at = excluded.last_scanned_at
-            """,
-            (source_id, workspace["id"], task_id, source_root, now, now),
-        )
-
-        seen_episode_ids: set[str] = set()
-        ready_count = 0
-        failed_count = 0
-        for item in remote_episodes:
-            if not isinstance(item, dict) or not isinstance(item.get("episode"), dict):
-                raise ValueError("客户端 Episode 清单格式无效")
-            remote_episode = item["episode"]
-            remote_episode_id = str(remote_episode.get("id") or "")
-            if not re.fullmatch(r"ep_[a-f0-9]{24,32}", remote_episode_id):
-                raise ValueError("客户端 Episode ID 无效")
-            relative_path = str(remote_episode.get("relative_path") or "").replace("\\", "/").strip("/")
-            if not relative_path or ".." in relative_path.split("/"):
-                raise ValueError("客户端 Episode 相对路径无效")
-            episode_id = _stable_id("ep", task_id, relative_path)
-            seen_episode_ids.add(episode_id)
-            import_status = str(remote_episode.get("import_status") or "ready")
-            if import_status == "ready":
-                ready_count += 1
-            else:
-                failed_count += 1
-            connection.execute(
-                """
-                INSERT INTO episode(
-                    id, data_source_id, remote_episode_id, relative_path, episode_name, data_group,
-                    mcap_path, summary_path, config_path, fingerprint, file_size, file_mtime_ns,
-                    start_time_ns, end_time_ns, duration_ns, import_status, import_error,
-                    cache_status, review_status, quality_decision, reviewer_name, last_playhead_ns,
-                    annotation_count, created_at, updated_at, reviewed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?,
-                          'not_prepared', 'unreviewed', NULL, NULL, 0, 0, ?, ?, NULL)
-                ON CONFLICT(id) DO UPDATE SET
-                    remote_episode_id = excluded.remote_episode_id,
-                    relative_path = excluded.relative_path,
-                    episode_name = excluded.episode_name,
-                    data_group = excluded.data_group,
-                    mcap_path = excluded.mcap_path,
-                    fingerprint = excluded.fingerprint,
-                    file_size = excluded.file_size,
-                    file_mtime_ns = excluded.file_mtime_ns,
-                    start_time_ns = excluded.start_time_ns,
-                    end_time_ns = excluded.end_time_ns,
-                    duration_ns = excluded.duration_ns,
-                    import_status = excluded.import_status,
-                    import_error = excluded.import_error,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    episode_id,
-                    source_id,
-                    remote_episode_id,
-                    relative_path,
-                    str(remote_episode.get("episode_name") or Path(relative_path).name),
-                    str(remote_episode.get("data_group") or task_name),
-                    f"{source_root}/{remote_episode_id}",
-                    str(remote_episode.get("fingerprint") or _stable_id("fp", remote_episode_id)),
-                    max(0, int(remote_episode.get("file_size") or 0)),
-                    max(0, int(remote_episode.get("file_mtime_ns") or 0)),
-                    remote_episode.get("start_time_ns"),
-                    remote_episode.get("end_time_ns"),
-                    max(0, int(remote_episode.get("duration_ns") or 0)),
-                    import_status,
-                    remote_episode.get("import_error"),
-                    now,
-                    now,
-                ),
-            )
-            connection.execute("DELETE FROM stream WHERE episode_id = ?", (episode_id,))
-            streams = item.get("streams") or []
-            if not isinstance(streams, list):
-                raise ValueError("客户端数据流清单格式无效")
-            for remote_stream in streams:
-                if not isinstance(remote_stream, dict):
-                    raise ValueError("客户端数据流条目无效")
-                remote_stream_id = str(remote_stream.get("id") or "")
-                if not re.fullmatch(r"str_[a-f0-9]{24,32}", remote_stream_id):
-                    raise ValueError("客户端数据流 ID 无效")
-                topic = str(remote_stream.get("topic") or "")
-                stream_id = _stable_id("str", episode_id, topic)
-                connection.execute(
-                    """
-                    INSERT INTO stream(
-                        id, episode_id, remote_stream_id, topic, stream_key, stream_type,
-                        display_name, encoding, schema_name, adapter_id, message_count,
-                        first_time_ns, last_time_ns, nominal_hz, available, metadata_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        stream_id,
-                        episode_id,
-                        remote_stream_id,
-                        topic,
-                        remote_stream.get("stream_key"),
-                        str(remote_stream.get("stream_type") or "unknown"),
-                        str(remote_stream.get("display_name") or topic),
-                        remote_stream.get("encoding"),
-                        remote_stream.get("schema_name"),
-                        remote_stream.get("adapter_id"),
-                        max(0, int(remote_stream.get("message_count") or 0)),
-                        remote_stream.get("first_time_ns"),
-                        remote_stream.get("last_time_ns"),
-                        remote_stream.get("nominal_hz"),
-                        1 if remote_stream.get("available") else 0,
-                        _json(remote_stream.get("metadata") or {}),
-                    ),
-                )
-
-        existing_episodes = connection.execute(
-            "SELECT id FROM episode WHERE data_source_id = ?", (source_id,)
-        ).fetchall()
-        for row in existing_episodes:
-            if row["id"] not in seen_episode_ids:
-                connection.execute(
-                    "UPDATE episode SET import_status = 'source_missing', import_error = ?, updated_at = ? WHERE id = ?",
-                    ("客户端本次清单中未包含此 Episode", now, row["id"]),
-                )
-        _refresh_task_status(connection, task_id)
-        task = _task_row(connection, task_id)
-    return {
-        "task_id": task_id,
-        "task": task,
-        "existing_task": bool(existing_task),
-        "discovered": len(remote_episodes),
-        "ready": ready_count,
-        "failed": failed_count,
-    }
-
-
 def rescan_qc_task(
     db_path: str | Path,
     task_id: str,
@@ -1542,8 +1295,6 @@ def rescan_qc_task(
     initialize_workspace(db_path)
     with connect_workspace(db_path) as connection:
         task = _task_row(connection, task_id)
-    if task.get("source_type") == "client_worker":
-        raise ValueError("客户端任务必须由数据所在电脑的 Data Worker 重新扫描")
     return scan_data_source(
         db_path,
         str(task["local_source_path"]),

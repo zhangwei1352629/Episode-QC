@@ -382,21 +382,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         help="Allowed browser IP/host. Repeat for multiple LAN interfaces.",
     )
+    web_parser.add_argument(
+        "--standalone",
+        action="store_true",
+        help="Run without Flow integration and import tasks directly from this QC machine.",
+    )
     web_parser.set_defaults(func=_cmd_web)
 
-    data_worker_parser = subparsers.add_parser(
-        "data-worker",
-        help="Run a localhost data worker so the central QC page can read this computer's files.",
-    )
-    data_worker_parser.add_argument("--port", type=int, default=8766)
-    data_worker_parser.add_argument("--workspace-root", type=Path)
-    data_worker_parser.add_argument(
-        "--allow-origin",
-        action="append",
-        required=True,
-        help="Central QC browser origin, for example http://10.1.11.155:8765. Repeat if needed.",
-    )
-    data_worker_parser.set_defaults(func=_cmd_data_worker)
     return parser
 
 
@@ -890,28 +882,7 @@ def _cmd_web(args: argparse.Namespace) -> int:
         open_browser=not args.no_browser,
         host=args.host,
         public_hosts=tuple(args.public_host),
-    )
-    return 0
-
-
-def _cmd_data_worker(args: argparse.Namespace) -> int:
-    from episode_qc.web_server import persistent_worker_identity, serve_web_app
-
-    workspace_root = args.workspace_root
-    if workspace_root is None:
-        config_root = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
-        workspace_root = config_root / "episode-qc" / "data-worker"
-    worker_info = persistent_worker_identity(workspace_root)
-    print(f"Episode QC Data Worker：{worker_info['name']} ({worker_info['id']})", flush=True)
-    print("仅向已配置的中央 QC 页面开放；源文件始终只读。", flush=True)
-    serve_web_app(
-        port=args.port,
-        workspace_root=workspace_root,
-        open_browser=False,
-        host="127.0.0.1",
-        cors_origins=tuple(args.allow_origin),
-        worker_info=worker_info,
-        print_token=True,
+        flow_enabled=not args.standalone,
     )
     return 0
 

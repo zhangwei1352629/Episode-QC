@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from episode_qc.source_paths import resolve_source_directory
+from episode_qc.source_paths import resolve_source_directory, resolve_target_directory
 from episode_qc.workspace import scan_data_source
 
 
@@ -86,3 +86,20 @@ def test_scan_data_source_accepts_smb_uri(monkeypatch: pytest.MonkeyPatch, tmp_p
     assert result["requested_root_path"] == "smb://nas.local/datasets/sample"
     assert result["root_path"] == str(dataset.resolve())
     assert result["discovered"] == 0
+
+
+def test_resolves_nonexistent_smb_result_target_from_existing_mount(tmp_path: Path):
+    runtime_dir = tmp_path / "runtime"
+    mount_root = runtime_dir / "gvfs" / "smb-share:server=nas.local,share=datasets"
+    mount_root.mkdir(parents=True)
+
+    resolved = resolve_target_directory(
+        "smb://nas.local/datasets/episode-data/qc-results/AST-001/QCJ-001",
+        runtime_dir=runtime_dir,
+        mountinfo_path=tmp_path / "missing-mountinfo",
+    )
+
+    assert resolved == (
+        mount_root / "episode-data" / "qc-results" / "AST-001" / "QCJ-001"
+    ).resolve()
+    assert not resolved.exists()

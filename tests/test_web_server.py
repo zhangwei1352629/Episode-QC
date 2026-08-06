@@ -15,12 +15,11 @@ from urllib.request import build_opener, ProxyHandler, Request
 import pytest
 
 from episode_qc.playback import ACTION_FRAME_ENCODING, MOTION_FRAME_ENCODING
-from episode_qc.platform_workflow import QualityCacheManager
+from episode_qc.platform_workflow import QualityCacheManager, canonical_json_sha256
 from episode_qc.web_server import (
     WebPaths,
     create_web_server,
     persistent_web_token,
-    persistent_worker_identity,
 )
 
 
@@ -35,8 +34,7 @@ def running_server(
     tmp_path: Path,
     *,
     public_hosts: tuple[str, ...] = (),
-    cors_origins: tuple[str, ...] = (),
-    worker_info: dict[str, str] | None = None,
+    flow_enabled: bool = True,
     workspace_name: str = "workspace",
 ):
     project_root = Path(__file__).resolve().parents[1]
@@ -53,8 +51,7 @@ def running_server(
         paths,
         token=TOKEN,
         public_hosts=public_hosts,
-        cors_origins=cors_origins,
-        worker_info=worker_info,
+        flow_enabled=flow_enabled,
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -191,6 +188,42 @@ Frame Time: 0.010000
         ],
         "cache_progress": 0,
     }
+    manifest = {
+        "schema_version": 1,
+        "asset_id": job["asset_id"],
+        "episodes": [
+            {
+                **job["episodes"][0],
+                "manifest": {
+                    "schema_version": 1,
+                    "files": [
+                        {
+                            "relative_path": "episodes/episode_000001/motion.bvh",
+                            "size_bytes": primary.stat().st_size,
+                            "sha256": checksum,
+                        },
+                        {
+                            "relative_path": "episodes/episode_000001/metadata.json",
+                            "size_bytes": (episode_root / "metadata.json").stat().st_size,
+                            "sha256": hashlib.sha256(
+                                (episode_root / "metadata.json").read_bytes()
+                            ).hexdigest(),
+                        },
+                    ],
+                },
+            }
+        ],
+    }
+    (source / "asset_manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    job["asset_manifest"] = manifest
+    job["asset_manifest_sha256"] = canonical_json_sha256(manifest)
+    job["result_upload_uri"] = str(
+        tmp_path / "nas" / "qc-results" / job["asset_id"] / job["code"]
+    )
+    job["next_attempt"] = 1
 
     class FakeWebFlowClient:
         def jobs_response(self):
@@ -289,7 +322,11 @@ Frame Time: 0.010000
         assert status == 200
         assert submitted["job"]["status"] == "completed"
         assert submitted["local_task"]["status"] == "submitted"
-        assert (source / "qc" / "v1" / "qc_result.json").is_file()
+        assert (
+            Path(job["result_upload_uri"])
+            / "attempt-0001"
+            / "qc_result.json"
+        ).is_file()
 
 
 def test_web_platform_refreshes_and_selects_reviewer_without_password(tmp_path: Path):
@@ -528,8 +565,8 @@ def test_web_server_requires_public_host_for_wildcard_bind(tmp_path: Path):
         create_web_server(paths, host="0.0.0.0")
 
 
-def test_data_worker_cors_import_manifest_and_central_registration(tmp_path: Path):
-    source_root = tmp_path / "浏览器所在电脑" / "本地任务"
+def test_standalone_mode_imports_local_task_without_flow(tmp_path: Path, monkeypatch):
+    source_root = tmp_path / "单机任务"
     episode_root = source_root / "episode_000001"
     episode_root.mkdir(parents=True)
     (episode_root / "motion.bvh").write_text(
@@ -551,200 +588,34 @@ Frame Time: 0.010000
 """,
         encoding="utf-8",
     )
-    central_origin = "http://10.1.11.155:8765"
-    worker_info = persistent_worker_identity(tmp_path / "worker")
+    monkeypatch.setenv("EPISODE_QC_FLOW_URL", "http://127.0.0.1:1")
+    monkeypatch.setenv("EPISODE_QC_FLOW_USERNAME", "must-not-connect")
+    monkeypatch.setenv("EPISODE_QC_FLOW_PASSWORD", "must-not-connect")
 
-    with running_server(
-        tmp_path,
-        cors_origins=(central_origin,),
-        worker_info=worker_info,
-        workspace_name="worker",
-    ) as (worker_server, worker_url):
-        connection = HTTPConnection("127.0.0.1", worker_server.server_address[1], timeout=5)
-        connection.request(
-            "OPTIONS",
-            "/api/tasks/import",
-            headers={
-                "Host": f"127.0.0.1:{worker_server.server_address[1]}",
-                "Origin": central_origin,
-                "Access-Control-Request-Method": "POST",
-                "Access-Control-Request-Headers": "X-Episode-QC-Token, Content-Type",
-            },
-        )
-        preflight = connection.getresponse()
-        assert preflight.status == 204
-        assert preflight.getheader("Access-Control-Allow-Origin") == central_origin
-        assert "X-Episode-QC-Token" in preflight.getheader("Access-Control-Allow-Headers")
-        preflight.read()
-        connection.close()
-
-        def worker_json(path: str, *, method: str = "GET", payload=None):
-            body = None if payload is None else json.dumps(payload).encode("utf-8")
-            worker_request = Request(
-                f"{worker_url}{path}",
-                data=body,
-                method=method,
-                headers={
-                    "Origin": central_origin,
-                    "X-Episode-QC-Token": TOKEN,
-                    "Content-Type": "application/json",
-                },
-            )
-            with LOCAL_OPENER.open(worker_request, timeout=5) as response:
-                assert response.headers["Access-Control-Allow-Origin"] == central_origin
-                return response.status, json.loads(response.read())
-
-        status, info = worker_json("/api/worker/info")
+    with running_server(tmp_path, flow_enabled=False) as (server, base_url):
+        assert server.application._flow_client is None
+        status, platform = request_json(f"{base_url}/api/platform/jobs")
         assert status == 200
-        assert info["worker"] == worker_info
-        status, indexed = worker_json(
-            "/api/tasks/import",
+        assert platform == {"enabled": False, "connected": False, "jobs": []}
+
+        with pytest.raises(HTTPError) as error:
+            request_json(
+                f"{base_url}/api/platform/reviewers",
+                method="POST",
+                payload={"baseUrl": "http://127.0.0.1:1"},
+            )
+        assert error.value.code == 400
+        assert "单机模式" in json.loads(error.value.read())["error"]
+
+        status, imported = request_json(
+            f"{base_url}/api/tasks/import",
             method="POST",
             payload={"rootPath": str(source_root)},
         )
         assert status == 200
-        assert indexed["ready"] == 1
-        status, manifest = worker_json(f"/api/tasks/{indexed['task_id']}/manifest")
-        assert status == 200
-        assert len(manifest["episodes"]) == 1
-        remote_episode_id = manifest["episodes"][0]["episode"]["id"]
-        status, cache = worker_json(
-            f"/api/episodes/{remote_episode_id}/cache",
-            method="POST",
-        )
-        assert status == 200
-        assert cache["complete"] is False
-        motion_response = None
-        for _ in range(100):
-            motion_request = Request(
-                f"{worker_url}/api/episodes/{remote_episode_id}/motion/frame?time_ns=10000000",
-                headers={"Origin": central_origin, "X-Episode-QC-Token": TOKEN},
-            )
-            response = LOCAL_OPENER.open(motion_request, timeout=5)
-            if response.status == 200:
-                motion_response = response
-                break
-            response.read()
-            response.close()
-            time.sleep(0.01)
-        assert motion_response is not None
-        with motion_response as response:
-            assert response.headers["Access-Control-Allow-Origin"] == central_origin
-            assert "X-Frame-Index" in response.headers["Access-Control-Expose-Headers"]
-            assert response.headers["X-Frame-Index"] == "1"
-            assert response.read()
-
-        with running_server(tmp_path, workspace_name="central") as (_central_server, central_url):
-            status, registered = request_json(
-                f"{central_url}/api/tasks/register-worker",
-                method="POST",
-                payload={
-                    "worker": {**worker_info, "url": worker_url},
-                    "manifest": manifest,
-                },
-            )
-            assert status == 200
-            assert registered["ready"] == 1
-            status, state = request_json(
-                f"{central_url}/api/workspace?task_id={registered['task_id']}"
-            )
-            assert status == 200
-            assert state["selected_task"]["source_type"] == "client_worker"
-            assert state["episodes"][0]["remote_episode_id"] == manifest["episodes"][0]["episode"]["id"]
-            central_episode_id = state["episodes"][0]["id"]
-            with pytest.raises(HTTPError) as cache_error:
-                request_json(
-                    f"{central_url}/api/episodes/{central_episode_id}/cache",
-                    method="POST",
-                )
-            assert cache_error.value.code == 400
-            assert "Data Worker" in json.loads(cache_error.value.read())["error"]
-            labels_path = tmp_path / "worker-flow-labels.yaml"
-            labels_path.write_text(
-                """标签库名称: 客户端全流程标签
-版本: "1.0.0"
-标签:
-  - 编码: local_motion_issue
-    名称: 本地动作异常
-    范围: 区间
-    对象: 动捕
-""",
-                encoding="utf-8",
-            )
-            status, preview = request_json(
-                f"{central_url}/api/label-schema/preview",
-                method="POST",
-                payload={"schemaPath": str(labels_path)},
-            )
-            assert status == 200
-            assert preview["readyToConfirm"] is True
-            status, _imported = request_json(
-                f"{central_url}/api/label-schema/import",
-                method="POST",
-            )
-            assert status == 200
-            status, annotation = request_json(
-                f"{central_url}/api/annotations",
-                method="POST",
-                payload={
-                    "payload": {
-                        "episode_id": central_episode_id,
-                        "label_code": "local_motion_issue",
-                        "scope": "time_range",
-                        "start_offset_ns": 0,
-                        "end_offset_ns": 10_000_000,
-                        "target_type": "mocap",
-                        "target_key": "/mocap/human_motion",
-                        "severity": "normal",
-                        "action": "keep_with_label",
-                        "comment": "数据由浏览器所在电脑读取",
-                        "attributes": {},
-                        "reviewer_name": "客户端质检员",
-                        "status": "confirmed",
-                    }
-                },
-            )
-            assert status == 200
-            assert annotation["episode_id"] == central_episode_id
-            status, reviewed = request_json(
-                f"{central_url}/api/episodes/{central_episode_id}/review",
-                method="POST",
-                payload={
-                    "status": "completed",
-                    "decision": "pass_with_labels",
-                    "reviewer": "客户端质检员",
-                    "playheadNs": 10_000_000,
-                },
-            )
-            assert status == 200
-            assert reviewed["review_status"] == "completed"
-            export_root = tmp_path / "worker-flow-export"
-            status, exported = request_json(
-                f"{central_url}/api/export",
-                method="POST",
-                payload={
-                    "taskId": registered["task_id"],
-                    "episodeIds": [central_episode_id],
-                    "outputParent": str(export_root),
-                    "format": "json",
-                },
-            )
-            assert status == 200
-            assert exported["episode_count"] == 1
-            assert exported["annotation_count"] == 1
-            output = json.loads(Path(exported["output_file"]).read_text(encoding="utf-8"))
-            assert output["annotations"][0]["label_code"] == "local_motion_issue"
-
-
-def test_worker_identity_persists_without_exposing_a_secret(tmp_path: Path):
-    root = tmp_path / "worker"
-    first = persistent_worker_identity(root)
-    second = persistent_worker_identity(root)
-
-    assert first == second
-    assert re.fullmatch(r"wrk_[a-f0-9]{24}", first["id"])
-    assert set(first) == {"id", "name"}
-    assert (root / ".worker-id").stat().st_mode & 0o777 == 0o600
+        assert imported["ready"] == 1
+        assert imported["task"]["origin"] == "local"
+        assert imported["task"]["source_type"] == "server_path"
 
 
 def test_web_api_streams_cached_binary_frames(tmp_path: Path):

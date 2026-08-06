@@ -35,6 +35,9 @@ const els = {
   taskList: $("task-list"), taskCenterImport: $("task-center-import"), submitFlowTask: $("submit-flow-task"),
   clearLocalTaskHistory: $("clear-local-task-history"),
   flowTaskStatus: $("flow-task-status"), flowTaskList: $("flow-task-list"),
+  flowTaskPanel: $("flow-task-panel"), localTaskPanel: $("local-task-panel"),
+  localTaskTitle: $("local-task-title"), localTaskDescription: $("local-task-description"),
+  taskCenterNote: $("task-center-note"),
   flowLoginForm: $("flow-login-form"), flowBaseUrl: $("flow-base-url"),
   flowReviewerSelect: $("flow-reviewer-select"), refreshFlowReviewers: $("refresh-flow-reviewers"), flowLogin: $("flow-login"),
   flowLogout: $("flow-logout"), refreshFlowJobs: $("refresh-flow-jobs"),
@@ -53,8 +56,6 @@ const state = {
   cache: null,
   currentEpisodeId: null,
   playbackEpisodeId: null,
-  dataProvider: null,
-  workerEventsClose: null,
   loadToken: 0,
   playheadNs: 0,
   durationNs: 0,
@@ -80,7 +81,7 @@ const state = {
   timelineSelecting: false,
   timelineAnchorNs: null,
   reviewerTimer: null,
-  platform: { connected: false, jobs: [] },
+  platform: { enabled: true, connected: false, jobs: [] },
   platformReviewers: [],
   labelSets: [],
   pendingFlowJobCode: null,
@@ -387,7 +388,18 @@ async function refreshPlatformJobs({ quiet = false } = {}) {
 }
 
 function renderPlatformJobs() {
-  const platform = state.platform || { connected: false, jobs: [] };
+  const platform = state.platform || { enabled: true, connected: false, jobs: [] };
+  const standalone = platform.enabled === false;
+  els.taskCenter.classList.toggle("standalone-mode", standalone);
+  els.flowTaskPanel.hidden = standalone;
+  els.localTaskTitle.textContent = standalone ? "单机 QC 任务" : "本地 QC 任务";
+  els.localTaskDescription.textContent = standalone
+    ? "无需 Flow，直接导入本机或已挂载 NAS 目录"
+    : "已领取任务和手工导入任务";
+  els.taskCenterNote.textContent = standalone
+    ? "单机模式只保存本地索引、缓存和质检结果，不连接 Flow，也不会修改原始数据。"
+    : "清空历史导入只删除本地索引和派生缓存，不删除原始数据，也不影响 Flow 任务。";
+  if (standalone) return;
   els.flowLoginForm.hidden = Boolean(platform.connected);
   els.flowLogout.hidden = !platform.connected;
   els.refreshFlowJobs.hidden = !platform.connected;
@@ -587,9 +599,7 @@ async function rescanCurrentTask() {
   if (!state.currentTaskId) return;
   setBusyButton(els.rescanTask, true, "扫描中…");
   try {
-    const result = state.currentTask?.source_type === "client_worker"
-      ? await window.episodeQc.rescanWorkerTask(state.currentTask)
-      : await window.episodeQc.rescanTask(state.currentTaskId);
+    const result = await window.episodeQc.rescanTask(state.currentTaskId);
     await refreshWorkspace();
     toast(
       `任务“${result.task.task_name}”扫描完成：发现 ${result.discovered}，成功 ${result.ready}，失败 ${result.failed}`,
@@ -607,17 +617,7 @@ async function addSource() {
   setBusyButton(els.addSource, true, "导入中…");
   setBusyButton(els.taskCenterImport, true, "导入中…");
   try {
-    const sourceType = window.prompt(
-      "数据在哪台电脑？\n1 = 当前打开网页的电脑（推荐启动 Data Worker）\n2 = QC 服务器或服务器已挂载的 NAS",
-      "1",
-    );
-    if (sourceType === null) return;
-    if (!['1', '2'].includes(sourceType.trim())) {
-      throw new Error("请输入 1（当前电脑）或 2（QC 服务器/NAS）");
-    }
-    const result = sourceType.trim() === "1"
-      ? await window.episodeQc.addLocalWorkerSource()
-      : await window.episodeQc.addSource();
+    const result = await window.episodeQc.addSource();
     if (!result) return;
     if (!result.ready) {
       const taskPayload = await window.episodeQc.getTasks();
@@ -632,9 +632,8 @@ async function addSource() {
     els.taskCenter.close();
     const targetEpisode = state.currentTask?.last_episode_id || state.episodes[0]?.id;
     if (targetEpisode) openEpisode(targetEpisode);
-    const sourceText = result.workerName ? `；数据由当前电脑 ${result.workerName} 读取` : "";
     toast(
-      `${result.existing_task ? "已有任务已重新扫描" : "新任务加载成功"}：${result.task.task_name}；发现 ${result.discovered}，成功 ${result.ready}，失败 ${result.failed}${sourceText}`,
+      `${result.existing_task ? "已有任务已重新扫描" : "新任务加载成功"}：${result.task.task_name}；发现 ${result.discovered}，成功 ${result.ready}，失败 ${result.failed}`,
       result.failed ? "error" : "success",
       7500,
     );
@@ -791,9 +790,6 @@ async function openEpisode(episodeId) {
   state.playing = false;
   state.cache = null;
   state.detail = null;
-  state.workerEventsClose?.();
-  state.workerEventsClose = null;
-  state.dataProvider = null;
   state.playbackEpisodeId = null;
   state.currentEpisodeId = episodeId;
   window.episodeQc.updateWorkspaceSettings({ lastEpisodeId: episodeId, taskId: state.currentTaskId }).catch(() => {});
@@ -818,24 +814,10 @@ async function openEpisode(episodeId) {
     state.labelSchema = detail.label_schema || state.labelSchema;
     state.durationNs = Number(detail.episode.duration_ns || 0);
     state.playheadNs = Math.min(Number(detail.episode.last_playhead_ns || 0), state.durationNs);
-    if (detail.episode.source_type === "client_worker") {
-      state.dataProvider = await window.episodeQc.requireWorker(detail.episode);
-      if (token !== state.loadToken) return;
-      state.playbackEpisodeId = detail.episode.remote_episode_id;
-      if (!state.playbackEpisodeId) throw new Error("客户端任务缺少远端 Episode 映射，请重新扫描任务");
-      state.workerEventsClose = window.episodeQc.onWorkerEpisodeCacheReady(
-        state.dataProvider,
-        handleEpisodeCacheReady,
-      );
-    } else {
-      state.playbackEpisodeId = episodeId;
-    }
+    state.playbackEpisodeId = episodeId;
     renderEpisodeDetail();
-    setCacheStatus(
-      "busy",
-      state.dataProvider ? "正在本机建立只读播放缓存…" : "首次打开：正在建立只读播放缓存…",
-    );
-    const cache = await window.episodeQc.prepareEpisode(state.playbackEpisodeId, state.dataProvider);
+    setCacheStatus("busy", "首次打开：正在建立只读播放缓存…");
+    const cache = await window.episodeQc.prepareEpisode(state.playbackEpisodeId);
     if (token !== state.loadToken) return;
     state.cache = cache;
     syncInteractiveState();
@@ -865,8 +847,7 @@ function renderEpisodeDetail() {
   if (!state.detail) return;
   const episode = state.detail.episode;
   els.currentEpisode.textContent = episode.episode_name;
-  const providerText = state.dataProvider ? ` · 当前电脑读取（${state.dataProvider.name}）` : "";
-  els.episodeMeta.textContent = `${episode.data_group} · ${episode.camera_count} 路相机 · ${episode.mocap_available ? "Mocap 可解析" : "Mocap 不可用"}${providerText} · ${episode.relative_path}`;
+  els.episodeMeta.textContent = `${episode.data_group} · ${episode.camera_count} 路相机 · ${episode.mocap_available ? "Mocap 可解析" : "Mocap 不可用"} · ${episode.relative_path}`;
   els.durationTime.textContent = formatClock(state.durationNs);
   els.timelineEnd.textContent = formatDuration(state.durationNs / 1e9);
   renderClock();
@@ -879,9 +860,6 @@ function renderEpisodeDetail() {
 }
 
 function clearEpisodeView() {
-  state.workerEventsClose?.();
-  state.workerEventsClose = null;
-  state.dataProvider = null;
   state.playbackEpisodeId = null;
   state.detail = null;
   state.cache = null;
@@ -1022,7 +1000,6 @@ async function requestVisualFrames(force = false) {
   state.visualPending = true;
   const episodeId = state.currentEpisodeId;
   const playbackEpisodeId = state.playbackEpisodeId;
-  const provider = state.dataProvider;
   const timeNs = Math.max(0, Math.min(state.durationNs, Math.round(state.playheadNs)));
   try {
     const cameraRequests = (state.cache.cameras || []).map(async (camera) => {
@@ -1030,7 +1007,6 @@ async function requestVisualFrames(force = false) {
         episodeId: playbackEpisodeId,
         streamId: camera.stream_id,
         timeNs,
-        provider,
       });
       if (episodeId !== state.currentEpisodeId) return;
       const card = els.cameraGrid.querySelector(`[data-camera-id="${camera.stream_id}"]`);
@@ -1047,7 +1023,7 @@ async function requestVisualFrames(force = false) {
       card.querySelector(".camera-time").textContent = `${formatClock(frame.frameOffsetNs)} · ${formatSkew(frame.skewNs)}`;
     });
     const motionRequest = state.cache.motion?.available
-      ? window.episodeQc.getMotionFrame({ episodeId: playbackEpisodeId, timeNs, provider }).then((frame) => {
+      ? window.episodeQc.getMotionFrame({ episodeId: playbackEpisodeId, timeNs }).then((frame) => {
           if (episodeId === state.currentEpisodeId) { state.motionFrame = frame; drawMotion(); }
         })
       : Promise.resolve();
@@ -1058,7 +1034,6 @@ async function requestVisualFrames(force = false) {
           episodeId: playbackEpisodeId,
           sourceKey: requestedSource,
           timeNs,
-          provider,
         }).then((frame) => {
           if (episodeId === state.currentEpisodeId && requestedSource === state.motionSource) {
             state.robotActionFrame = frame;

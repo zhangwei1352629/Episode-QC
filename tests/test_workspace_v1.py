@@ -33,9 +33,7 @@ from episode_qc.workspace import (
     list_label_sets,
     list_qc_tasks,
     preview_label_schema,
-    qc_task_manifest,
     redo_annotation_change,
-    register_worker_task,
     rescan_qc_task,
     save_annotation,
     scan_data_source,
@@ -257,60 +255,6 @@ def test_qc_tasks_isolate_episode_lists_and_reuse_same_source(tmp_path: Path):
     assert exported["episode_count"] == 1
 
 
-def test_client_worker_task_mirrors_metadata_and_keeps_central_review_state(tmp_path: Path):
-    worker_db = tmp_path / "worker" / "workspace.db"
-    central_db = tmp_path / "central" / "workspace.db"
-    source_root = tmp_path / "客户端电脑" / "本地数据"
-    _write_sample_episode(source_root / "episode_000001")
-    indexed = scan_data_source(worker_db, source_root)
-    manifest = qc_task_manifest(worker_db, indexed["task_id"])
-    worker = {
-        "id": "wrk_" + "1" * 24,
-        "name": "质检电脑-01",
-        "url": "http://127.0.0.1:8766",
-    }
-
-    registered = register_worker_task(central_db, worker=worker, manifest=manifest)
-
-    assert registered["ready"] == 1
-    assert registered["failed"] == 0
-    assert registered["task"]["source_type"] == "client_worker"
-    assert registered["task"]["worker_id"] == worker["id"]
-    assert registered["task"]["remote_task_id"] == indexed["task_id"]
-    state = workspace_state(central_db, task_id=registered["task_id"])
-    assert len(state["episodes"]) == 1
-    mirrored_episode = state["episodes"][0]
-    remote_episode = manifest["episodes"][0]["episode"]
-    assert mirrored_episode["id"] != remote_episode["id"]
-    assert mirrored_episode["remote_episode_id"] == remote_episode["id"]
-    assert mirrored_episode["source_type"] == "client_worker"
-    detail = episode_detail(central_db, mirrored_episode["id"])
-    assert {item["remote_stream_id"] for item in detail["streams"]} == {
-        item["id"] for item in manifest["episodes"][0]["streams"]
-    }
-
-    update_episode_review(
-        central_db,
-        mirrored_episode["id"],
-        review_status="completed",
-        quality_decision="pass",
-        reviewer_name="中央质检员",
-    )
-    refreshed = register_worker_task(central_db, worker=worker, manifest=manifest)
-    preserved = episode_detail(central_db, mirrored_episode["id"])["episode"]
-    assert refreshed["existing_task"] is True
-    assert preserved["review_status"] == "completed"
-    assert preserved["quality_decision"] == "pass"
-    assert preserved["reviewer_name"] == "中央质检员"
-
-    with pytest.raises(ValueError, match="Data Worker"):
-        rescan_qc_task(central_db, registered["task_id"])
-    with pytest.raises(ValueError, match="本机"):
-        register_worker_task(
-            central_db,
-            worker={**worker, "url": "http://10.1.11.155:8766"},
-            manifest=manifest,
-        )
 def test_schema_v1_data_source_is_migrated_to_qc_task(tmp_path: Path):
     db_path = tmp_path / "legacy.db"
     source_root = tmp_path / "旧资产"

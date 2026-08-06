@@ -70,6 +70,43 @@ def resolve_source_directory(
     )
 
 
+def resolve_target_directory(
+    value: str | os.PathLike[str],
+    *,
+    runtime_dir: str | os.PathLike[str] | None = None,
+    mountinfo_path: str | os.PathLike[str] = "/proc/self/mountinfo",
+) -> Path:
+    """Resolve a writable target path whose final directories may not exist yet."""
+
+    raw = os.fspath(value).strip()
+    if not raw:
+        raise ValueError("请输入结果目标目录")
+    if raw.lower().startswith("file:"):
+        parsed = urlsplit(raw)
+        if parsed.scheme.lower() != "file" or parsed.query or parsed.fragment:
+            raise ValueError(f"不支持的结果 URI: {raw}")
+        if parsed.netloc and parsed.netloc.lower() != "localhost":
+            raise ValueError("远程 file URI 不受支持；NAS 请使用 smb:// 地址")
+        return Path(unquote(parsed.path)).expanduser().resolve()
+
+    location = _parse_smb_location(raw)
+    if location is None:
+        return Path(raw).expanduser().resolve()
+    candidates = list(
+        _smb_mount_candidates(
+            location,
+            runtime_dir=runtime_dir,
+            mountinfo_path=mountinfo_path,
+        )
+    )
+    if not candidates:
+        raise FileNotFoundError(
+            f"NAS 共享尚未挂载或当前进程不可访问: "
+            f"smb://{location.server}/{location.share}"
+        )
+    return _join_within_mount(candidates[0], location.relative_parts)
+
+
 def _resolve_file_uri(raw: str) -> Path:
     parsed = urlsplit(raw)
     if parsed.scheme.lower() != "file":

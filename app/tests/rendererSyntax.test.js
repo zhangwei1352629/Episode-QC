@@ -33,19 +33,13 @@ test("任务化页面包含当前任务、任务中心和按任务导出", () =>
   assert.match(webApi, /task_id=/);
 });
 
-test("客户端 Data Worker 链路由浏览器本机读取并由中央保存任务", () => {
+test("本地任务直接读取 QC 服务器目录且不再包含 Worker 链路", () => {
   const html = fs.readFileSync(path.resolve(__dirname, "../renderer/index.html"), "utf8");
   const renderer = fs.readFileSync(path.resolve(__dirname, "../renderer/renderer.js"), "utf8");
   const webApi = fs.readFileSync(path.resolve(__dirname, "../renderer/web-api.js"), "utf8");
 
-  assert.match(html, /connect-src[^;]*127\.0\.0\.1:\*/);
-  assert.match(renderer, /addLocalWorkerSource/);
-  assert.match(renderer, /remote_episode_id/);
-  assert.match(renderer, /source_type === "client_worker"/);
-  assert.match(webApi, /\/api\/worker\/info/);
-  assert.match(webApi, /\/api\/tasks\/register-worker/);
-  assert.match(webApi, /onWorkerEpisodeCacheReady/);
-  assert.match(webApi, /episodeQcWorker:/);
+  assert.match(renderer, /const result = await window\.episodeQc\.addSource\(\)/);
+  assert.match(webApi, /QC 服务器可访问的绝对路径或已挂载 NAS 目录/);
 });
 
 test("Flow 任务中心包含登录、领取、缓存和提交入口", () => {
@@ -65,6 +59,19 @@ test("Flow 任务中心包含登录、领取、缓存和提交入口", () => {
   assert.match(webApi, /\/api\/platform\/reviewers/);
   assert.match(webApi, /\/api\/platform\/login/);
   assert.match(webApi, /\/api\/platform\/jobs/);
+});
+
+test("单机模式隐藏 Flow 并直接导入 QC 服务器目录", () => {
+  const html = fs.readFileSync(path.resolve(__dirname, "../renderer/index.html"), "utf8");
+  const renderer = fs.readFileSync(path.resolve(__dirname, "../renderer/renderer.js"), "utf8");
+  const css = fs.readFileSync(path.resolve(__dirname, "../renderer/styles.css"), "utf8");
+
+  assert.match(html, /id="flow-task-panel"/);
+  assert.match(html, /id="local-task-title"/);
+  assert.match(renderer, /platform\.enabled === false/);
+  assert.match(renderer, /单机 QC 任务/);
+  assert.match(renderer, /const result = await window\.episodeQc\.addSource\(\)/);
+  assert.match(css, /\.task-center-dialog\.standalone-mode \.task-center-columns/);
 });
 
 test("标签库菜单和本地任务历史管理入口完整", () => {

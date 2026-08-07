@@ -220,6 +220,7 @@ class EpisodeQcWebApplication:
         *,
         token: str | None = None,
         flow_enabled: bool = True,
+        require_token: bool = True,
     ) -> None:
         self.paths = paths
         self.token = token or secrets.token_urlsafe(32)
@@ -239,6 +240,7 @@ class EpisodeQcWebApplication:
         self._flow_connection: dict[str, str] = {}
         self._flow_error = ""
         self.flow_enabled = bool(flow_enabled)
+        self.require_token = bool(require_token)
         self.session_id = f"web-{self.token[:12]}"
         paths.root.mkdir(parents=True, exist_ok=True)
         initialize_workspace(paths.db_path)
@@ -381,6 +383,23 @@ class EpisodeQcWebApplication:
         self._platform_executor.submit(self._cache_platform_job, client, job_code)
         return {"accepted": True, "job": claimed, "caching": True}
 
+    def start_platform_job(self, job_code: str) -> dict[str, object]:
+        self._assert_flow_enabled()
+        client = self._require_flow_client()
+        job = self._platform_job(client, job_code)
+        task = self._local_task_for_job(job_code)
+        if task is None:
+            raise ValueError("质检任务尚未完整缓存到本地")
+        if task.get("status") in {"completed", "submitted", "archived"}:
+            return {"job": job, "local_task": task, "started": False}
+        manager = self._quality_cache_manager()
+        manager.start_review(client, job_code)
+        return {
+            "job": self._platform_job(client, job_code),
+            "local_task": task,
+            "started": True,
+        }
+
     def submit_platform_job(self, job_code: str) -> dict[str, object]:
         self._assert_flow_enabled()
         client = self._require_flow_client()
@@ -507,6 +526,8 @@ class EpisodeQcWebApplication:
 
     def _cache_platform_job(self, client, job_code: str) -> None:
         manager = self._quality_cache_manager()
+        local_ready = False
+        indexed_task_id = ""
 
         def publish_progress(values: dict[str, object]) -> None:
             self.events.publish(
@@ -566,7 +587,23 @@ class EpisodeQcWebApplication:
                     f"本地 {len(ready)} 个"
                 )
             manager.record_local_episodes(job_code, mappings)
-            started = manager.start_review(client, job_code)
+            local_ready = True
+            indexed_task_id = str(indexed["task_id"])
+            try:
+                started = manager.start_review(client, job_code)
+            except Exception as exc:
+                # The asset is already fully downloaded, verified and indexed.
+                # A work-session conflict is not a NAS/cache failure; keep the
+                # task ready so opening it can retry the start operation.
+                publish_progress(
+                    {
+                        "status": "ready",
+                        "progress": 100,
+                        "taskId": indexed_task_id,
+                        "warning": str(exc),
+                    }
+                )
+                return
             publish_progress(
                 {
                     "status": "ready",
@@ -576,15 +613,25 @@ class EpisodeQcWebApplication:
                 }
             )
         except Exception as exc:
-            try:
-                client.report_cache(
-                    job_code,
-                    status="failed",
-                    cache_error=str(exc),
+            if local_ready:
+                publish_progress(
+                    {
+                        "status": "ready",
+                        "progress": 100,
+                        "taskId": indexed_task_id,
+                        "warning": str(exc),
+                    }
                 )
-            except Exception:
-                pass
-            publish_progress({"status": "failed", "error": str(exc)})
+            else:
+                try:
+                    client.report_cache(
+                        job_code,
+                        status="failed",
+                        cache_error=str(exc),
+                    )
+                except Exception:
+                    pass
+                publish_progress({"status": "failed", "error": str(exc)})
         finally:
             with self._platform_lock:
                 self._platform_jobs.discard(job_code)
@@ -784,10 +831,11 @@ class EpisodeQcRequestHandler(BaseHTTPRequestHandler):
 
     def _assert_api_access(self, parsed: Any) -> None:
         origin = self.headers.get("Origin")
-        query_token = parse_qs(parsed.query).get("token", [""])[0]
-        supplied = self.headers.get("X-Episode-QC-Token", "") or query_token
-        if not hmac.compare_digest(supplied, self.application.token):
-            raise PermissionError("访问令牌无效")
+        if self.application.require_token:
+            query_token = parse_qs(parsed.query).get("token", [""])[0]
+            supplied = self.headers.get("X-Episode-QC-Token", "") or query_token
+            if not hmac.compare_digest(supplied, self.application.token):
+                raise PermissionError("访问令牌无效")
         if self.command != "GET" and origin and origin not in self.server.allowed_origins:  # type: ignore[attr-defined]
             raise PermissionError("请求 Origin 无效")
 
@@ -812,16 +860,28 @@ class EpisodeQcRequestHandler(BaseHTTPRequestHandler):
     def _redirect_entry_with_current_token(self, parsed: Any) -> bool:
         if parsed.path not in {"", "/"}:
             return False
+        if not self.application.require_token:
+            return False
         supplied = parse_qs(parsed.query).get("token", [""])[0]
         if hmac.compare_digest(supplied, self.application.token):
             return False
+        if not self._client_is_loopback():
+            raise PermissionError("局域网访问必须使用启动终端打印的完整令牌地址")
         location = f"/?token={quote(self.application.token, safe='')}"
         self.send_response(HTTPStatus.TEMPORARY_REDIRECT)
         self.send_header("Location", location)
         self.send_header("Content-Length", "0")
         self.send_header("Cache-Control", "no-store")
+        self._send_security_headers()
         self.end_headers()
         return True
+
+    def _client_is_loopback(self) -> bool:
+        address = str(self.client_address[0]).split("%", 1)[0]
+        try:
+            return ipaddress.ip_address(address).is_loopback
+        except ValueError:
+            return False
 
     def _route_api(self, method: str, path: str, query: dict[str, list[str]]) -> None:
         app = self.application
@@ -868,6 +928,13 @@ class EpisodeQcRequestHandler(BaseHTTPRequestHandler):
         platform_submit_match = re.fullmatch(
             r"/api/platform/jobs/([A-Za-z0-9._-]+)/submit", path
         )
+        platform_start_match = re.fullmatch(
+            r"/api/platform/jobs/([A-Za-z0-9._-]+)/start", path
+        )
+        if method == "POST" and platform_start_match:
+            self._discard_body()
+            self._send_json(app.start_platform_job(platform_start_match.group(1)))
+            return
         if method == "POST" and platform_submit_match:
             self._discard_body()
             self._send_json(app.submit_platform_job(platform_submit_match.group(1)))
@@ -1007,6 +1074,7 @@ class EpisodeQcRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(payload)))
         self.send_header("Cache-Control", "no-cache" if path.suffix in {".html", ".js", ".mjs", ".css"} else "public, max-age=3600")
         self.send_header("X-Content-Type-Options", "nosniff")
+        self._send_security_headers()
         self.end_headers()
         self.wfile.write(payload)
 
@@ -1033,6 +1101,7 @@ class EpisodeQcRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(payload)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
+        self._send_security_headers()
         self.end_headers()
         self.wfile.write(payload)
 
@@ -1046,6 +1115,7 @@ class EpisodeQcRequestHandler(BaseHTTPRequestHandler):
         self.send_header("X-Frame-Index", str(metadata["frame_index"]))
         self.send_header("X-End-Of-Stream", "1" if metadata["end_of_stream"] else "0")
         self.send_header("X-Content-Type-Options", "nosniff")
+        self._send_security_headers()
         self.end_headers()
         self.wfile.write(payload)
 
@@ -1053,7 +1123,18 @@ class EpisodeQcRequestHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Length", "0")
         self.send_header("Cache-Control", "no-store")
+        self._send_security_headers()
         self.end_headers()
+
+    def _send_security_headers(self) -> None:
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' blob: data:; connect-src 'self'; object-src 'none'; "
+            "base-uri 'none'; frame-ancestors 'none'",
+        )
 
 def create_web_server(
     paths: WebPaths,
@@ -1063,6 +1144,7 @@ def create_web_server(
     host: str = "127.0.0.1",
     public_hosts: tuple[str, ...] = (),
     flow_enabled: bool = True,
+    require_token: bool = True,
 ) -> EpisodeQcWebServer:
     if not 0 <= port <= 65535:
         raise ValueError("端口必须在 0 到 65535 之间")
@@ -1080,6 +1162,7 @@ def create_web_server(
         paths,
         token=token,
         flow_enabled=flow_enabled,
+        require_token=require_token,
     )
     return EpisodeQcWebServer(
         (bind_host, port),
@@ -1097,6 +1180,7 @@ def serve_web_app(
     host: str = "127.0.0.1",
     public_hosts: tuple[str, ...] = (),
     flow_enabled: bool = True,
+    require_token: bool = True,
 ) -> None:
     paths = default_web_paths(workspace_root)
     server = create_web_server(
@@ -1106,15 +1190,27 @@ def serve_web_app(
         host=host,
         public_hosts=public_hosts,
         flow_enabled=flow_enabled,
+        require_token=require_token,
     )
     actual_port = server.server_address[1]
     entry_urls = [f"{_http_origin(item, actual_port)}/" for item in server.public_hosts]
-    browser_url = f"{entry_urls[0]}?token={quote(server.application.token, safe='')}"
+    browser_url = (
+        f"{entry_urls[0]}?token={quote(server.application.token, safe='')}"
+        if require_token
+        else entry_urls[0]
+    )
     print("Episode QC Web:", flush=True)
     for entry_url in entry_urls:
-        print(f"  {entry_url}", flush=True)
+        entry_host = _normalize_web_host(urlsplit(entry_url).hostname or "")
+        if require_token and entry_host not in LOCAL_WEB_HOSTS:
+            print(f"  {entry_url}?token={quote(server.application.token, safe='')}", flush=True)
+        else:
+            print(f"  {entry_url}", flush=True)
     if any(item not in LOCAL_WEB_HOSTS for item in server.public_hosts):
-        print("警告：局域网直达模式已开启；同网段用户打开上述地址后将获得完整质检权限。", flush=True)
+        if require_token:
+            print("警告：局域网访问已开启；请只把完整令牌地址交给授权质检员。", flush=True)
+        else:
+            print("严重警告：免令牌模式已开启；任何可访问此端口的人都拥有完整质检权限。", flush=True)
     if open_browser:
         threading.Timer(0.25, webbrowser.open, args=(browser_url,)).start()
     try:

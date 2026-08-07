@@ -387,6 +387,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Run without Flow integration and import tasks directly from this QC machine.",
     )
+    web_parser.add_argument(
+        "--no-token",
+        action="store_true",
+        help="Disable Web access tokens. Unsafe on shared networks; use only on an isolated trusted LAN.",
+    )
     web_parser.set_defaults(func=_cmd_web)
 
     return parser
@@ -883,6 +888,7 @@ def _cmd_web(args: argparse.Namespace) -> int:
         host=args.host,
         public_hosts=tuple(args.public_host),
         flow_enabled=not args.standalone,
+        require_token=not args.no_token,
     )
     return 0
 

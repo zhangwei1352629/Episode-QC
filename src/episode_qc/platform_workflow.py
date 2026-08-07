@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from pathlib import PurePosixPath
 from typing import Callable
+from urllib.parse import urlsplit
 
 from episode_qc.source_paths import resolve_source_directory, resolve_target_directory
 
@@ -40,6 +41,25 @@ class FlowClientError(RuntimeError):
 
 class QualityCacheError(RuntimeError):
     pass
+
+
+def _api_error_message(value: object) -> str:
+    """Flatten DRF error payloads without assuming the payload is an object."""
+
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "；".join(filter(None, (_api_error_message(item) for item in value)))
+    if isinstance(value, dict):
+        if value.get("detail"):
+            return _api_error_message(value["detail"])
+        messages = []
+        for field, detail in value.items():
+            rendered = _api_error_message(detail)
+            if rendered:
+                messages.append(rendered if field in {"error", "non_field_errors"} else f"{field}: {rendered}")
+        return "；".join(messages)
+    return str(value)
 
 
 class FlowClient:
@@ -77,8 +97,7 @@ class FlowClient:
         except urllib.error.HTTPError as error:
             message = error.read().decode("utf-8", errors="replace")
             try:
-                payload = json.loads(message)
-                message = payload.get("detail") or payload
+                message = _api_error_message(json.loads(message))
             except json.JSONDecodeError:
                 pass
             raise FlowClientError(f"Flow 请求失败（HTTP {error.code}）：{message}") from error
@@ -468,6 +487,7 @@ class QualityCacheManager:
         local_result: Path,
         result_manifest: dict,
     ) -> str:
+        job_code = self._safe_component(job["code"], "质检任务编号")
         upload_uri = str(
             job.get("result_upload_uri")
             or state.get("result_upload_uri")
@@ -475,21 +495,21 @@ class QualityCacheManager:
         ).rstrip("/")
         if not upload_uri:
             raise QualityCacheError("Flow 没有返回独立的质检结果上传目录")
+        self._validate_result_job_root(
+            upload_uri,
+            asset_id=str(job["asset_id"]),
+            job_code=job_code,
+            field_name="质检结果上传目录",
+        )
+        source_uri = str(job.get("source_uri") or job.get("asset_nas_uri") or "")
+        if source_uri and self._uri_is_within(upload_uri, source_uri):
+            raise QualityCacheError("质检结果目录不能位于不可变原始资产目录内")
         result_root = resolve_target_directory(upload_uri)
         attempt_name = f"attempt-{int(result_manifest['attempt']):04d}"
         destination = result_root / attempt_name
-        manifest_path = destination / "result_manifest.json"
         if destination.exists():
-            try:
-                existing = json.loads(manifest_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError) as exc:
-                raise QualityCacheError(f"已有质检结果目录不完整：{destination}") from exc
-            if (
-                existing.get("result_id") == result_manifest["result_id"]
-                and existing.get("result_sha256") == result_manifest["result_sha256"]
-            ):
+            if self._verify_published_result(destination, result_manifest):
                 return f"{upload_uri}/{attempt_name}/qc_result.json"
-            raise QualityCacheError(f"质检结果轮次已经存在，禁止覆盖：{destination}")
 
         staging_uri = str(
             job.get("result_staging_uri")
@@ -497,6 +517,22 @@ class QualityCacheManager:
             or ""
         ).rstrip("/")
         if staging_uri:
+            self._validate_result_job_root(
+                staging_uri,
+                asset_id=str(job["asset_id"]),
+                job_code=job_code,
+                field_name="质检结果暂存目录",
+            )
+            if self._normalized_uri(staging_uri) == self._normalized_uri(upload_uri):
+                raise QualityCacheError("质检结果暂存目录不能与正式目录相同")
+            upload_namespace = self._storage_namespace(upload_uri)
+            staging_namespace = self._storage_namespace(staging_uri)
+            if (
+                upload_namespace is not None
+                and staging_namespace is not None
+                and upload_namespace != staging_namespace
+            ):
+                raise QualityCacheError("质检结果暂存目录与正式目录必须位于同一存储卷或 SMB 共享")
             staging_root = resolve_target_directory(staging_uri)
             staging = staging_root / (
                 f"{attempt_name}.{result_manifest['result_id']}.partial"
@@ -507,6 +543,11 @@ class QualityCacheManager:
             )
         result_root.mkdir(parents=True, exist_ok=True)
         staging.mkdir(parents=True, exist_ok=True)
+        try:
+            if result_root.stat().st_dev != staging.parent.stat().st_dev:
+                raise QualityCacheError("质检结果暂存目录与正式目录不在同一文件系统，无法原子发布")
+        except OSError as exc:
+            raise QualityCacheError(f"无法确认质检结果目录所在文件系统：{exc}") from exc
         staged_result = staging / "qc_result.json"
         temporary_result = staging / "qc_result.json.partial"
         shutil.copy2(local_result, temporary_result)
@@ -518,15 +559,77 @@ class QualityCacheManager:
             os.replace(staging, destination)
         except OSError as exc:
             try:
-                existing = json.loads(manifest_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
+                self._verify_published_result(destination, result_manifest)
+            except QualityCacheError:
                 raise QualityCacheError(f"无法原子发布质检结果：{exc}") from exc
-            if (
-                existing.get("result_id") != result_manifest["result_id"]
-                or existing.get("result_sha256") != result_manifest["result_sha256"]
-            ):
-                raise QualityCacheError(f"质检结果轮次发生并发冲突：{destination}") from exc
+        self._verify_published_result(destination, result_manifest)
         return f"{upload_uri}/{attempt_name}/qc_result.json"
+
+    @staticmethod
+    def _normalized_uri(value: str) -> str:
+        return str(value).strip().replace("\\", "/").rstrip("/").casefold()
+
+    @classmethod
+    def _uri_is_within(cls, candidate: str, parent: str) -> bool:
+        normalized_candidate = cls._normalized_uri(candidate)
+        normalized_parent = cls._normalized_uri(parent)
+        return normalized_candidate == normalized_parent or normalized_candidate.startswith(
+            normalized_parent + "/"
+        )
+
+    @classmethod
+    def _validate_result_job_root(
+        cls,
+        value: str,
+        *,
+        asset_id: str,
+        job_code: str,
+        field_name: str,
+    ) -> None:
+        expected_suffix = f"/{asset_id}/{job_code}".casefold()
+        if not cls._normalized_uri(value).endswith(expected_suffix):
+            raise QualityCacheError(
+                f"{field_name}必须以当前资产和任务编号结尾：{asset_id}/{job_code}"
+            )
+
+    @staticmethod
+    def _storage_namespace(value: str) -> tuple[str, ...] | None:
+        normalized = str(value).strip().replace("\\", "/")
+        lowered = normalized.casefold()
+        if lowered.startswith("smb://"):
+            parsed = urlsplit(normalized)
+            parts = [part for part in parsed.path.split("/") if part]
+            if parsed.hostname and parts:
+                return ("network", parsed.hostname.casefold(), parts[0].casefold())
+        if normalized.startswith("//"):
+            parts = [part for part in normalized[2:].split("/") if part]
+            if len(parts) >= 2:
+                return ("network", parts[0].casefold(), parts[1].casefold())
+        drive = re.match(r"^([A-Za-z]):/", normalized)
+        if drive:
+            return ("drive", drive.group(1).casefold())
+        return None
+
+    @staticmethod
+    def _verify_published_result(destination: Path, expected_manifest: dict) -> bool:
+        manifest_path = destination / "result_manifest.json"
+        try:
+            existing = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise QualityCacheError(f"已有质检结果目录缺少有效清单：{destination}") from exc
+        if existing != expected_manifest:
+            raise QualityCacheError(f"质检结果轮次已经存在且清单不同，禁止覆盖：{destination}")
+        files = existing.get("files") or []
+        if len(files) != 1 or files[0].get("relative_path") != "qc_result.json":
+            raise QualityCacheError(f"质检结果清单文件范围无效：{destination}")
+        result_path = destination / "qc_result.json"
+        expected_size = int(files[0].get("size_bytes") or 0)
+        expected_sha256 = str(files[0].get("sha256") or "").lower()
+        if not result_path.is_file() or result_path.stat().st_size != expected_size:
+            raise QualityCacheError(f"已发布质检结果文件大小校验失败：{result_path}")
+        if sha256_file(result_path) != expected_sha256:
+            raise QualityCacheError(f"已发布质检结果文件 SHA-256 校验失败：{result_path}")
+        return True
 
     def _ensure_disk_space(self, source_bytes: int) -> None:
         free = shutil.disk_usage(self.cache_root).free
@@ -569,6 +672,32 @@ class QualityCacheManager:
         manifest = job.get("asset_manifest") or {}
         if not isinstance(manifest, dict) or not manifest.get("episodes"):
             raise QualityCacheError("Flow 任务缺少完整 asset_manifest，禁止下载")
+        if str(manifest.get("asset_id") or "") != str(job.get("asset_id") or ""):
+            raise QualityCacheError("Flow 资产清单中的 asset_id 与质检任务不一致")
+        platform_episodes = {
+            str(item.get("episode_id") or ""): item
+            for item in job.get("episodes") or []
+        }
+        manifest_episodes = {
+            str(item.get("episode_id") or ""): item
+            for item in manifest.get("episodes") or []
+            if isinstance(item, dict)
+        }
+        if (
+            not platform_episodes
+            or set(platform_episodes) != set(manifest_episodes)
+            or "" in manifest_episodes
+        ):
+            raise QualityCacheError("Flow 资产清单与质检任务的 Episode 范围不一致")
+        for episode_id, platform_episode in platform_episodes.items():
+            manifest_episode = manifest_episodes[episode_id]
+            for field in ("relative_path", "primary_file", "checksum_sha256"):
+                left = str(platform_episode.get(field) or "").replace("\\", "/")
+                right = str(manifest_episode.get(field) or "").replace("\\", "/")
+                if left != right:
+                    raise QualityCacheError(
+                        f"Flow 资产清单 Episode {episode_id} 的 {field} 与任务登记不一致"
+                    )
         manifest_digest = canonical_json_sha256(manifest)
         expected_digest = str(job.get("asset_manifest_sha256") or "")
         if expected_digest and expected_digest != manifest_digest:
@@ -608,6 +737,10 @@ class QualityCacheManager:
                 if expected_size < 0 or not re.fullmatch(r"[a-f0-9]{64}", expected_sha256):
                     raise QualityCacheError(f"资产清单文件校验信息无效：{normalized}")
                 source = source_root / relative
+                try:
+                    source.resolve().relative_to(source_root.resolve())
+                except (OSError, ValueError) as exc:
+                    raise QualityCacheError(f"NAS 清单文件超出资产根目录：{normalized}") from exc
                 if not source.is_file():
                     raise QualityCacheError(f"NAS 缺少清单文件：{normalized}")
                 if source.stat().st_size != expected_size:

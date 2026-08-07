@@ -28,6 +28,7 @@ def test_web_cli_accepts_multiple_lan_hosts():
             "--port",
             "8765",
             "--standalone",
+            "--no-token",
         ]
     )
 
@@ -35,6 +36,7 @@ def test_web_cli_accepts_multiple_lan_hosts():
     assert args.public_host == ["192.168.123.222", "10.1.11.155"]
     assert args.port == 8765
     assert args.standalone is True
+    assert args.no_token is True
 
 
 def test_cli_does_not_load_image_detection_by_default():

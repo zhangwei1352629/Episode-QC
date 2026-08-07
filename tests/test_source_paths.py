@@ -4,7 +4,12 @@ from pathlib import Path
 
 import pytest
 
-from episode_qc.source_paths import resolve_source_directory, resolve_target_directory
+from episode_qc.source_paths import (
+    SmbLocation,
+    _windows_unc_root,
+    resolve_source_directory,
+    resolve_target_directory,
+)
 from episode_qc.workspace import scan_data_source
 
 
@@ -103,3 +108,13 @@ def test_resolves_nonexistent_smb_result_target_from_existing_mount(tmp_path: Pa
         mount_root / "episode-data" / "qc-results" / "AST-001" / "QCJ-001"
     ).resolve()
     assert not resolved.exists()
+
+
+def test_windows_native_smb_candidate_is_share_root_only():
+    location = SmbLocation(
+        server="10.1.10.10",
+        share="datasets",
+        relative_parts=("embodiment_free", "AST-001"),
+    )
+
+    assert _windows_unc_root(location) == r"\\10.1.10.10\datasets"

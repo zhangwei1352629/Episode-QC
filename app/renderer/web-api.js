@@ -68,6 +68,10 @@ function installWebApi() {
       `/api/platform/jobs/${encodeURIComponent(jobCode)}/claim`,
       { method: "POST" },
     ),
+    startPlatformJob: (jobCode) => request(
+      `/api/platform/jobs/${encodeURIComponent(jobCode)}/start`,
+      { method: "POST" },
+    ),
     submitPlatformJob: (jobCode) => request(
       `/api/platform/jobs/${encodeURIComponent(jobCode)}/submit`,
       { method: "POST" },

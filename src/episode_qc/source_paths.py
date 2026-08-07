@@ -267,14 +267,17 @@ def _unescape_mount_field(value: str) -> str:
 
 def _native_smb_mounts(location: SmbLocation) -> list[Path]:
     if os.name == "nt":
-        suffix = "\\".join(location.relative_parts)
-        unc = f"\\\\{location.server}\\{location.share}"
-        if suffix:
-            unc += f"\\{suffix}"
-        return [Path(unc)]
+        # Callers append ``relative_parts`` after selecting a mount root.  The
+        # native Windows candidate must therefore be the share root, otherwise
+        # smb://server/share/a became \\server\share\a\a.
+        return [Path(_windows_unc_root(location))]
     if sys.platform == "darwin":
         return [Path("/Volumes") / location.share]
     return []
+
+
+def _windows_unc_root(location: SmbLocation) -> str:
+    return f"\\\\{location.server}\\{location.share}"
 
 
 def _join_within_mount(mount_root: Path, relative_parts: tuple[str, ...]) -> Path:

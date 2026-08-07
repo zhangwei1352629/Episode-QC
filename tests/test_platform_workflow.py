@@ -1,16 +1,83 @@
 from __future__ import annotations
 
 import hashlib
+from io import BytesIO
 import json
 from pathlib import Path
+from unittest.mock import Mock
+import urllib.error
 
 import pytest
 
 from episode_qc.platform_workflow import (
+    FlowClient,
+    FlowClientError,
     QualityCacheError,
     QualityCacheManager,
     canonical_json_sha256,
 )
+
+
+def test_flow_client_preserves_drf_list_error_message():
+    client = FlowClient("http://flow.test")
+    client.opener.open = Mock(
+        side_effect=urllib.error.HTTPError(
+            "http://flow.test/api/v1/qc/jobs/QCJ-001/work",
+            400,
+            "Bad Request",
+            {},
+            BytesIO("[\"质检员已有进行中的工作时段\"]".encode("utf-8")),
+        )
+    )
+
+    with pytest.raises(FlowClientError, match="质检员已有进行中的工作时段"):
+        client.request("POST", "/api/v1/qc/jobs/QCJ-001/work", {})
+
+
+def test_atomic_json_writer_uses_platform_independent_lf(tmp_path: Path):
+    target = tmp_path / "result.json"
+    QualityCacheManager._write_json_atomic(target, {"name": "测试"})
+
+    assert target.read_bytes() == b'{\n  "name": "\xe6\xb5\x8b\xe8\xaf\x95"\n}\n'
+
+
+def test_result_job_root_cannot_escape_assigned_asset_and_job():
+    with pytest.raises(QualityCacheError, match="当前资产和任务编号"):
+        QualityCacheManager._validate_result_job_root(
+            r"C:\nas\data_collection\AST-001",
+            asset_id="AST-001",
+            job_code="QCJ-001",
+            field_name="质检结果上传目录",
+        )
+
+
+def test_existing_published_result_is_rehashed_before_idempotent_reuse(tmp_path: Path):
+    destination = tmp_path / "attempt-0001"
+    destination.mkdir()
+    result_path = destination / "qc_result.json"
+    result_path.write_bytes(b"tampered")
+    expected_sha256 = hashlib.sha256(b"expected").hexdigest()
+    manifest = {
+        "schema_version": 1,
+        "result_id": "QCR-001",
+        "result_sha256": expected_sha256,
+        "job_code": "QCJ-001",
+        "asset_id": "AST-001",
+        "attempt": 1,
+        "source_manifest_sha256": "a" * 64,
+        "created_at": "2026-08-07T00:00:00+00:00",
+        "files": [
+            {
+                "relative_path": "qc_result.json",
+                "size_bytes": len(b"expected"),
+                "sha256": expected_sha256,
+            }
+        ],
+    }
+    (destination / "result_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(QualityCacheError, match="SHA-256"):
+        QualityCacheManager._verify_published_result(destination, manifest)
 
 
 def publish_asset_manifest(asset_root: Path, job: dict, relative_files: list[str]) -> dict:
@@ -271,7 +338,7 @@ def test_cache_rejects_unsafe_platform_paths(tmp_path: Path):
     job["asset_manifest"] = safe_manifest
     job["asset_manifest_sha256"] = canonical_json_sha256(safe_manifest)
 
-    with pytest.raises(QualityCacheError, match="安全的相对路径"):
+    with pytest.raises(QualityCacheError, match="primary_file"):
         QualityCacheManager(tmp_path / "cache", reserve_bytes=0).cache_job(
             FakeFlowClient(job), job
         )

@@ -17,6 +17,7 @@ import pytest
 from episode_qc.playback import ACTION_FRAME_ENCODING, MOTION_FRAME_ENCODING
 from episode_qc.platform_workflow import QualityCacheManager, canonical_json_sha256
 from episode_qc.web_server import (
+    EpisodeQcRequestHandler,
     WebPaths,
     create_web_server,
     persistent_web_token,
@@ -35,6 +36,7 @@ def running_server(
     *,
     public_hosts: tuple[str, ...] = (),
     flow_enabled: bool = True,
+    require_token: bool = True,
     workspace_name: str = "workspace",
 ):
     project_root = Path(__file__).resolve().parents[1]
@@ -52,6 +54,7 @@ def running_server(
         token=TOKEN,
         public_hosts=public_hosts,
         flow_enabled=flow_enabled,
+        require_token=require_token,
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -124,6 +127,8 @@ def test_web_api_requires_token_and_serves_workspace(tmp_path: Path):
         with LOCAL_OPENER.open(f"{base_url}/web-api.js", timeout=5) as response:
             assert response.status == 200
             assert b"window.episodeQc" in response.read()
+            assert response.headers["Referrer-Policy"] == "no-referrer"
+            assert response.headers["X-Frame-Options"] == "DENY"
 
         with LOCAL_OPENER.open(f"{base_url}/label-template-simple.yaml", timeout=5) as response:
             assert response.status == 200
@@ -135,6 +140,25 @@ def test_web_api_requires_token_and_serves_workspace(tmp_path: Path):
             assert response.status == 200
             assert response.headers["Content-Type"].startswith("text/javascript")
             assert b"resolveSelectedTarget" in response.read()
+
+
+def test_explicit_no_token_mode_allows_api_without_token(tmp_path: Path):
+    with running_server(tmp_path, require_token=False) as (_server, base_url):
+        with LOCAL_OPENER.open(f"{base_url}/", timeout=5) as response:
+            assert response.status == 200
+            assert response.geturl() == f"{base_url}/"
+        with LOCAL_OPENER.open(f"{base_url}/api/workspace", timeout=5) as response:
+            assert response.status == 200
+            assert json.loads(response.read())["workspace"]["name"] == "Mocap QC 工作区"
+
+
+def test_only_loopback_clients_may_auto_receive_web_token():
+    handler = object.__new__(EpisodeQcRequestHandler)
+    handler.client_address = ("127.0.0.1", 12345)
+    assert handler._client_is_loopback() is True
+
+    handler.client_address = ("10.1.10.99", 12345)
+    assert handler._client_is_loopback() is False
 
 
 def test_web_claims_caches_and_submits_flow_job(tmp_path: Path):

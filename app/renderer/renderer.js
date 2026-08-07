@@ -507,7 +507,15 @@ async function handleFlowTaskAction(event) {
   const job = state.platform.jobs.find((item) => item.code === button.dataset.flowJobCode);
   if (!job) return;
   if (button.dataset.flowAction === "open" && job.local_task_id) {
-    await switchTask(job.local_task_id);
+    try {
+      if (!["completed", "submitted", "archived"].includes(job.local_task_status)) {
+        await window.episodeQc.startPlatformJob(job.code);
+      }
+      await switchTask(job.local_task_id);
+    } catch (error) {
+      toast(error.message || String(error), "error", 7000);
+      await refreshPlatformJobs({ quiet: true });
+    }
     return;
   }
   if (button.dataset.flowAction !== "claim") return;

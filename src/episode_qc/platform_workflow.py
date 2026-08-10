@@ -12,7 +12,7 @@ import socket
 import urllib.error
 import urllib.request
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from pathlib import PurePosixPath
 from typing import Callable
@@ -243,6 +243,10 @@ class QualityCacheManager:
         )
         if reused is not None:
             return reused
+        try:
+            self.evict_expired()
+        except Exception:
+            pass
         self._ensure_disk_space(total_bytes)
         partial_root.mkdir(parents=True, exist_ok=True)
         copied_bytes = self._existing_bytes(partial_root, files)
@@ -444,6 +448,7 @@ class QualityCacheManager:
             result_manifest=result_manifest,
         )
         state["result_synced"] = True
+        state["result_synced_at"] = datetime.now(timezone.utc).isoformat()
         state["result_nas_path"] = result_nas_path
         state["result_id"] = result_id
         state["result_sha256"] = result_sha256
@@ -479,6 +484,58 @@ class QualityCacheManager:
         if not state.get("result_synced"):
             raise QualityCacheError("质检结果尚未同步，禁止清理本地缓存")
         shutil.rmtree(ready_root)
+
+    def evict_expired(
+        self,
+        *,
+        now: datetime | None = None,
+        retention: timedelta = timedelta(days=1),
+    ) -> dict[str, object]:
+        current = now or datetime.now(timezone.utc)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=timezone.utc)
+        current = current.astimezone(timezone.utc)
+        summary = {
+            "scanned_jobs": 0,
+            "evicted_jobs": [],
+            "skipped_jobs": [],
+            "failed_jobs": {},
+            "freed_bytes": 0,
+        }
+        ready_root = self.cache_root / "ready"
+        if not ready_root.is_dir():
+            return summary
+        for job_root in sorted(path for path in ready_root.iterdir() if path.is_dir()):
+            job_code = job_root.name
+            summary["scanned_jobs"] += 1
+            try:
+                self._safe_component(job_code, "质检任务编号")
+                state = json.loads((job_root / ".qc-cache.json").read_text(encoding="utf-8"))
+                if not isinstance(state, dict):
+                    raise QualityCacheError("缓存状态必须是对象")
+            except (OSError, json.JSONDecodeError, QualityCacheError) as exc:
+                summary["failed_jobs"][job_code] = str(exc)
+                continue
+            if state.get("result_synced") is not True:
+                summary["skipped_jobs"].append(job_code)
+                continue
+            try:
+                synced_at = datetime.fromisoformat(str(state["result_synced_at"]))
+            except (KeyError, TypeError, ValueError):
+                summary["skipped_jobs"].append(job_code)
+                continue
+            if synced_at.tzinfo is None or current < synced_at.astimezone(timezone.utc) + retention:
+                summary["skipped_jobs"].append(job_code)
+                continue
+            try:
+                freed_bytes = sum(path.stat().st_size for path in job_root.rglob("*") if path.is_file())
+                self.evict(job_code)
+            except (OSError, json.JSONDecodeError, QualityCacheError) as exc:
+                summary["failed_jobs"][job_code] = str(exc)
+                continue
+            summary["evicted_jobs"].append(job_code)
+            summary["freed_bytes"] += freed_bytes
+        return summary
 
     def _publish_result(
         self,

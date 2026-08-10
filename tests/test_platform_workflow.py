@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from datetime import datetime, timezone
 from io import BytesIO
 import json
 from pathlib import Path
@@ -260,10 +261,87 @@ def test_flow_job_is_fully_cached_verified_submitted_and_safely_evicted(tmp_path
     ]
     assert (result_path.parent / "result_manifest.json").is_file()
     assert not any(Path(job["result_staging_uri"]).glob("*.partial"))
+    state = json.loads(
+        (tmp_path / "qc-cache" / "ready" / job["code"] / ".qc-cache.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert state["result_synced"] is True
+    assert datetime.fromisoformat(state["result_synced_at"]).tzinfo is not None
 
     cache.evict(job["code"])
     assert not (tmp_path / "qc-cache" / "ready" / job["code"]).exists()
 
+
+def test_evict_expired_removes_synced_ready_cache_after_one_day(tmp_path: Path):
+    cache_root = tmp_path / "cache"
+    manager = QualityCacheManager(cache_root, reserve_bytes=0)
+    job_root = cache_root / "ready" / "QCJ-expired"
+    job_root.mkdir(parents=True)
+    (job_root / ".qc-cache.json").write_text(
+        json.dumps({"result_synced": True, "result_synced_at": "2026-08-09T11:59:59+00:00"}), encoding="utf-8"
+    )
+    (job_root / "asset.bin").write_bytes(b"expired-cache")
+    expected_bytes = sum(path.stat().st_size for path in job_root.rglob("*") if path.is_file())
+
+    summary = manager.evict_expired(now=datetime(2026, 8, 10, 12, tzinfo=timezone.utc))
+
+    assert summary["evicted_jobs"] == ["QCJ-expired"]
+    assert summary["freed_bytes"] == expected_bytes
+    assert not job_root.exists()
+
+def test_evict_expired_keeps_nonobject_state_and_download_partial(tmp_path: Path):
+    cache_root = tmp_path / "cache"
+    manager = QualityCacheManager(cache_root, reserve_bytes=0)
+    malformed = cache_root / "ready" / "QCJ-nonobject"
+    malformed.mkdir(parents=True)
+    (malformed / ".qc-cache.json").write_text("[]", encoding="utf-8")
+    partial = cache_root / "downloading" / "QCJ-active.partial"
+    partial.mkdir(parents=True)
+    (partial / "recording.bin").write_bytes(b"in-progress")
+
+    summary = manager.evict_expired(now=datetime(2026, 8, 10, 12, tzinfo=timezone.utc))
+
+    assert "QCJ-nonobject" in summary["failed_jobs"]
+    assert summary["failed_jobs"]["QCJ-nonobject"] == "缓存状态必须是对象"
+    assert malformed.is_dir()
+    assert partial.is_dir()
+
+def test_cache_job_evicts_expired_before_checking_disk_space(tmp_path: Path, monkeypatch):
+    asset_root = tmp_path / "nas" / "AST-003"
+    source = asset_root / "episodes" / "episode_000001"
+    source.mkdir(parents=True)
+    payload = b"motion"
+    (source / "motion.bvh").write_bytes(payload)
+    checksum = hashlib.sha256(payload).hexdigest()
+    job = {
+        "code": "QCJ-003",
+        "asset_id": "AST-003",
+        "source_uri": str(asset_root),
+        "episodes": [{
+            "episode_id": "AST-003-EP0001",
+            "relative_path": "episodes/episode_000001",
+            "primary_file": "motion.bvh",
+            "checksum_sha256": checksum,
+        }],
+    }
+    publish_asset_manifest(asset_root, job, ["episodes/episode_000001/motion.bvh"])
+    manager = QualityCacheManager(tmp_path / "cache", reserve_bytes=0)
+    calls = []
+
+    def evict_expired():
+        calls.append("evict_expired")
+        return {}
+
+    def ensure_disk_space(_):
+        calls.append("ensure_disk_space")
+
+    monkeypatch.setattr(manager, "evict_expired", evict_expired)
+    monkeypatch.setattr(manager, "_ensure_disk_space", ensure_disk_space)
+
+    manager.cache_job(FakeFlowClient(job), job)
+
+    assert calls[:2] == ["evict_expired", "ensure_disk_space"]
 
 def test_cache_rejects_wrong_manifest_checksum(tmp_path: Path):
     asset_root = tmp_path / "nas" / "AST-002"

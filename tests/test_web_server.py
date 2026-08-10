@@ -18,6 +18,7 @@ from episode_qc.playback import ACTION_FRAME_ENCODING, MOTION_FRAME_ENCODING
 from episode_qc.platform_workflow import QualityCacheManager, canonical_json_sha256
 from episode_qc.web_server import (
     EpisodeQcRequestHandler,
+    PlatformCacheCleanupLoop,
     WebPaths,
     create_web_server,
     persistent_web_token,
@@ -65,6 +66,27 @@ def running_server(
         thread.join(timeout=5)
         server.server_close()
 
+
+def test_platform_cache_cleanup_loop_runs_at_startup_and_stops():
+    calls = []
+    periodic = threading.Event()
+
+    class FakeManager:
+        def evict_expired(self):
+            calls.append("run")
+            if len(calls) == 2:
+                periodic.set()
+            return {"scanned_jobs": 1, "evicted_jobs": [], "skipped_jobs": [], "failed_jobs": [], "freed_bytes": 0}
+
+    loop = PlatformCacheCleanupLoop(lambda: FakeManager(), interval_seconds=0.01, log=lambda _: None)
+    loop.start()
+    assert periodic.wait(timeout=1)
+    loop.close()
+    assert not loop.is_running
+
+def test_web_application_starts_platform_cache_cleanup(tmp_path: Path):
+    with running_server(tmp_path) as (server, _):
+        assert server.application._platform_cache_cleanup.is_running
 
 def request_json(url: str, *, method: str = "GET", payload: dict[str, object] | None = None):
     body = None if payload is None else json.dumps(payload).encode("utf-8")

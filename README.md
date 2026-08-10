@@ -381,6 +381,8 @@ uv run episode-qc workspace-export /path/to/workspace.db /path/to/results --form
 
 对于约 100GB 的资产，领取前会检查磁盘空间。由于 Web 回放还要生成派生缓存，默认要求可用空间至少为“源数据大小的 2 倍 + 10GB”，即 100GB 任务至少预留约 210GB。可用 `EPISODE_QC_CACHE_RESERVE_GB` 调整额外预留空间。
 
+已同步成功的 `platform-cache/ready/<job_code>` 会从 Flow 回写成功时起保留 24 小时。QC Web 服务启动时立即清理一次，之后每小时自动清理到期缓存；下载中的 `.partial`、待回写结果和 24 小时内的缓存不会自动删除。新任务在磁盘检查前也会执行同样的安全清理，若空间仍不足则保持原有错误提示，不会提前删除未到期数据。
+
 自动化或兼容环境仍可在启动服务前设置以下变量，让页面打开时自动使用账号登录；普通质检工作站推荐使用页面中的人员刷新选择：
 
 ```bash

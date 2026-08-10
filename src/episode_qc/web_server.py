@@ -16,7 +16,7 @@ import secrets
 import threading
 import traceback
 import shutil
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 import webbrowser
 
@@ -213,6 +213,66 @@ class PlaybackRegistry:
         return value
 
 
+class PlatformCacheCleanupLoop:
+    def __init__(
+        self,
+        manager_factory: Callable[[], QualityCacheManager],
+        *,
+        interval_seconds: float = 3600.0,
+        log: Callable[[str], None] = print,
+    ) -> None:
+        if interval_seconds <= 0:
+            raise ValueError("缓存清理间隔必须大于零")
+        self._manager_factory = manager_factory
+        self._interval_seconds = interval_seconds
+        self._log = log
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+
+    @property
+    def is_running(self) -> bool:
+        return bool(self._thread and self._thread.is_alive())
+
+    def start(self) -> None:
+        with self._lock:
+            if self.is_running:
+                return
+            self._stop.clear()
+            self.run_once("startup")
+            self._thread = threading.Thread(
+                target=self._run, name="episode-qc-platform-cache-cleanup", daemon=True
+            )
+            self._thread.start()
+
+    def close(self) -> None:
+        self._stop.set()
+        with self._lock:
+            thread = self._thread
+        if thread and thread is not threading.current_thread():
+            thread.join(timeout=5)
+        with self._lock:
+            self._thread = None
+
+    def run_once(self, reason: str) -> dict[str, object] | None:
+        try:
+            result = self._manager_factory().evict_expired()
+        except Exception as exc:
+            self._log(f"QC 平台缓存清理[{reason}]失败：{exc}")
+            return None
+        self._log(
+            "QC 平台缓存清理"
+            f"[{reason}]：扫描 {result['scanned_jobs']} 个，"
+            f"删除 {len(result['evicted_jobs'])} 个，"
+            f"释放 {result['freed_bytes']} 字节，"
+            f"失败 {len(result['failed_jobs'])} 个 {result['failed_jobs']}"
+        )
+        return result
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._interval_seconds):
+            self.run_once("periodic")
+
 class EpisodeQcWebApplication:
     def __init__(
         self,
@@ -245,8 +305,11 @@ class EpisodeQcWebApplication:
         paths.root.mkdir(parents=True, exist_ok=True)
         initialize_workspace(paths.db_path)
         self._connect_platform_from_environment()
+        self._platform_cache_cleanup = PlatformCacheCleanupLoop(self._quality_cache_manager)
+        self._platform_cache_cleanup.start()
 
     def close(self) -> None:
+        self._platform_cache_cleanup.close()
         self._executor.shutdown(wait=False, cancel_futures=True)
         self._platform_executor.shutdown(wait=False, cancel_futures=True)
 

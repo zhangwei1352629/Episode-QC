@@ -10,6 +10,7 @@ import urllib.error
 
 import pytest
 
+import episode_qc.platform_workflow as platform_workflow
 from episode_qc.platform_workflow import (
     FlowClient,
     FlowClientError,
@@ -148,6 +149,82 @@ class FakeFlowClient:
         assert job_code == self.job["code"]
         self.results.append(values)
         return {**self.job, "status": "completed", "submitted": values}
+
+
+def test_cache_job_verifies_each_cached_file_once_and_reports_file_progress(
+    tmp_path: Path, monkeypatch
+):
+    asset_root = tmp_path / "nas" / "AST-SINGLE-PASS"
+    first_episode = asset_root / "episodes" / "episode_000001"
+    second_episode = asset_root / "episodes" / "episode_000002"
+    first_episode.mkdir(parents=True)
+    second_episode.mkdir(parents=True)
+    first_primary = first_episode / "motion.bvh"
+    second_primary = second_episode / "motion.bvh"
+    first_primary.write_bytes(b"first primary payload")
+    second_primary.write_bytes(b"second primary payload")
+    first_checksum = hashlib.sha256(first_primary.read_bytes()).hexdigest()
+    second_checksum = hashlib.sha256(second_primary.read_bytes()).hexdigest()
+    job = {
+        "code": "QCJ-SINGLE-PASS",
+        "asset_id": "AST-SINGLE-PASS",
+        "source_uri": str(asset_root),
+        "episodes": [
+            {
+                "episode_id": "AST-SINGLE-PASS-EP0001",
+                "relative_path": "episodes/episode_000001",
+                "primary_file": "motion.bvh",
+                "checksum_sha256": first_checksum,
+            },
+            {
+                "episode_id": "AST-SINGLE-PASS-EP0002",
+                "relative_path": "episodes/episode_000002",
+                "primary_file": "motion.bvh",
+                "checksum_sha256": second_checksum,
+            },
+        ],
+    }
+    publish_asset_manifest(
+        asset_root,
+        job,
+        [
+            "episodes/episode_000001/motion.bvh",
+            "episodes/episode_000002/motion.bvh",
+        ],
+    )
+    cache_root = tmp_path / "qc-cache"
+    manager = QualityCacheManager(cache_root, reserve_bytes=0, chunk_size=7)
+    original_sha256_file = platform_workflow.sha256_file
+    cache_hash_calls: dict[str, int] = {}
+    downloading_root = cache_root / "downloading"
+
+    def count_cache_hashes(path: str | Path) -> str:
+        path = Path(path)
+        if path.is_relative_to(downloading_root):
+            relative = path.relative_to(
+                downloading_root / "QCJ-SINGLE-PASS.partial" / "AST-SINGLE-PASS"
+            ).as_posix()
+            cache_hash_calls[relative] = cache_hash_calls.get(relative, 0) + 1
+        return original_sha256_file(path)
+
+    monkeypatch.setattr(platform_workflow, "sha256_file", count_cache_hashes)
+    progress: list[dict] = []
+
+    manager.cache_job(FakeFlowClient(job), job, progress_callback=progress.append)
+
+    assert cache_hash_calls == {
+        "asset_manifest.json": 1,
+        "episodes/episode_000001/motion.bvh": 1,
+        "episodes/episode_000002/motion.bvh": 1,
+    }
+    verification = [item for item in progress if item.get("phase") == "verifying"]
+    assert [item["verified_files"] for item in verification] == [1, 2, 3]
+    assert [item["current_file"] for item in verification] == [
+        "asset_manifest.json",
+        "episodes/episode_000001/motion.bvh",
+        "episodes/episode_000002/motion.bvh",
+    ]
+    assert all(item["total_files"] == 3 for item in verification)
 
 
 def test_flow_job_is_fully_cached_verified_submitted_and_safely_evicted(tmp_path: Path):

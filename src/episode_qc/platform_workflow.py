@@ -282,8 +282,10 @@ class QualityCacheManager:
                 )
                 last_reported_percent = percent
 
-        self._verify_manifest_files(partial_root, files)
-        primary_files = self._verify_episode_primary_files(claimed, partial_root)
+        verified_files = self._verify_manifest_files(
+            partial_root, files, progress_callback=progress_callback
+        )
+        primary_files = self._verify_episode_primary_files(claimed, verified_files)
 
         state = {
             "schema_version": 2,
@@ -833,15 +835,37 @@ class QualityCacheManager:
         return sorted(specs, key=lambda item: item["relative_path"]), manifest_digest
 
     @staticmethod
-    def _verify_manifest_files(asset_root: Path, files: list[dict]) -> None:
-        for item in files:
+    def _verify_manifest_files(
+        asset_root: Path,
+        files: list[dict],
+        *,
+        progress_callback: ProgressCallback | None = None,
+    ) -> dict[str, str]:
+        verified_files: dict[str, str] = {}
+        total_files = len(files)
+        for index, item in enumerate(files, start=1):
             relative = Path(item["relative_path"])
             target = asset_root / relative
             if not target.is_file() or target.stat().st_size != int(item["size_bytes"]):
                 raise QualityCacheError(f"缓存文件大小校验失败：{relative}")
-            if sha256_file(target) != item["sha256"]:
+            digest = sha256_file(target)
+            if digest != item["sha256"]:
                 target.unlink(missing_ok=True)
                 raise QualityCacheError(f"缓存文件 SHA-256 校验失败：{relative}")
+            relative_path = relative.as_posix()
+            verified_files[relative_path] = digest
+            QualityCacheManager._emit(
+                progress_callback,
+                {
+                    "status": "verifying",
+                    "phase": "verifying",
+                    "progress": 99,
+                    "verified_files": index,
+                    "total_files": total_files,
+                    "current_file": relative_path,
+                },
+            )
+        return verified_files
 
     def _reuse_ready_cache(
         self,
@@ -871,8 +895,8 @@ class QualityCacheManager:
         )
         if matches:
             try:
-                self._verify_manifest_files(ready_asset_root, files)
-                primary_files = self._verify_episode_primary_files(job, ready_asset_root)
+                verified_files = self._verify_manifest_files(ready_asset_root, files)
+                primary_files = self._verify_episode_primary_files(job, verified_files)
             except QualityCacheError:
                 matches = False
         if matches:
@@ -895,7 +919,9 @@ class QualityCacheManager:
         shutil.rmtree(ready_job_root)
         return None
 
-    def _verify_episode_primary_files(self, job: dict, asset_root: Path) -> list[dict]:
+    def _verify_episode_primary_files(
+        self, job: dict, verified_files: dict[str, str]
+    ) -> list[dict]:
         episodes = job.get("episodes") or []
         if not episodes:
             raise QualityCacheError("质检任务不包含 Episode")
@@ -908,18 +934,19 @@ class QualityCacheManager:
                 episode["primary_file"], "Episode 主文件"
             )
             primary_relative = relative_dir / primary_name
-            primary = asset_root / primary_relative
-            if not primary.is_file():
+            primary_path = primary_relative.as_posix()
+            actual_sha256 = verified_files.get(primary_path)
+            if actual_sha256 is None:
                 raise QualityCacheError(f"缓存缺少主文件：{primary_relative}")
             expected_sha256 = str(episode.get("checksum_sha256") or "")
-            if expected_sha256 and sha256_file(primary) != expected_sha256:
+            if expected_sha256 and actual_sha256 != expected_sha256:
                 raise QualityCacheError(
                     f"Episode {episode['episode_id']} 主文件 SHA-256 校验失败"
                 )
             verified.append(
                 {
                     "episode_id": episode["episode_id"],
-                    "path": str(primary_relative),
+                    "path": primary_path,
                     "sha256": expected_sha256,
                 }
             )

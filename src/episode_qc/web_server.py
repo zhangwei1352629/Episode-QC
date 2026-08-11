@@ -294,6 +294,7 @@ class EpisodeQcWebApplication:
         self._jobs: set[str] = set()
         self._jobs_lock = threading.Lock()
         self._platform_jobs: set[str] = set()
+        self._platform_progress: dict[str, dict[str, object]] = {}
         self._platform_lock = threading.RLock()
         self._flow_client_factory = FlowClient
         self._flow_client: FlowClient | None = None
@@ -539,6 +540,10 @@ class EpisodeQcWebApplication:
         }
         with self._platform_lock:
             caching = set(self._platform_jobs)
+            progress_by_job = {
+                code: dict(values)
+                for code, values in self._platform_progress.items()
+            }
             if response.get("reviewer"):
                 self._flow_connection["reviewer"] = str(response["reviewer"])
             connection = dict(self._flow_connection)
@@ -554,6 +559,11 @@ class EpisodeQcWebApplication:
                     "local_task_id": local_task.get("id") if local_task else None,
                     "local_task_status": local_task.get("status") if local_task else None,
                     "local_caching": code in caching,
+                    **(
+                        {"local_progress": progress_by_job[code]}
+                        if code in caching and code in progress_by_job
+                        else {}
+                    ),
                 }
             )
         return {"enabled": True, "connected": True, **connection, "jobs": jobs}
@@ -593,6 +603,8 @@ class EpisodeQcWebApplication:
         indexed_task_id = ""
 
         def publish_progress(values: dict[str, object]) -> None:
+            with self._platform_lock:
+                self._platform_progress[job_code] = dict(values)
             self.events.publish(
                 {"type": "platform_job", "jobCode": job_code, **values}
             )
@@ -698,6 +710,7 @@ class EpisodeQcWebApplication:
         finally:
             with self._platform_lock:
                 self._platform_jobs.discard(job_code)
+                self._platform_progress.pop(job_code, None)
 
     def add_source(self, request: dict[str, object]) -> dict[str, object]:
         root_path = request.get("rootPath")

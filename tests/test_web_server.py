@@ -183,6 +183,51 @@ def test_only_loopback_clients_may_auto_receive_web_token():
     assert handler._client_is_loopback() is False
 
 
+def test_platform_jobs_return_active_verification_progress_and_renderer_contract(tmp_path: Path):
+    job = {
+        "code": "QCJ-WEB-PROGRESS",
+        "status": "caching",
+        "asset_id": "AST-WEB-PROGRESS",
+    }
+    progress = {
+        "status": "verifying",
+        "phase": "verifying",
+        "progress": 99,
+        "verified_files": 3,
+        "total_files": 9,
+        "current_file": "episodes/episode_000003/data.mcap",
+    }
+
+    class FakeFlowClient:
+        def jobs_response(self):
+            return {"reviewer": "Web 质检员", "jobs": [dict(job)]}
+
+    with running_server(tmp_path) as (server, base_url):
+        server.application._flow_client = FakeFlowClient()
+        with server.application._platform_lock:
+            server.application._platform_jobs.add(job["code"])
+            server.application._platform_progress = {job["code"]: dict(progress)}
+
+        status, payload = request_json(f"{base_url}/api/platform/jobs")
+        assert status == 200
+        visible = payload["jobs"][0]
+        assert visible["local_caching"] is True
+        assert visible["local_progress"] == progress
+
+        with server.application._platform_lock:
+            server.application._platform_jobs.discard(job["code"])
+        status, payload = request_json(f"{base_url}/api/platform/jobs")
+        assert status == 200
+        assert "local_progress" not in payload["jobs"][0]
+
+    renderer = (Path(__file__).resolve().parents[1] / "app" / "renderer" / "renderer.js").read_text(
+        encoding="utf-8"
+    )
+    phase_marker = "local.phase === " + chr(34) + "verifying" + chr(34)
+    assert phase_marker in renderer
+    assert "校验 ${Number(local.verified_files || 0)}/${Number(local.total_files)} 个文件" in renderer
+
+
 def test_web_claims_caches_and_submits_flow_job(tmp_path: Path):
     source = tmp_path / "nas" / "AST-WEB-001"
     episode_root = source / "episodes" / "episode_000001"

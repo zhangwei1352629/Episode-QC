@@ -350,6 +350,62 @@ def test_flow_job_is_fully_cached_verified_submitted_and_safely_evicted(tmp_path
     assert not (tmp_path / "qc-cache" / "ready" / job["code"]).exists()
 
 
+def test_cache_job_accepts_partial_job_coverage_and_copies_only_covered_files(tmp_path: Path):
+    """Catches partial Flow QC Jobs being rejected or downloading unscoped Episode files."""
+    asset_root = tmp_path / "nas" / "AST-PARTIAL-001"
+    first_source = asset_root / "episodes" / "episode_000001"
+    second_source = asset_root / "episodes" / "episode_000002"
+    first_source.mkdir(parents=True)
+    second_source.mkdir(parents=True)
+    first_payload = b"first covered Episode"
+    second_payload = b"second unscoped Episode"
+    first_primary = first_source / "motion.bvh"
+    second_primary = second_source / "motion.bvh"
+    first_primary.write_bytes(first_payload)
+    second_primary.write_bytes(second_payload)
+    full_episodes = [
+        {
+            "episode_id": "AST-PARTIAL-001-EP0001",
+            "relative_path": "episodes/episode_000001",
+            "primary_file": "motion.bvh",
+            "checksum_sha256": hashlib.sha256(first_payload).hexdigest(),
+        },
+        {
+            "episode_id": "AST-PARTIAL-001-EP0002",
+            "relative_path": "episodes/episode_000002",
+            "primary_file": "motion.bvh",
+            "checksum_sha256": hashlib.sha256(second_payload).hexdigest(),
+        },
+    ]
+    job = {
+        "code": "QCJ-PARTIAL-001",
+        "asset_id": "AST-PARTIAL-001",
+        "source_uri": str(asset_root),
+        "episodes": full_episodes,
+    }
+    full_manifest = publish_asset_manifest(
+        asset_root,
+        job,
+        [
+            "episodes/episode_000001/motion.bvh",
+            "episodes/episode_000002/motion.bvh",
+        ],
+    )
+    job["episodes"] = [full_episodes[0]]
+
+    cached = QualityCacheManager(tmp_path / "qc-cache", reserve_bytes=0).cache_job(
+        FakeFlowClient(job), job
+    )
+
+    cache_dir = Path(cached["cache_dir"])
+    state = json.loads((cache_dir.parent / ".qc-cache.json").read_text(encoding="utf-8"))
+    assert cached["reused"] is False
+    assert (cache_dir / "episodes" / "episode_000001" / "motion.bvh").read_bytes() == first_payload
+    assert not (cache_dir / "episodes" / "episode_000002").exists()
+    assert state["episode_ids"] == ["AST-PARTIAL-001-EP0001"]
+    assert state["asset_manifest_sha256"] == canonical_json_sha256(full_manifest)
+
+
 def test_evict_expired_removes_synced_ready_cache_after_one_day(tmp_path: Path):
     cache_root = tmp_path / "cache"
     manager = QualityCacheManager(cache_root, reserve_bytes=0)

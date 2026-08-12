@@ -744,7 +744,7 @@ class QualityCacheManager:
         }
         if (
             not platform_episodes
-            or set(platform_episodes) != set(manifest_episodes)
+            or not set(platform_episodes).issubset(manifest_episodes)
             or "" in manifest_episodes
         ):
             raise QualityCacheError("Flow 资产清单与质检任务的 Episode 范围不一致")
@@ -774,7 +774,9 @@ class QualityCacheManager:
 
         specs = []
         seen = set()
-        for episode in manifest.get("episodes") or []:
+        for episode in (
+            manifest_episodes[episode_id] for episode_id in platform_episodes
+        ):
             files = (episode.get("manifest") or {}).get("files") or []
             if not files:
                 raise QualityCacheError(

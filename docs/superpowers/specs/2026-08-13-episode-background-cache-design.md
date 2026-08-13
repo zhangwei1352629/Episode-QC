@@ -12,7 +12,7 @@
 - 仅允许缓存 Job 覆盖且已关闭、具有固定 manifest 的 Episode。每个 Episode 的 `relative_path`、`primary_file`、校验和必须与完整清单及 NAS 上的 `asset_manifest.json` 一致。
 - 每个文件继续使用 `.partial` 续传，文件完成后做 SHA-256 校验。已验证 Episode 不重复下载；重启后从已记录状态与残留 partial 文件恢复。
 - Job 仍只能一次提交本次 Job 范围中全部、不重复的 Episode 结论。缓存未完整或任一 Episode 尚未审核时拒绝提交。
-- 不修改 Flow、DataCollector、NAS 原始资产布局、完整 manifest 摘要算法或 QC 结果原子发布协议。
+- 不修改 DataCollector、NAS 原始资产布局、完整 manifest 摘要算法或 QC 结果原子发布协议。Flow 仅调整缓存进度上报：已经开始审核的 Job 继续保持 `in_progress`，同时接受后台缓存的字节和百分比更新。
 
 ## 缓存状态和文件布局
 
@@ -32,11 +32,15 @@
 
 磁盘不足不会删除任何已缓存 Episode。worker 把当前 Episode 标为失败/等待空间，保留 partial 和可恢复状态；释放空间后可从同一 Job 继续。
 
+Flow 在首条可用 Episode 开始审核后保持 Job 为 `in_progress`。后续 `caching` 与最终 `cache_ready` 上报只更新缓存字段；不会将 Job 或已审核 Episode 回退为缓存状态。这样 Flow 的工作时段、审核身份和最终整轮原子提交语义保持不变。
+
 ## 工作区与界面契约
 
 `WebApplication._cache_platform_job()` 需要接受“Episode 已就绪”回调：首次就绪时建立本地 Flow task，后续就绪时刷新同一 task 并保存 Flow Episode 到本地 Episode 映射。`/api/platform/jobs` 继续返回 `local_task_id`、`local_caching` 和累计进度，并新增每个 Episode 的缓存摘要，以便任务中心显示“已缓存 N/M”。
 
 本地 Episode 列表只包含已验证就绪的 Episode；未缓存 Episode 不暴露为可回放项目。任务打开后，UI 可审核当前可用 Episode，同时显示后台缓存仍在进行。播放缓存仍由现有 `prepare_episode_cache()` 管理，与原始 Episode 下载状态分离。
+
+现有 Flow 平台缓存的定时过期清理不再启动，`cache_job()` 也不再为腾出空间调用清理；M6 不会自动删除任何 Job 缓存。
 
 ## 错误处理与恢复
 

@@ -797,6 +797,38 @@ class QualityCacheManager:
         state["local_episodes"] = mappings
         self._write_json_atomic(state_path, state)
 
+    def record_pre_cache_failure(self, job_code: str, cache_error: str) -> None:
+        """Durably queue a Flow failure that happened before cache state exists."""
+        safe_code = self._safe_component(job_code, "质检任务编号")
+        message = str(cache_error).strip() or "缓存前校验失败"
+        state = {
+            "schema_version": 3,
+            "job_code": safe_code,
+            "cache_complete": False,
+            "cache_status": "failed",
+            "cache_error": message,
+            "cached_episode_count": 0,
+            "total_episode_count": 0,
+            "cached_bytes": 0,
+            "total_bytes": 0,
+            "pending_cache_report": {
+                "status": "failed",
+                "cache_error": message,
+            },
+        }
+        self._write_json_atomic(self._pre_cache_failure_state_path(safe_code), state)
+
+    def has_pre_cache_failure(self, job_code: str) -> bool:
+        safe_code = self._safe_component(job_code, "质检任务编号")
+        return self._pre_cache_failure_state_path(safe_code).is_file()
+
+    def clear_pre_cache_failure(self, job_code: str) -> None:
+        """Clear a failed pre-cache journal only for an explicit user retry."""
+        safe_code = self._safe_component(job_code, "质检任务编号")
+        failed_root = self._pre_cache_failure_state_path(safe_code).parent
+        if failed_root.is_dir():
+            shutil.rmtree(failed_root)
+
     def local_episode_mappings(self, job_code: str) -> list[dict]:
         state_path = self._state_path(job_code)
         state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -806,6 +838,8 @@ class QualityCacheManager:
         safe_code = self._safe_component(job_code, "质检任务编号")
         state_path = self.cache_root / "ready" / safe_code / ".qc-cache.json"
         if not state_path.is_file():
+            state_path = self._pre_cache_failure_state_path(safe_code)
+        if not state_path.is_file():
             return None
         try:
             state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -813,7 +847,7 @@ class QualityCacheManager:
             raise QualityCacheError("本地 Episode 缓存状态损坏，请人工检查") from exc
         if state.get("job_code") != safe_code:
             raise QualityCacheError("本地 Episode 缓存任务编号不一致")
-        return {
+        summary = {
             "cache_complete": bool(state.get("cache_complete")),
             "cache_status": str(state.get("cache_status") or "caching"),
             "cached_episode_count": int(state.get("cached_episode_count") or 0),
@@ -821,11 +855,16 @@ class QualityCacheManager:
             "cached_bytes": int(state.get("cached_bytes") or 0),
             "total_bytes": int(state.get("total_bytes") or 0),
         }
+        if state.get("cache_error"):
+            summary["cache_error"] = str(state["cache_error"])
+        return summary
 
     def flush_pending_cache_report(self, client: FlowClient, job_code: str) -> bool:
         """Retry a durable Flow cache-status report after reconnecting."""
         safe_code = self._safe_component(job_code, "质检任务编号")
         state_path = self.cache_root / "ready" / safe_code / ".qc-cache.json"
+        if not state_path.is_file():
+            state_path = self._pre_cache_failure_state_path(safe_code)
         if not state_path.is_file():
             return False
         try:
@@ -849,6 +888,10 @@ class QualityCacheManager:
         if not state_path.is_file():
             raise QualityCacheError("质检任务尚未完整缓存到本地")
         return state_path
+
+    def _pre_cache_failure_state_path(self, job_code: str) -> Path:
+        safe_code = self._safe_component(job_code, "质检任务编号")
+        return self.cache_root / "failed" / safe_code / ".qc-cache.json"
 
     def evict(self, job_code: str) -> None:
         job_code = self._safe_component(job_code, "质检任务编号")

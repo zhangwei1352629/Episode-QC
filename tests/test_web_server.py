@@ -15,7 +15,8 @@ from urllib.request import build_opener, ProxyHandler, Request
 import pytest
 
 from episode_qc.playback import ACTION_FRAME_ENCODING, MOTION_FRAME_ENCODING
-from episode_qc.platform_workflow import QualityCacheManager, canonical_json_sha256
+from episode_qc.platform_workflow import FlowClientError, QualityCacheManager, canonical_json_sha256
+import episode_qc.platform_workflow as platform_workflow
 import episode_qc.web_server as web_server
 from episode_qc.web_server import (
     EpisodeQcRequestHandler,
@@ -183,14 +184,17 @@ def test_web_flow_label_schema_is_installed_before_ready_episode_indexing(tmp_pa
     assert job.get("status") != "failed"
 
 
-def test_web_flow_label_schema_conflict_fails_public_cache_job_without_submission(tmp_path: Path, monkeypatch):
+def test_web_flow_label_schema_conflict_persists_failed_report_and_reconnects_without_recaching(tmp_path: Path, monkeypatch):
     local_schema = flow_label_schema(label_name="本地冲突标签")
     frozen_schema = flow_label_schema()
     local_job = flow_label_job(code="QCJ-LOCAL-LABEL-SCHEMA", schema=local_schema)
     job = flow_label_job(code="QCJ-WEB-LABEL-CONFLICT", schema=frozen_schema)
 
     class FakeFlowClient:
-        submitted = []
+        def __init__(self):
+            self.available = False
+            self.reports = []
+            self.submitted = []
 
         def jobs_response(self):
             return {"reviewer": "Web 质检员", "jobs": [dict(job)]}
@@ -205,6 +209,9 @@ def test_web_flow_label_schema_conflict_fails_public_cache_job_without_submissio
 
         def report_cache(self, job_code, **values):
             assert job_code == job["code"]
+            self.reports.append((job_code, values))
+            if not self.available:
+                raise FlowClientError("temporary Flow outage")
             job.update(values)
             return dict(job)
 
@@ -212,22 +219,22 @@ def test_web_flow_label_schema_conflict_fails_public_cache_job_without_submissio
             self.submitted.append((job_code, values))
             return dict(job)
 
-    class CacheThatMustNotRun:
-        called = False
-
-        def cache_summary(self, _job_code):
-            return None
-
-        def cache_job(self, *_args, **_kwargs):
-            self.called = True
-            raise AssertionError("conflicting schema must fail before cache scanning")
-
-    cache = CacheThatMustNotRun()
+    cache_calls = []
+    scan_calls = []
     client = FakeFlowClient()
-    monkeypatch.setattr(web_server, "scan_data_source", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("scan must not run")))
+    monkeypatch.setattr(platform_workflow.time, "sleep", lambda _delay: None)
+    monkeypatch.setattr(web_server, "scan_data_source", lambda *_args, **_kwargs: scan_calls.append(True))
     with running_server(tmp_path) as (server, base_url):
         install_flow_label_schema(server.application.paths.db_path, local_job)
         server.application._flow_client = client
+        cache = QualityCacheManager(
+            server.application.paths.root / "platform-cache", reserve_bytes=0
+        )
+        monkeypatch.setattr(
+            cache,
+            "cache_job",
+            lambda *_args, **_kwargs: cache_calls.append(True),
+        )
         server.application._quality_cache_manager = lambda: cache
 
         status, accepted = request_json(
@@ -237,14 +244,55 @@ def test_web_flow_label_schema_conflict_fails_public_cache_job_without_submissio
         for _ in range(200):
             _status, payload = request_json(f"{base_url}/api/platform/jobs")
             visible = payload["jobs"][0]
-            if visible["status"] == "failed" and not visible["local_caching"]:
+            if len(client.reports) >= 3 and not visible["local_caching"]:
                 break
             time.sleep(0.01)
 
-    assert visible["status"] == "failed"
-    assert "同一标签集版本已有不同的本地标签快照" in visible["cache_error"]
-    assert cache.called is False
-    assert client.submitted == []
+        state_path = (
+            server.application.paths.root
+            / "platform-cache"
+            / "failed"
+            / job["code"]
+            / ".qc-cache.json"
+        )
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        assert visible["cache_status"] == "failed"
+        assert "同一标签集版本已有不同的本地标签快照" in visible["cache_error"]
+        assert state["pending_cache_report"]["status"] == "failed"
+        assert len(client.reports) == 3
+        assert cache_calls == []
+        assert scan_calls == []
+        assert client.submitted == []
+
+        client.available = True
+        server.application._flow_client_factory = lambda *_args: client
+        status, reconnected = request_json(
+            f"{base_url}/api/platform/login",
+            method="POST",
+            payload={
+                "baseUrl": "http://flow.test:8000",
+                "username": "reviewer",
+                "password": "secret",
+            },
+        )
+
+        assert status == 200
+        assert len(client.reports) == 4
+        assert client.reports[-1] == (
+            job["code"],
+            {
+                "status": "failed",
+                "cache_error": "同一标签集版本已有不同的本地标签快照",
+            },
+        )
+        assert "pending_cache_report" not in json.loads(state_path.read_text(encoding="utf-8"))
+        assert cache_calls == []
+        assert scan_calls == []
+        assert reconnected["jobs"][0]["cache_status"] == "failed"
+
+        _status, refreshed = request_json(f"{base_url}/api/platform/jobs")
+        assert refreshed["jobs"][0]["status"] == "failed"
+        assert "同一标签集版本已有不同的本地标签快照" in refreshed["jobs"][0]["cache_error"]
 
 
 def test_web_flow_label_schema_submit_uses_direct_annotations(tmp_path: Path, monkeypatch):

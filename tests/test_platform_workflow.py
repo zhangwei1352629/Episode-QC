@@ -656,6 +656,62 @@ def test_pending_final_flow_cache_report_is_retried_after_reconnect(tmp_path: Pa
     assert "pending_cache_report" not in state
 
 
+def test_pre_cache_failure_report_is_durable_and_retried_after_reconnect(tmp_path: Path, monkeypatch):
+    cache = QualityCacheManager(tmp_path / "qc-cache", reserve_bytes=0)
+    state_path = (
+        tmp_path / "qc-cache" / "failed" / "QCJ-PRE-CACHE-FAILURE" / ".qc-cache.json"
+    )
+    cache.record_pre_cache_failure(
+        "QCJ-PRE-CACHE-FAILURE", "同一标签集版本已有不同的本地标签快照"
+    )
+
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["cache_status"] == "failed"
+    assert state["cache_complete"] is False
+    assert state["pending_cache_report"] == {
+        "status": "failed",
+        "cache_error": "同一标签集版本已有不同的本地标签快照",
+    }
+    assert cache.cache_summary("QCJ-PRE-CACHE-FAILURE") == {
+        "cache_complete": False,
+        "cache_status": "failed",
+        "cache_error": "同一标签集版本已有不同的本地标签快照",
+        "cached_episode_count": 0,
+        "total_episode_count": 0,
+        "cached_bytes": 0,
+        "total_bytes": 0,
+    }
+
+    class UnavailableThenRecoveredClient:
+        def __init__(self):
+            self.available = False
+            self.reports = []
+
+        def report_cache(self, job_code, **values):
+            self.reports.append((job_code, values))
+            if not self.available:
+                raise FlowClientError("temporary Flow outage")
+            return {"code": job_code, **values}
+
+    client = UnavailableThenRecoveredClient()
+    monkeypatch.setattr(platform_workflow.time, "sleep", lambda _delay: None)
+
+    assert cache.flush_pending_cache_report(client, "QCJ-PRE-CACHE-FAILURE") is False
+    assert len(client.reports) == 3
+    assert "pending_cache_report" in json.loads(state_path.read_text(encoding="utf-8"))
+
+    client.available = True
+    assert cache.flush_pending_cache_report(client, "QCJ-PRE-CACHE-FAILURE") is True
+    assert client.reports[-1] == (
+        "QCJ-PRE-CACHE-FAILURE",
+        {
+            "status": "failed",
+            "cache_error": "同一标签集版本已有不同的本地标签快照",
+        },
+    )
+    assert "pending_cache_report" not in json.loads(state_path.read_text(encoding="utf-8"))
+
+
 def test_structured_label_flow_job_is_fully_cached_verified_submitted_and_safely_evicted(tmp_path: Path):
     asset_root = tmp_path / "nas" / "AST-001"
     first_source = asset_root / "episodes" / "episode_000001"

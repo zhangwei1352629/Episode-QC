@@ -383,6 +383,10 @@ class EpisodeQcWebApplication:
                 continue
             if item.get("status") in {"completed", "waiting_data"}:
                 continue
+            if summary and summary.get("cache_status") == "failed":
+                # A schema/pre-cache failure has no local Episode queue to
+                # resume. Its durable Flow report is retried above only.
+                continue
             if summary is None or summary.get("cache_complete"):
                 continue
             with self._platform_lock:
@@ -405,6 +409,12 @@ class EpisodeQcWebApplication:
             summary = self._quality_cache_manager().cache_summary(job_code)
             if summary and summary.get("cache_complete"):
                 return {"accepted": False, "job": job, "local_task": local_task}
+        manager = self._quality_cache_manager()
+        if manager.has_pre_cache_failure(job_code):
+            # This endpoint is the explicit retry boundary. A reconnect only
+            # reports the durable failure; it never restarts cache/scan work.
+            manager.clear_pre_cache_failure(job_code)
+            summary = None
         if summary and not summary.get("cache_complete"):
             # The job is already owned locally.  Resuming its durable queue
             # must not re-claim an active Flow work session.
@@ -539,7 +549,13 @@ class EpisodeQcWebApplication:
                 continue
             code = str(item.get("code") or "")
             local_task = local_by_job.get(code)
-            cache_summary = cache_by_job.get(code, {})
+            cache_summary = cache_by_job.get(code)
+            if cache_summary is None and code:
+                try:
+                    cache_summary = manager.cache_summary(code)
+                except QualityCacheError:
+                    cache_summary = None
+            cache_summary = cache_summary or {}
             jobs.append(
                 {
                     **item,
@@ -710,14 +726,35 @@ class EpisodeQcWebApplication:
                 }
             )
         except Exception as exc:
-            try:
-                client.report_cache(
-                    job_code,
-                    status="failed",
-                    cache_error=str(exc),
-                )
-            except Exception:
-                pass
+            if job:
+                try:
+                    manager.record_pre_cache_failure(job_code, str(exc))
+                except (OSError, QualityCacheError):
+                    # If the failure journal itself cannot be persisted, keep
+                    # the previous best-effort direct report as a last resort.
+                    try:
+                        client.report_cache(
+                            job_code,
+                            status="failed",
+                            cache_error=str(exc),
+                        )
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        manager.flush_pending_cache_report(client, job_code)
+                    except QualityCacheError:
+                        # The durable report remains available for reconnect.
+                        pass
+            else:
+                try:
+                    client.report_cache(
+                        job_code,
+                        status="failed",
+                        cache_error=str(exc),
+                    )
+                except Exception:
+                    pass
             publish_progress(
                 {
                     "status": "cache_failed" if local_ready else "failed",

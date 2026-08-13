@@ -20,6 +20,31 @@ from episode_qc.platform_workflow import (
 )
 
 
+FLOW_SCHEMA = {
+    "schema": {
+        "schema_type": "annotation_label_schema",
+        "schema_version": "1.0.0",
+        "label_set_id": "task-quality",
+        "label_set_name": "Task quality",
+        "language": "en",
+    },
+    "severity_levels": [{"code": "warning", "name": "Warning", "order": 1}],
+    "actions": [{"code": "review", "name": "Review"}],
+    "groups": [{"code": "motion", "name": "Motion", "order": 1}],
+    "labels": [
+        {
+            "code": "body_sway",
+            "name": "Body sway",
+            "group": "motion",
+            "enabled": True,
+            "annotation_scopes": ["time_range"],
+            "target_types": ["body"],
+            "fields": [],
+        }
+    ],
+}
+
+
 def test_flow_client_preserves_drf_list_error_message():
     client = FlowClient("http://flow.test")
     client.opener.open = Mock(
@@ -631,7 +656,7 @@ def test_pending_final_flow_cache_report_is_retried_after_reconnect(tmp_path: Pa
     assert "pending_cache_report" not in state
 
 
-def test_flow_job_is_fully_cached_verified_submitted_and_safely_evicted(tmp_path: Path):
+def test_structured_label_flow_job_is_fully_cached_verified_submitted_and_safely_evicted(tmp_path: Path):
     asset_root = tmp_path / "nas" / "AST-001"
     first_source = asset_root / "episodes" / "episode_000001"
     second_source = asset_root / "episodes" / "episode_000002"
@@ -652,6 +677,10 @@ def test_flow_job_is_fully_cached_verified_submitted_and_safely_evicted(tmp_path
         "asset_size_bytes": 0,
         "asset_nas_uri": str(asset_root),
         "source_uri": str(asset_root),
+        "label_set_id": "task-quality",
+        "label_schema_version": "1.0.0",
+        "label_schema_hash": canonical_json_sha256(FLOW_SCHEMA),
+        "label_schema": FLOW_SCHEMA,
         "episodes": [
             {
                 "episode_id": "AST-001-EP0001",
@@ -727,14 +756,30 @@ def test_flow_job_is_fully_cached_verified_submitted_and_safely_evicted(tmp_path
                 "episode_id": "AST-001-EP0001",
                 "decision": "pass_with_labels",
                 "quality_grade": "good",
-                "annotation_count": 2,
-                "result": {"labels": ["minor_jitter"]},
+                "annotation_count": 1,
+                "annotations": [
+                    {
+                        "annotation_id": "ann-local-1",
+                        "label_code": "body_sway",
+                        "scope": "time_range",
+                        "start_offset_ns": 100,
+                        "end_offset_ns": 200,
+                        "target_type": "body",
+                        "target_key": "root",
+                        "severity": "warning",
+                        "action": "review",
+                        "comment": "visible sway",
+                        "attributes": {"axis": "x"},
+                        "local_only": "must not publish",
+                    }
+                ],
+                "result": {"labels": ["minor_jitter"], "annotations": [{"local": "context"}]},
             },
             {
                 "episode_id": "AST-001-EP0002",
                 "decision": "reject",
                 "quality_grade": "invalid",
-                "annotation_count": 1,
+                "annotation_count": 0,
             },
         ],
         result={"reviewed_episode_count": 2},
@@ -757,6 +802,27 @@ def test_flow_job_is_fully_cached_verified_submitted_and_safely_evicted(tmp_path
     assert client.results[0]["result_manifest"]["result_sha256"] == client.results[0][
         "result_sha256"
     ]
+    assert client.results[0]["label_set"] == {
+        "label_set_id": "task-quality",
+        "label_schema_version": "1.0.0",
+        "label_schema_hash": canonical_json_sha256(FLOW_SCHEMA),
+    }
+    assert client.results[0]["episode_results"][0]["annotations"] == [
+        {
+            "id": "ann-local-1",
+            "label_code": "body_sway",
+            "scope": "time_range",
+            "start_offset_ns": 100,
+            "end_offset_ns": 200,
+            "target_type": "body",
+            "target_key": "root",
+            "severity": "warning",
+            "action": "review",
+            "comment": "visible sway",
+            "attributes": {"axis": "x"},
+        }
+    ]
+    assert client.results[0]["episode_results"][1]["annotations"] == []
     assert (result_path.parent / "result_manifest.json").is_file()
     assert not any(Path(job["result_staging_uri"]).glob("*.partial"))
     state = json.loads(
@@ -769,6 +835,50 @@ def test_flow_job_is_fully_cached_verified_submitted_and_safely_evicted(tmp_path
 
     cache.evict(job["code"])
     assert not (tmp_path / "qc-cache" / "ready" / job["code"]).exists()
+
+
+def test_legacy_annotations_are_rejected_before_result_publication(tmp_path: Path):
+    """Catches labeled legacy jobs publishing NAS evidence before Flow rejects them."""
+    asset_root = tmp_path / "nas" / "AST-LEGACY-ANNOTATIONS"
+    episode_directory = asset_root / "episodes" / "episode_000001"
+    episode_directory.mkdir(parents=True)
+    primary = episode_directory / "motion.bvh"
+    primary.write_bytes(b"legacy annotation payload")
+    job = {
+        "code": "QCJ-LEGACY-ANNOTATIONS",
+        "asset_id": "AST-LEGACY-ANNOTATIONS",
+        "source_uri": str(asset_root),
+        "episodes": [
+            {
+                "episode_id": "AST-LEGACY-ANNOTATIONS-EP0001",
+                "relative_path": "episodes/episode_000001",
+                "primary_file": "motion.bvh",
+                "checksum_sha256": hashlib.sha256(primary.read_bytes()).hexdigest(),
+            }
+        ],
+    }
+    publish_asset_manifest(asset_root, job, ["episodes/episode_000001/motion.bvh"])
+    cache = QualityCacheManager(tmp_path / "qc-cache", reserve_bytes=0)
+    client = FakeFlowClient(job)
+    cache.cache_job(client, job)
+
+    with pytest.raises(QualityCacheError, match="标签库引用"):
+        cache.submit_result(
+            client,
+            job,
+            episode_results=[
+                {
+                    "episode_id": "AST-LEGACY-ANNOTATIONS-EP0001",
+                    "decision": "pass_with_labels",
+                    "annotation_count": 1,
+                    "annotations": [{"annotation_id": "ann-legacy", "label_code": "body_sway"}],
+                }
+            ],
+        )
+
+    assert not (tmp_path / "qc-cache" / "results-pending" / job["code"]).exists()
+    assert not (Path(job["result_upload_uri"]) / "attempt-0001" / "qc_result.json").exists()
+    assert client.results == []
 
 
 def test_cache_job_accepts_partial_job_coverage_and_copies_only_covered_files(tmp_path: Path):

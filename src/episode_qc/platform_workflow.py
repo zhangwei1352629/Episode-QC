@@ -44,6 +44,55 @@ class QualityCacheError(RuntimeError):
     pass
 
 
+_FLOW_LABEL_REFERENCE_FIELDS = (
+    "label_set_id",
+    "label_schema_version",
+    "label_schema_hash",
+)
+_FLOW_ANNOTATION_FIELDS = (
+    "label_code",
+    "scope",
+    "start_offset_ns",
+    "end_offset_ns",
+    "target_type",
+    "target_key",
+    "severity",
+    "action",
+    "comment",
+    "attributes",
+)
+
+
+def _flow_label_set_reference(job: dict) -> dict | None:
+    """Return the complete frozen Flow label reference, if this is a labeled job."""
+    values = {field: job.get(field) for field in _FLOW_LABEL_REFERENCE_FIELDS}
+    provided = [value is not None and value != "" for value in values.values()]
+    if any(provided) and not all(provided):
+        raise QualityCacheError("Flow 标签库引用必须同时包含标签集、版本和哈希")
+    if not any(provided):
+        return None
+    return values
+
+
+def _flow_annotations(value: object) -> list[dict]:
+    """Keep only Flow fact fields and rename QC-local annotation IDs."""
+    if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
+        raise QualityCacheError("annotations 必须是对象列表")
+    normalized_annotations = []
+    for annotation in value:
+        normalized = {
+            field: annotation[field]
+            for field in _FLOW_ANNOTATION_FIELDS
+            if field in annotation
+        }
+        if "annotation_id" in annotation:
+            normalized["id"] = annotation["annotation_id"]
+        elif "id" in annotation:
+            normalized["id"] = annotation["id"]
+        normalized_annotations.append(normalized)
+    return normalized_annotations
+
+
 def _api_error_message(value: object) -> str:
     """Flatten DRF error payloads without assuming the payload is an object."""
 
@@ -148,6 +197,7 @@ class FlowClient:
         *,
         episode_results: list[dict],
         result: dict | None = None,
+        label_set: dict | None = None,
         result_nas_path: str = "",
         result_id: str = "",
         result_sha256: str = "",
@@ -168,6 +218,10 @@ class FlowClient:
             }
             if episode_result.get("quality_grade"):
                 normalized["quality_grade"] = episode_result["quality_grade"]
+            if "annotations" in episode_result:
+                normalized["annotations"] = _flow_annotations(
+                    episode_result["annotations"]
+                )
             normalized_results.append(normalized)
         payload = {
             "episode_results": normalized_results,
@@ -177,6 +231,8 @@ class FlowClient:
             "result_sha256": result_sha256,
             "result_manifest": result_manifest or {},
         }
+        if label_set is not None:
+            payload["label_set"] = label_set
         return self.request("POST", f"/api/v1/qc/jobs/{job_code}/result", payload)
 
 
@@ -623,6 +679,8 @@ class QualityCacheManager:
         submitted_ids = {item.get("episode_id") for item in episode_results}
         if len(submitted_ids) != len(episode_results) or submitted_ids != expected_ids:
             raise QualityCacheError("必须一次提交资产内全部且不重复的 Episode 质检结论")
+        label_set = _flow_label_set_reference(job)
+        normalized_results = []
         for episode_result in episode_results:
             decision = episode_result.get("decision")
             quality_grade = episode_result.get("quality_grade")
@@ -632,14 +690,26 @@ class QualityCacheManager:
                 raise QualityCacheError(f"不支持的质量等级：{quality_grade}")
             if int(episode_result.get("annotation_count") or 0) < 0:
                 raise QualityCacheError("标注数量不能为负数")
-        normalized_results = [
-            {
-                **item,
-                "decision": DECISION_MAP[item["decision"]],
-                "annotation_count": int(item.get("annotation_count") or 0),
+            has_direct_annotations = "annotations" in episode_result
+            annotations = (
+                _flow_annotations(episode_result["annotations"])
+                if has_direct_annotations
+                else []
+            )
+            annotation_count = int(episode_result.get("annotation_count") or 0)
+            if label_set is not None or has_direct_annotations:
+                if annotation_count != len(annotations):
+                    raise QualityCacheError("annotation_count 必须等于 annotations 数量")
+            if label_set is None and annotations:
+                raise QualityCacheError("带有标注的质检结果需要完整的 Flow 标签库引用")
+            normalized = {
+                **episode_result,
+                "decision": DECISION_MAP[episode_result["decision"]],
+                "annotation_count": annotation_count,
             }
-            for item in episode_results
-        ]
+            if label_set is not None or has_direct_annotations:
+                normalized["annotations"] = annotations
+            normalized_results.append(normalized)
         pending_result = state.get("pending_result") or {}
         result_id = str(pending_result.get("result_id") or f"QCR-{uuid.uuid4().hex}")
         attempt = int(state.get("next_attempt") or job.get("next_attempt") or 1)
@@ -704,8 +774,9 @@ class QualityCacheManager:
             client.report_work(job_code, action="heartbeat")
         response = client.submit_result(
             job_code,
-            episode_results=episode_results,
+            episode_results=normalized_results,
             result=result or {},
+            label_set=label_set,
             result_nas_path=result_nas_path,
             result_id=result_id,
             result_sha256=result_sha256,

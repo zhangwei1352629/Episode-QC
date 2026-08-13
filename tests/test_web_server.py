@@ -16,18 +16,67 @@ import pytest
 
 from episode_qc.playback import ACTION_FRAME_ENCODING, MOTION_FRAME_ENCODING
 from episode_qc.platform_workflow import QualityCacheManager, canonical_json_sha256
+import episode_qc.web_server as web_server
 from episode_qc.web_server import (
     EpisodeQcRequestHandler,
     WebPaths,
     create_web_server,
     persistent_web_token,
 )
+from episode_qc.workspace import install_flow_label_schema, workspace_state
 
 
 TOKEN = "web-test-token"
 EPISODE_ID = "ep_" + "a" * 24
 STREAM_ID = "str_" + "b" * 24
 LOCAL_OPENER = build_opener(ProxyHandler({}))
+
+
+def flow_label_schema(*, label_name: str = "躯干摆动") -> dict[str, object]:
+    return {
+        "schema": {
+            "schema_type": "annotation_label_schema",
+            "schema_version": "1.0.0",
+            "label_set_id": "flow_web_labels",
+            "label_set_name": "Flow Web 标签",
+            "language": "zh-CN",
+        },
+        "severity_levels": [{"code": "normal", "name": "一般", "order": 1}],
+        "actions": [{"code": "keep_with_label", "name": "保留但标记"}],
+        "groups": [{"code": "motion", "name": "动作", "order": 1}],
+        "labels": [
+            {
+                "code": "body_sway",
+                "name": label_name,
+                "group": "motion",
+                "enabled": True,
+                "annotation_scopes": ["time_range"],
+                "target_types": ["global"],
+                "default_severity": "normal",
+                "default_action": "keep_with_label",
+                "color": "#8844EE",
+            }
+        ],
+    }
+
+
+def flow_label_job(*, code: str, schema: dict[str, object]) -> dict[str, object]:
+    return {
+        "code": code,
+        "status": "pending",
+        "asset_id": f"AST-{code}",
+        "task_name": "Flow 标签缓存测试",
+        "label_set_id": schema["schema"]["label_set_id"],
+        "label_schema_version": schema["schema"]["schema_version"],
+        "label_schema_hash": canonical_json_sha256(schema),
+        "label_schema": schema,
+        "episodes": [
+            {
+                "episode_id": f"{code}-EP0001",
+                "relative_path": "episodes/episode_000001",
+            }
+        ],
+    }
 
 
 @contextmanager
@@ -69,6 +118,182 @@ def running_server(
 def test_web_application_does_not_start_an_automatic_platform_cache_cleanup(tmp_path: Path):
     with running_server(tmp_path) as (server, _):
         assert not hasattr(server.application, "_platform_cache_cleanup")
+
+
+def test_web_flow_label_schema_is_installed_before_ready_episode_indexing(tmp_path: Path, monkeypatch):
+    schema = flow_label_schema()
+    job = flow_label_job(code="QCJ-WEB-LABEL-SCHEMA", schema=schema)
+    indexed = []
+
+    class FakeFlowClient:
+        def jobs(self):
+            return [dict(job)]
+
+        def report_cache(self, _job_code, **values):
+            job.update(values)
+            return dict(job)
+
+    class FakeCache:
+        def cache_job(self, _client, _job, *, progress_callback, episode_ready_callback):
+            progress_callback({"status": "caching", "progress": 50})
+            episode_ready_callback(
+                {
+                    "cache_dir": str(tmp_path / "cached"),
+                    "cached_episode_count": 1,
+                    "total_episode_count": 1,
+                }
+            )
+            return {"total_episode_count": 1}
+
+        def record_local_episodes(self, _job_code, mappings):
+            assert mappings == [
+                {
+                    "episode_id": "QCJ-WEB-LABEL-SCHEMA-EP0001",
+                    "local_episode_id": "ep_local",
+                    "relative_path": "episodes/episode_000001",
+                }
+            ]
+
+        def cache_summary(self, _job_code):
+            return {"cached_bytes": 1, "total_bytes": 1}
+
+        def start_review(self, _client, _job_code):
+            return {"status": "in_progress"}
+
+    def scan_after_schema_install(db_path, *_args, **_kwargs):
+        assert workspace_state(db_path)["label_schema"] == schema
+        indexed.append(True)
+        return {
+            "task_id": "task_local",
+            "episodes": [
+                {
+                    "id": "ep_local",
+                    "relative_path": "episodes/episode_000001",
+                    "import_status": "ready",
+                }
+            ],
+        }
+
+    monkeypatch.setattr(web_server, "scan_data_source", scan_after_schema_install)
+    with running_server(tmp_path) as (server, _base_url):
+        server.application._quality_cache_manager = lambda: FakeCache()
+        server.application._cache_platform_job(FakeFlowClient(), job["code"])
+
+    assert indexed == [True]
+    assert job.get("status") != "failed"
+
+
+def test_web_flow_label_schema_conflict_fails_public_cache_job_without_submission(tmp_path: Path, monkeypatch):
+    local_schema = flow_label_schema(label_name="本地冲突标签")
+    frozen_schema = flow_label_schema()
+    local_job = flow_label_job(code="QCJ-LOCAL-LABEL-SCHEMA", schema=local_schema)
+    job = flow_label_job(code="QCJ-WEB-LABEL-CONFLICT", schema=frozen_schema)
+
+    class FakeFlowClient:
+        submitted = []
+
+        def jobs_response(self):
+            return {"reviewer": "Web 质检员", "jobs": [dict(job)]}
+
+        def jobs(self):
+            return [dict(job)]
+
+        def claim(self, job_code):
+            assert job_code == job["code"]
+            job["status"] = "claimed"
+            return dict(job)
+
+        def report_cache(self, job_code, **values):
+            assert job_code == job["code"]
+            job.update(values)
+            return dict(job)
+
+        def submit_result(self, job_code, **values):
+            self.submitted.append((job_code, values))
+            return dict(job)
+
+    class CacheThatMustNotRun:
+        called = False
+
+        def cache_summary(self, _job_code):
+            return None
+
+        def cache_job(self, *_args, **_kwargs):
+            self.called = True
+            raise AssertionError("conflicting schema must fail before cache scanning")
+
+    cache = CacheThatMustNotRun()
+    client = FakeFlowClient()
+    monkeypatch.setattr(web_server, "scan_data_source", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("scan must not run")))
+    with running_server(tmp_path) as (server, base_url):
+        install_flow_label_schema(server.application.paths.db_path, local_job)
+        server.application._flow_client = client
+        server.application._quality_cache_manager = lambda: cache
+
+        status, accepted = request_json(
+            f"{base_url}/api/platform/jobs/{job['code']}/claim", method="POST"
+        )
+        assert status == 202 and accepted["accepted"] is True
+        for _ in range(200):
+            _status, payload = request_json(f"{base_url}/api/platform/jobs")
+            visible = payload["jobs"][0]
+            if visible["status"] == "failed" and not visible["local_caching"]:
+                break
+            time.sleep(0.01)
+
+    assert visible["status"] == "failed"
+    assert "同一标签集版本已有不同的本地标签快照" in visible["cache_error"]
+    assert cache.called is False
+    assert client.submitted == []
+
+
+def test_web_flow_label_schema_submit_uses_direct_annotations(tmp_path: Path, monkeypatch):
+    job = {"code": "QCJ-WEB-LABEL-SUBMIT", "status": "in_progress"}
+    annotation = {"annotation_id": "ann_" + "c" * 24, "label_code": "body_sway"}
+    submitted = {}
+
+    class FakeFlowClient:
+        def jobs(self):
+            return [dict(job)]
+
+    class FakeCache:
+        def local_episode_mappings(self, _job_code):
+            return [{"episode_id": "FLOW-EP-1", "local_episode_id": "ep_local"}]
+
+        def submit_result(self, _client, _job, *, episode_results, result):
+            submitted["episode_results"] = episode_results
+            submitted["result"] = result
+            return {"status": "completed"}
+
+    monkeypatch.setattr(
+        web_server,
+        "episode_detail",
+        lambda *_args: {
+            "episode": {
+                "quality_decision": "pass_with_labels",
+                "review_status": "completed",
+                "reviewer_name": "Web 质检员",
+                "annotation_count": 1,
+            },
+            "annotations": [annotation],
+        },
+    )
+    with running_server(tmp_path) as (server, _base_url):
+        server.application._flow_client = FakeFlowClient()
+        server.application._quality_cache_manager = lambda: FakeCache()
+        monkeypatch.setattr(web_server.EpisodeQcWebApplication, "_local_task_for_job", lambda *_args: {"id": "task_local"})
+        monkeypatch.setattr(web_server, "mark_qc_task_submitted", lambda *_args: {"status": "submitted"})
+        response = server.application.submit_platform_job(job["code"])
+
+    assert response["job"]["status"] == "completed"
+    episode_result = submitted["episode_results"][0]
+    assert episode_result["annotation_count"] == 1
+    assert episode_result["annotations"] == [annotation]
+    assert episode_result["result"] == {
+        "local_episode_id": "ep_local",
+        "review_status": "completed",
+        "reviewer_name": "Web 质检员",
+    }
 
 def request_json(url: str, *, method: str = "GET", payload: dict[str, object] | None = None):
     body = None if payload is None else json.dumps(payload).encode("utf-8")

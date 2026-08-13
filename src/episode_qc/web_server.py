@@ -410,11 +410,7 @@ class EpisodeQcWebApplication:
             if summary and summary.get("cache_complete"):
                 return {"accepted": False, "job": job, "local_task": local_task}
         manager = self._quality_cache_manager()
-        if manager.has_pre_cache_failure(job_code):
-            # This endpoint is the explicit retry boundary. A reconnect only
-            # reports the durable failure; it never restarts cache/scan work.
-            manager.clear_pre_cache_failure(job_code)
-            summary = None
+        pre_cache_failure = manager.has_pre_cache_failure(job_code)
         if summary and not summary.get("cache_complete"):
             # The job is already owned locally.  Resuming its durable queue
             # must not re-claim an active Flow work session.
@@ -425,6 +421,10 @@ class EpisodeQcWebApplication:
             self._platform_executor.submit(self._cache_platform_job, client, job_code)
             return {"accepted": True, "job": job, "caching": True}
         claimed = client.claim(job_code)
+        if pre_cache_failure:
+            # Clear only after Flow has accepted the explicit retry. A failed
+            # claim must leave the durable failure/error available to retry.
+            manager.clear_pre_cache_failure(job_code)
         with self._platform_lock:
             if job_code in self._platform_jobs:
                 return {"accepted": False, "job": claimed, "caching": True}
@@ -728,7 +728,7 @@ class EpisodeQcWebApplication:
         except Exception as exc:
             if job:
                 try:
-                    manager.record_pre_cache_failure(job_code, str(exc))
+                    manager.record_cache_failure(job_code, str(exc))
                 except (OSError, QualityCacheError):
                     # If the failure journal itself cannot be persisted, keep
                     # the previous best-effort direct report as a last resort.

@@ -15,7 +15,12 @@ from urllib.request import build_opener, ProxyHandler, Request
 import pytest
 
 from episode_qc.playback import ACTION_FRAME_ENCODING, MOTION_FRAME_ENCODING
-from episode_qc.platform_workflow import FlowClientError, QualityCacheManager, canonical_json_sha256
+from episode_qc.platform_workflow import (
+    FlowClientError,
+    QualityCacheError,
+    QualityCacheManager,
+    canonical_json_sha256,
+)
 import episode_qc.platform_workflow as platform_workflow
 import episode_qc.web_server as web_server
 from episode_qc.web_server import (
@@ -293,6 +298,128 @@ def test_web_flow_label_schema_conflict_persists_failed_report_and_reconnects_wi
         _status, refreshed = request_json(f"{base_url}/api/platform/jobs")
         assert refreshed["jobs"][0]["status"] == "failed"
         assert "同一标签集版本已有不同的本地标签快照" in refreshed["jobs"][0]["cache_error"]
+
+
+def test_web_existing_ready_cache_failure_retries_its_own_durable_report_without_recaching(tmp_path: Path, monkeypatch):
+    job = {"code": "QCJ-WEB-READY-FAILURE", "status": "in_progress", "asset_id": "AST-READY"}
+
+    class FakeFlowClient:
+        def __init__(self):
+            self.available = False
+            self.reports = []
+
+        def jobs(self):
+            return [dict(job)]
+
+        def report_cache(self, job_code, **values):
+            self.reports.append((job_code, values))
+            if not self.available:
+                raise FlowClientError("temporary Flow outage")
+            job.update(values)
+            return dict(job)
+
+    client = FakeFlowClient()
+    monkeypatch.setattr(platform_workflow.time, "sleep", lambda _delay: None)
+    with running_server(tmp_path) as (server, _base_url):
+        cache = QualityCacheManager(
+            server.application.paths.root / "platform-cache", reserve_bytes=0
+        )
+        ready_state_path = (
+            server.application.paths.root
+            / "platform-cache"
+            / "ready"
+            / job["code"]
+            / ".qc-cache.json"
+        )
+        QualityCacheManager._write_json_atomic(
+            ready_state_path,
+            {
+                "schema_version": 3,
+                "job_code": job["code"],
+                "asset_id": job["asset_id"],
+                "cache_complete": True,
+                "cache_status": "cache_ready",
+                "cached_episode_count": 1,
+                "total_episode_count": 1,
+                "cached_bytes": 42,
+                "total_bytes": 42,
+                "local_episodes": [{"episode_id": "FLOW-EP", "local_episode_id": "ep_local"}],
+                "result_synced": False,
+            },
+        )
+        monkeypatch.setattr(
+            cache,
+            "cache_job",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(QualityCacheError("index failed")),
+        )
+        server.application._quality_cache_manager = lambda: cache
+        server.application._cache_platform_job(client, job["code"])
+
+        ready_state = json.loads(ready_state_path.read_text(encoding="utf-8"))
+        pre_state_path = (
+            server.application.paths.root
+            / "platform-cache"
+            / "failed"
+            / job["code"]
+            / ".qc-cache.json"
+        )
+        assert ready_state["cache_status"] == "failed"
+        assert ready_state["cache_error"] == "index failed"
+        assert ready_state["pending_cache_report"] == {
+            "status": "failed",
+            "cache_error": "index failed",
+        }
+        assert ready_state["local_episodes"] == [{"episode_id": "FLOW-EP", "local_episode_id": "ep_local"}]
+        assert ready_state["result_synced"] is False
+        assert not pre_state_path.exists()
+        assert len(client.reports) == 3
+
+        scheduled = []
+        monkeypatch.setattr(
+            server.application._platform_executor,
+            "submit",
+            lambda *_args: scheduled.append(True),
+        )
+        client.available = True
+        server.application._resume_incomplete_platform_caches(client, {"jobs": [dict(job)]})
+
+        assert client.reports[-1] == (
+            job["code"],
+            {"status": "failed", "cache_error": "index failed"},
+        )
+        assert "pending_cache_report" not in json.loads(ready_state_path.read_text(encoding="utf-8"))
+        assert scheduled == []
+
+
+def test_web_failed_claim_keeps_pre_cache_failure_journal_and_does_not_start_cache(tmp_path: Path, monkeypatch):
+    job = {"code": "QCJ-WEB-CLAIM-FAILURE", "status": "pending"}
+
+    class FailingClaimClient:
+        def jobs(self):
+            return [dict(job)]
+
+        def claim(self, _job_code):
+            raise FlowClientError("Flow claim unavailable")
+
+    with running_server(tmp_path) as (server, _base_url):
+        cache = QualityCacheManager(
+            server.application.paths.root / "platform-cache", reserve_bytes=0
+        )
+        cache.record_pre_cache_failure(job["code"], "frozen schema conflict")
+        scheduled = []
+        monkeypatch.setattr(
+            server.application._platform_executor,
+            "submit",
+            lambda *_args: scheduled.append(True),
+        )
+        server.application._flow_client = FailingClaimClient()
+        server.application._quality_cache_manager = lambda: cache
+
+        with pytest.raises(FlowClientError, match="Flow claim unavailable"):
+            server.application.claim_platform_job(job["code"])
+
+        assert cache.has_pre_cache_failure(job["code"])
+        assert scheduled == []
 
 
 def test_web_flow_label_schema_submit_uses_direct_annotations(tmp_path: Path, monkeypatch):

@@ -797,26 +797,42 @@ class QualityCacheManager:
         state["local_episodes"] = mappings
         self._write_json_atomic(state_path, state)
 
-    def record_pre_cache_failure(self, job_code: str, cache_error: str) -> None:
-        """Durably queue a Flow failure that happened before cache state exists."""
+    def record_cache_failure(self, job_code: str, cache_error: str) -> None:
+        """Durably queue a Flow failure without discarding an existing cache state."""
         safe_code = self._safe_component(job_code, "质检任务编号")
         message = str(cache_error).strip() or "缓存前校验失败"
-        state = {
-            "schema_version": 3,
-            "job_code": safe_code,
-            "cache_complete": False,
-            "cache_status": "failed",
+        ready_state_path = self.cache_root / "ready" / safe_code / ".qc-cache.json"
+        if ready_state_path.is_file():
+            state_path = ready_state_path
+            try:
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise QualityCacheError("本地 Episode 缓存状态损坏，请人工检查") from exc
+            if state.get("job_code") != safe_code:
+                raise QualityCacheError("本地 Episode 缓存任务编号不一致")
+        else:
+            state_path = self._pre_cache_failure_state_path(safe_code)
+            state = {
+                "schema_version": 3,
+                "job_code": safe_code,
+                "cache_complete": False,
+                "cached_episode_count": 0,
+                "total_episode_count": 0,
+                "cached_bytes": 0,
+                "total_bytes": 0,
+            }
+        state["cache_status"] = "failed"
+        state["cache_error"] = message
+        state["pending_cache_report"] = {
+            "status": "failed",
             "cache_error": message,
-            "cached_episode_count": 0,
-            "total_episode_count": 0,
-            "cached_bytes": 0,
-            "total_bytes": 0,
-            "pending_cache_report": {
-                "status": "failed",
-                "cache_error": message,
-            },
         }
-        self._write_json_atomic(self._pre_cache_failure_state_path(safe_code), state)
+        state.pop("cache_report_error", None)
+        self._write_json_atomic(state_path, state)
+
+    def record_pre_cache_failure(self, job_code: str, cache_error: str) -> None:
+        """Compatibility wrapper for callers that fail before cache creation."""
+        self.record_cache_failure(job_code, cache_error)
 
     def has_pre_cache_failure(self, job_code: str) -> bool:
         safe_code = self._safe_component(job_code, "质检任务编号")

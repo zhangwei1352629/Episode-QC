@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 让 Episode-QC 在一个 Flow QC Job 内按 Episode 后台持续下载、校验和索引，并在整批完成前允许审核已就绪 Episode，且从不自动驱逐缓存。
+**Goal:** 让 Episode-QC 在一个 Flow QC Job 内按 Episode 后台持续下载、校验和索引，并在整批完成前允许审核已就绪 Episode；仅按已同步超过 24 小时的安全留存规则自动回收完整 Job 缓存。
 
 **Architecture:** `QualityCacheManager` 将完整 Asset manifest 验证与逐 Episode 文件计划分离，在已持久化的 Job 状态中记录每个 Episode 的下载/校验进度。Web 层在每条 Episode 就绪时增量扫描并保存映射；Flow 保持 `in_progress` 状态同时接收后续缓存进度，避免正在审核的任务被回退为 `caching`。
 
@@ -13,7 +13,7 @@
 - Flow Job 仍按 Asset 领取、按 Job 覆盖 Episode 集合提交；提交必须包含全部且仅包含这些 Episode。
 - 始终校验完整 `asset_manifest` 与 NAS `asset_manifest.json`，但只逐条处理 Job 覆盖的 Episode。
 - 每个文件使用 `.partial` 续传并在 Episode 进入 `ready` 前完成 SHA-256 校验。
-- 不自动调用 `evict()`、`evict_expired()` 或删除任何已验证缓存；不改 DataCollector、NAS 布局或 QC 结果发布协议。
+- 后台缓存不直接删除任何缓存；Web 生命周期与每个 Episode 磁盘检查调用统一 `evict_expired()`，且其只删除已同步超过 24 小时的 `ready` Job；不改 DataCollector、NAS 布局或 QC 结果发布协议。
 - 仅在 Job 的所有 Episode 都缓存就绪且都已完成本地审核时提交结果。
 - 直接在用户明确授权的 `Episode-QC/master` 与 `Episode-Flow/main` 修改；保留各仓库已有未跟踪文件。
 
@@ -162,7 +162,7 @@ Expected: FAIL，因为当前 Web 层只在 `cache_job()` 完成后扫描、映�
 
 - [x] **Step 4: 移除自动驱逐并调整任务中心动作**
 
-删除 `WebApplication` 对 `PlatformCacheCleanupLoop` 的启动和关闭调用，移除 `cache_job()` 开始时调用 `evict_expired()` 的逻辑。渲染器优先处理 `local_task_id`：即使 `local_caching` 为真也显示“打开任务”；进度文案显示 `已缓存 N/M` 和累计百分比。保留已有显式 CLI 清理命令，不从任何后台路径调用它。
+保留渲染器优先处理 `local_task_id`：即使 `local_caching` 为真也显示“打开任务”；进度文案显示 `已缓存 N/M` 和累计百分比。Web 生命周期和每个 Episode 的磁盘检查由 2026-08-13 自动清理恢复方案负责安全回收；保留已有显式 CLI 清理命令。
 
 - [x] **Step 5: 验证 GREEN**
 

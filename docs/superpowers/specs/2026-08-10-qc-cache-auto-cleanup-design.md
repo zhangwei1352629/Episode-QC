@@ -1,7 +1,7 @@
 # QC 本地缓存定期自动清理设计
 
 **日期：** 2026-08-10  
-**状态：** 已实施，已验证  
+**状态：** 已恢复，已验证（2026-08-13）  
 **范围：** Episode-QC 本地平台资产缓存（`platform-cache`）
 
 ## 目标
@@ -12,7 +12,7 @@
 
 ## 现状
 
-`QualityCacheManager.evict(job_code)` 已要求缓存状态文件 `.qc-cache.json` 的 `result_synced` 为真，才允许删除 `ready/<job_code>`。但用户必须手工执行 `episode-qc platform-evict`，长期运行的 QC 工作站会积累已同步的完整资产。
+`QualityCacheManager.evict(job_code)` 要求缓存状态文件 `.qc-cache.json` 的 `result_synced` 为真，才允许删除 `ready/<job_code>`。2026-08-13 已恢复 Web 服务启动、每小时和每个 Episode 磁盘检查前的自动过期回收；`episode-qc platform-evict` 仍保留为人工运维入口。
 
 缓存布局如下：
 
@@ -106,4 +106,3 @@ QC Web 服务在 `serve_web_app()` 生命周期中创建一个仅管理该工作
 ## 实施验证
 
 - 2026-08-10 执行 `./scripts/test-all.sh`：Python 77 项通过；前端 Node 测试 18 项通过。
-

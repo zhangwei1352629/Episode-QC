@@ -1,5 +1,7 @@
 # QC 自动缓存清理恢复 Implementation Plan
 
+**状态：** 已实施，本机验证通过（2026-08-13）。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 安全恢复 Episode-QC Web 服务的过期平台缓存自动清理，并在下载每个 Episode 前回收已同步且超过 24 小时的缓存。

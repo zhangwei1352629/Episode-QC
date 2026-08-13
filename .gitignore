@@ -8,6 +8,7 @@ build/
 coverage/
 .episode-qc/
 .pytest_cache/
+.worktrees/
 __pycache__/
 *.pyc
 

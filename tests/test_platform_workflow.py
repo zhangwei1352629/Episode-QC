@@ -205,6 +205,100 @@ class FakeFlowClient:
         return {**self.job, "status": "completed", "submitted": values}
 
 
+def test_pending_result_replays_its_original_legacy_label_reference(tmp_path: Path):
+    """An upgrade must not rewrite facts that were already staged for retry."""
+
+    job = {
+        "code": "QCJ-LEGACY-RETRY-001",
+        "asset_id": "AST-LEGACY-RETRY-001",
+        "episodes": [{"episode_id": "AST-LEGACY-RETRY-001-EP0001"}],
+        "next_attempt": 1,
+        "result_upload_uri": str(
+            tmp_path
+            / "nas"
+            / "qc-results"
+            / "AST-LEGACY-RETRY-001"
+            / "QCJ-LEGACY-RETRY-001"
+        ),
+    }
+    cache = QualityCacheManager(tmp_path / "qc-cache", reserve_bytes=0)
+    ready = cache.cache_root / "ready" / job["code"]
+    ready.mkdir(parents=True)
+    pending_root = cache.cache_root / "results-pending" / job["code"]
+    pending_root.mkdir(parents=True)
+    legacy_hash = "a" * 64
+    result_document = {
+        "schema_version": 2,
+        "result_id": "QCR-LEGACY-RETRY-001",
+        "job_code": job["code"],
+        "asset_id": job["asset_id"],
+        "attempt": 1,
+        "source_manifest_sha256": "b" * 64,
+        "label_set": {
+            "label_set_id": "task-quality-v1",
+            "label_schema_version": "1.0.0",
+            "label_schema_hash": legacy_hash,
+        },
+        "episode_results": [
+            {
+                "episode_id": "AST-LEGACY-RETRY-001-EP0001",
+                "decision": "pass",
+                "annotation_count": 0,
+                "annotations": [],
+                "result": {"preserve": "legacy"},
+            }
+        ],
+        "result": {"preserve": "legacy"},
+    }
+    local_result = pending_root / "qc_result.json"
+    encoded = (json.dumps(result_document, ensure_ascii=False, indent=2) + "\n").encode(
+        "utf-8"
+    )
+    local_result.write_bytes(encoded)
+    result_sha256 = hashlib.sha256(encoded).hexdigest()
+    (ready / ".qc-cache.json").write_text(
+        json.dumps(
+            {
+                "asset_id": job["asset_id"],
+                "asset_manifest_sha256": "b" * 64,
+                "pending_result": {
+                    "result_id": result_document["result_id"],
+                    "result_sha256": result_sha256,
+                    "attempt": 1,
+                    "created_at": "2026-08-13T00:00:00+00:00",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    client = FakeFlowClient(job)
+    current_job = {
+        **job,
+        "label_set_id": "task-quality-v1",
+        "label_schema_version": "1.0.0",
+        "label_schema_hash": "c" * 64,
+    }
+
+    response = cache.submit_result(
+        client,
+        current_job,
+        episode_results=[
+            {
+                "episode_id": "AST-LEGACY-RETRY-001-EP0001",
+                "decision": "discard",
+                "annotation_count": 0,
+                "annotations": [],
+            }
+        ],
+        result={"must_not": "replace pending result"},
+    )
+
+    assert response["status"] == "completed"
+    assert client.results[0]["label_set"]["label_schema_hash"] == legacy_hash
+    assert client.results[0]["episode_results"] == result_document["episode_results"]
+    assert client.results[0]["result"] == result_document["result"]
+
+
 def test_cache_job_verifies_each_cached_file_once_and_reports_file_progress(
     tmp_path: Path, monkeypatch
 ):

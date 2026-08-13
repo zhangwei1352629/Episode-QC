@@ -23,6 +23,7 @@ from episode_qc.playback import (
 )
 from episode_qc.platform_workflow import canonical_json_sha256
 from episode_qc.workspace import (
+    _activate_label_schema,
     activate_label_set,
     clear_local_task_history,
     delete_label_set,
@@ -88,6 +89,54 @@ def test_flow_label_schema_rejects_snapshot_hash_mismatch(tmp_path: Path):
     assert imported is not None
     assert imported["source_hash"] == job["label_schema_hash"]
     assert workspace_state(db_path)["label_schema"]["labels"][0]["name"] == "相机遮挡"
+
+
+def test_flow_label_schema_upgrades_matching_legacy_local_digest(tmp_path: Path):
+    schema = {
+        "schema": {
+            "schema_type": "annotation_label_schema",
+            "schema_version": "1.0.0",
+            "label_set_id": "flow_task_quality",
+            "label_set_name": "Flow 任务标签",
+            "language": "zh-CN",
+        },
+        "severity_levels": [],
+        "actions": [],
+        "groups": [{"code": "quality", "name": "质量", "order": 1}],
+        "labels": [
+            {
+                "code": "camera_occlusion",
+                "name": "相机遮挡",
+                "group": "quality",
+                "enabled": True,
+                "annotation_scopes": ["episode"],
+                "target_types": ["global"],
+                "fields": [],
+            }
+        ],
+    }
+    job = {
+        "label_set_id": "flow_task_quality",
+        "label_schema_version": "1.0.0",
+        "label_schema_hash": canonical_json_sha256(schema),
+        "label_schema": schema,
+    }
+    db_path = tmp_path / "workspace.db"
+    initialize_workspace(db_path)
+
+    # A workstation upgraded from the former Flow contract may already have
+    # this exact immutable schema recorded under the old declared digest.
+    _activate_label_schema(
+        db_path,
+        schema,
+        source_format="flow",
+        source_hash="a" * 64,
+    )
+
+    imported = import_flow_label_schema(db_path, job)
+
+    assert imported is not None
+    assert imported["source_hash"] == job["label_schema_hash"]
 
 
 def test_v1_import_playback_annotation_and_export_round_trip(tmp_path: Path):

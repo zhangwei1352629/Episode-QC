@@ -453,7 +453,51 @@ class QualityCacheManager:
         state = json.loads(state_path.read_text(encoding="utf-8"))
         if state.get("asset_id") != job.get("asset_id"):
             raise QualityCacheError("本地缓存与质检任务的数据资产不一致")
-        label_set, episode_results = build_quality_fact_submission(job, episode_results)
+        pending_result = state.get("pending_result") or {}
+        local_results = self.cache_root / "results-pending" / job_code
+        local_result = local_results / "qc_result.json"
+        if pending_result:
+            if not local_result.is_file():
+                raise QualityCacheError("待同步质检结果文件缺失，禁止重建或覆盖")
+            try:
+                result_document = json.loads(local_result.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise QualityCacheError("待同步质检结果文件无法读取，禁止重建或覆盖") from exc
+            if not isinstance(result_document, dict):
+                raise QualityCacheError("待同步质检结果格式无效，禁止重建或覆盖")
+            result_id = str(result_document.get("result_id") or "")
+            if (
+                not result_id
+                or result_id != str(pending_result.get("result_id") or "")
+                or result_document.get("job_code") != job_code
+                or result_document.get("asset_id") != job.get("asset_id")
+            ):
+                raise QualityCacheError("待同步质检结果与当前任务不一致，禁止重建或覆盖")
+            try:
+                attempt = int(result_document.get("attempt"))
+            except (TypeError, ValueError) as exc:
+                raise QualityCacheError("待同步质检结果缺少有效尝试序号") from exc
+            if attempt < 1 or attempt != int(pending_result.get("attempt") or attempt):
+                raise QualityCacheError("待同步质检结果尝试序号不一致，禁止重建或覆盖")
+            result_sha256 = sha256_file(local_result)
+            if result_sha256 != str(pending_result.get("result_sha256") or ""):
+                raise QualityCacheError("待同步质检结果 SHA-256 不一致，禁止重建或覆盖")
+            episode_results = result_document.get("episode_results")
+            label_set = result_document.get("label_set")
+            result_payload = result_document.get("result") or {}
+            if not isinstance(episode_results, list) or not isinstance(result_payload, dict):
+                raise QualityCacheError("待同步质检结果格式无效，禁止重建或覆盖")
+            if label_set is not None and not isinstance(label_set, dict):
+                raise QualityCacheError("待同步质检标签库引用格式无效，禁止重建或覆盖")
+            created_at = str(pending_result.get("created_at") or "")
+            if not created_at:
+                raise QualityCacheError("待同步质检结果缺少创建时间，禁止重建或覆盖")
+        else:
+            label_set, episode_results = build_quality_fact_submission(job, episode_results)
+            result_id = f"QCR-{uuid.uuid4().hex}"
+            attempt = int(state.get("next_attempt") or job.get("next_attempt") or 1)
+            created_at = datetime.now(timezone.utc).isoformat()
+            result_payload = result or {}
         expected_ids = {item["episode_id"] for item in job.get("episodes", [])}
         submitted_ids = {item.get("episode_id") for item in episode_results}
         if len(submitted_ids) != len(episode_results) or submitted_ids != expected_ids:
@@ -467,46 +511,30 @@ class QualityCacheManager:
                 raise QualityCacheError(f"不支持的质量等级：{quality_grade}")
             if int(episode_result.get("annotation_count") or 0) < 0:
                 raise QualityCacheError("标注数量不能为负数")
-        normalized_results = [
-            {
-                **item,
-                "decision": DECISION_MAP[item["decision"]],
-                "annotation_count": int(item.get("annotation_count") or 0),
+        if not pending_result:
+            normalized_results = [
+                {
+                    **item,
+                    "decision": DECISION_MAP[item["decision"]],
+                    "annotation_count": int(item.get("annotation_count") or 0),
+                }
+                for item in episode_results
+            ]
+            result_document = {
+                "schema_version": 2,
+                "result_id": result_id,
+                "job_code": job_code,
+                "asset_id": job["asset_id"],
+                "attempt": attempt,
+                "source_manifest_sha256": state.get("asset_manifest_sha256", ""),
+                "episode_results": normalized_results,
+                "result": result_payload,
             }
-            for item in episode_results
-        ]
-        pending_result = state.get("pending_result") or {}
-        result_id = str(pending_result.get("result_id") or f"QCR-{uuid.uuid4().hex}")
-        attempt = int(state.get("next_attempt") or job.get("next_attempt") or 1)
-        created_at = str(
-            pending_result.get("created_at")
-            or datetime.now(timezone.utc).isoformat()
-        )
-        result_document = {
-            "schema_version": 2,
-            "result_id": result_id,
-            "job_code": job_code,
-            "asset_id": job["asset_id"],
-            "attempt": attempt,
-            "source_manifest_sha256": state.get("asset_manifest_sha256", ""),
-            "episode_results": normalized_results,
-            "result": result or {},
-        }
-        if label_set is not None:
-            result_document["label_set"] = label_set
-        local_results = self.cache_root / "results-pending" / job_code
-        local_results.mkdir(parents=True, exist_ok=True)
-        local_result = local_results / "qc_result.json"
-        encoded_result = (
-            json.dumps(result_document, ensure_ascii=False, indent=2) + "\n"
-        ).encode("utf-8")
-        result_sha256 = hashlib.sha256(encoded_result).hexdigest()
-        if pending_result and (
-            pending_result.get("result_id") != result_id
-            or pending_result.get("result_sha256") != result_sha256
-        ):
-            raise QualityCacheError("已有待同步质检结果且内容不同，禁止覆盖")
-        self._write_json_atomic(local_result, result_document)
+            if label_set is not None:
+                result_document["label_set"] = label_set
+            local_results.mkdir(parents=True, exist_ok=True)
+            self._write_json_atomic(local_result, result_document)
+            result_sha256 = sha256_file(local_result)
         result_manifest = {
             "schema_version": 1,
             "result_id": result_id,
@@ -514,7 +542,9 @@ class QualityCacheManager:
             "job_code": job_code,
             "asset_id": job["asset_id"],
             "attempt": attempt,
-            "source_manifest_sha256": state.get("asset_manifest_sha256", ""),
+            "source_manifest_sha256": result_document.get(
+                "source_manifest_sha256", state.get("asset_manifest_sha256", "")
+            ),
             "created_at": created_at,
             "files": [
                 {
@@ -543,7 +573,7 @@ class QualityCacheManager:
             job_code,
             episode_results=episode_results,
             label_set=label_set,
-            result=result or {},
+            result=result_payload,
             result_nas_path=result_nas_path,
             result_id=result_id,
             result_sha256=result_sha256,

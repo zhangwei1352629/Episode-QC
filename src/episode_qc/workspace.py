@@ -1788,11 +1788,25 @@ def import_flow_label_schema(db_path: str | Path, job: dict) -> dict[str, object
         raise ValueError("Flow 任务标签库快照与冻结版本引用不一致")
     with connect_workspace(db_path) as connection:
         existing = connection.execute(
-            "SELECT source_hash FROM label_set WHERE label_set_key = ? AND version = ?",
+            """
+            SELECT source_hash, raw_schema_json
+            FROM label_set
+            WHERE label_set_key = ? AND version = ?
+            """,
             (supplied["label_set_id"], supplied["label_schema_version"]),
         ).fetchone()
     if existing and str(existing["source_hash"]).lower() != supplied["label_schema_hash"].lower():
-        raise ValueError("本地已有同版本但摘要不同的标签库，必须使用新的 schema_version")
+        try:
+            existing_schema = _normalize_label_schema(
+                json.loads(existing["raw_schema_json"]),
+                fallback_name=supplied["label_set_id"],
+            )
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                "本地已有同版本但摘要不同的标签库，必须使用新的 schema_version"
+            ) from exc
+        if canonical_json_sha256(existing_schema) != canonical_json_sha256(schema):
+            raise ValueError("本地已有同版本但摘要不同的标签库，必须使用新的 schema_version")
     _activate_label_schema(
         db_path,
         schema,

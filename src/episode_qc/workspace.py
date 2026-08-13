@@ -153,8 +153,22 @@ def initialize_workspace(
     reviewer_name: str = "",
 ) -> dict[str, object]:
     with connect_workspace(db_path) as connection:
-        connection.executescript(
-            """
+        return _initialize_workspace(
+            connection,
+            name=name,
+            reviewer_name=reviewer_name,
+        )
+
+
+def _initialize_workspace(
+    connection: sqlite3.Connection,
+    *,
+    name: str = "Mocap QC 工作区",
+    reviewer_name: str = "",
+) -> dict[str, object]:
+    _execute_schema_statements(
+        connection,
+        """
             CREATE TABLE IF NOT EXISTS workspace (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
@@ -332,27 +346,39 @@ def initialize_workspace(
             CREATE INDEX IF NOT EXISTS idx_annotation_episode ON annotation(episode_id, start_offset_ns);
             CREATE INDEX IF NOT EXISTS idx_annotation_label ON annotation(label_code);
             CREATE INDEX IF NOT EXISTS idx_change_session ON change_log(session_id, id);
-            """
-        )
-        _ensure_column(connection, "data_source", "task_id", "TEXT REFERENCES qc_task(id)")
-        _ensure_column(connection, "qc_task", "source_type", "TEXT NOT NULL DEFAULT 'server_path'")
-        row = connection.execute("SELECT * FROM workspace LIMIT 1").fetchone()
-        if row is None:
-            workspace_id = _new_id("ws")
-            now = _now()
-            connection.execute(
-                "INSERT INTO workspace VALUES (?, ?, ?, NULL, '{}', ?, ?, ?)",
-                (workspace_id, name, reviewer_name, SCHEMA_VERSION, now, now),
-            )
-        _migrate_data_sources_to_tasks(connection)
-        _upgrade_inferred_platform_tasks(connection)
-        _migrate_last_episode_to_task(connection)
+            """,
+    )
+    _ensure_column(connection, "data_source", "task_id", "TEXT REFERENCES qc_task(id)")
+    _ensure_column(connection, "qc_task", "source_type", "TEXT NOT NULL DEFAULT 'server_path'")
+    row = connection.execute("SELECT * FROM workspace LIMIT 1").fetchone()
+    if row is None:
+        workspace_id = _new_id("ws")
+        now = _now()
         connection.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_data_source_task ON data_source(task_id) WHERE task_id IS NOT NULL"
+            "INSERT INTO workspace VALUES (?, ?, ?, NULL, '{}', ?, ?, ?)",
+            (workspace_id, name, reviewer_name, SCHEMA_VERSION, now, now),
         )
-        connection.execute("UPDATE workspace SET schema_version = ?", (SCHEMA_VERSION,))
-        row = connection.execute("SELECT * FROM workspace LIMIT 1").fetchone()
-        return dict(row)
+    _migrate_data_sources_to_tasks(connection)
+    _upgrade_inferred_platform_tasks(connection)
+    _migrate_last_episode_to_task(connection)
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_data_source_task ON data_source(task_id) WHERE task_id IS NOT NULL"
+    )
+    connection.execute("UPDATE workspace SET schema_version = ?", (SCHEMA_VERSION,))
+    row = connection.execute("SELECT * FROM workspace LIMIT 1").fetchone()
+    return dict(row)
+
+
+def _execute_schema_statements(connection: sqlite3.Connection, script: str) -> None:
+    statement = ""
+    for line in script.splitlines(keepends=True):
+        statement += line
+        if sqlite3.complete_statement(statement):
+            if statement.strip():
+                connection.execute(statement)
+            statement = ""
+    if statement.strip():
+        raise ValueError("工作区 schema SQL 不完整")
 
 
 def _ensure_column(
@@ -1853,8 +1879,9 @@ def install_flow_label_schema(
     ):
         raise ValueError("Flow 标签快照与任务引用不一致")
 
-    initialize_workspace(db_path)
     with connect_workspace(db_path) as connection:
+        connection.execute("BEGIN")
+        _initialize_workspace(connection)
         existing = connection.execute(
             """
             SELECT id, source_hash, raw_schema_json FROM label_set

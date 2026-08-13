@@ -152,6 +152,32 @@ def test_flow_label_schema_rejects_matching_content_with_different_stored_source
     assert _label_set_storage_state(db_path)["active_id"] == before["active_id"]
 
 
+def test_flow_label_schema_conflict_rolls_back_workspace_initialization(tmp_path: Path):
+    db_path = tmp_path / "workspace.db"
+    local_path = tmp_path / "local-labels.yaml"
+    local_path.write_text(yaml.safe_dump(FLOW_SCHEMA, allow_unicode=True), encoding="utf-8")
+    import_label_schema(db_path, local_path)
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("ALTER TABLE qc_task DROP COLUMN source_type")
+        connection.execute("UPDATE workspace SET schema_version = 0")
+    before = _label_set_storage_state(db_path)
+    before_task_columns = _table_columns(db_path, "qc_task")
+    flow_job = {
+        "label_set_id": "task-quality",
+        "label_schema_version": "1.0.0",
+        "label_schema": FLOW_SCHEMA,
+        "label_schema_hash": canonical_json_sha256(FLOW_SCHEMA),
+    }
+
+    assert before["workspace"][5] == 0
+    assert "source_type" not in before_task_columns
+    with pytest.raises(ValueError, match="同一标签集版本"):
+        install_flow_label_schema(db_path, flow_job)
+
+    assert _label_set_storage_state(db_path) == before
+    assert _table_columns(db_path, "qc_task") == before_task_columns
+
+
 @pytest.mark.parametrize(
     "missing_field",
     ("label_set_id", "label_schema_version", "label_schema_hash", "label_schema"),
@@ -844,6 +870,7 @@ def _write_label_schema(path: Path) -> Path:
 
 def _label_set_storage_state(db_path: Path) -> dict[str, object]:
     with sqlite3.connect(db_path) as connection:
+        workspace = connection.execute("SELECT * FROM workspace LIMIT 1").fetchone()
         label_set = connection.execute(
             "SELECT id, source_hash, enabled, raw_schema_json FROM label_set"
         ).fetchone()
@@ -854,6 +881,7 @@ def _label_set_storage_state(db_path: Path) -> dict[str, object]:
             "SELECT active_label_set_id FROM workspace LIMIT 1"
         ).fetchone()[0]
     return {
+        "workspace": workspace,
         "id": label_set[0],
         "source_hash": label_set[1],
         "enabled": label_set[2],
@@ -861,6 +889,11 @@ def _label_set_storage_state(db_path: Path) -> dict[str, object]:
         "definitions": definitions,
         "active_id": active_id,
     }
+
+
+def _table_columns(db_path: Path, table: str) -> tuple[str, ...]:
+    with sqlite3.connect(db_path) as connection:
+        return tuple(row[1] for row in connection.execute(f"PRAGMA table_info({table})"))
 
 
 def _jpeg(index: int) -> bytes:

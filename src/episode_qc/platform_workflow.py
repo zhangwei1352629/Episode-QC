@@ -426,6 +426,7 @@ class QualityCacheManager:
                 episode_ready = False
                 for retry in range(3):
                     try:
+                        self.evict_expired()
                         self._ensure_disk_space(
                             sum(int(item["size_bytes"]) for item in episode_files)
                         )

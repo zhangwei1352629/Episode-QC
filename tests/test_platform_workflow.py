@@ -1076,7 +1076,7 @@ def test_evict_expired_keeps_nonobject_state_and_download_partial(tmp_path: Path
     assert malformed.is_dir()
     assert partial.is_dir()
 
-def test_cache_job_does_not_evict_existing_caches_before_checking_episode_disk_space(tmp_path: Path, monkeypatch):
+def test_cache_job_evicts_expired_caches_before_checking_episode_disk_space(tmp_path: Path, monkeypatch):
     asset_root = tmp_path / "nas" / "AST-003"
     source = asset_root / "episodes" / "episode_000001"
     source.mkdir(parents=True)
@@ -1110,7 +1110,7 @@ def test_cache_job_does_not_evict_existing_caches_before_checking_episode_disk_s
 
     manager.cache_job(FakeFlowClient(job), job)
 
-    assert calls == ["ensure_disk_space"]
+    assert calls == ["evict_expired", "ensure_disk_space"]
 
 def test_cache_rejects_wrong_manifest_checksum(tmp_path: Path):
     asset_root = tmp_path / "nas" / "AST-002"

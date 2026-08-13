@@ -264,6 +264,32 @@ Frame Time: 0.010000
         "asset_file_count": 2,
         "task_code": "TASK-WEB-001",
         "task_name": "Web Flow 领取测试",
+        "label_set_id": "task-quality-v1",
+        "label_schema_version": "1.0.0",
+        "label_schema_hash": "a" * 64,
+        "label_schema": {
+            "schema": {
+                "schema_type": "annotation_label_schema",
+                "schema_version": "1.0.0",
+                "label_set_id": "task-quality-v1",
+                "label_set_name": "任务质检标签",
+                "language": "zh-CN",
+            },
+            "severity_levels": [],
+            "actions": [],
+            "groups": [{"code": "quality", "name": "质量", "order": 1}],
+            "labels": [
+                {
+                    "code": "person_interruption",
+                    "name": "人员进入画面",
+                    "group": "quality",
+                    "enabled": True,
+                    "annotation_scopes": ["episode"],
+                    "target_types": ["global"],
+                    "fields": [],
+                }
+            ],
+        },
         "collector": "采集测试员",
         "reviewer_name": "",
         "source_uri": str(source),
@@ -392,6 +418,8 @@ Frame Time: 0.010000
         assert status == 200
         assert state["selected_task"]["origin"] == "flow"
         assert state["selected_task"]["flow_job_code"] == job["code"]
+        assert state["label_schema"]["schema"]["label_set_id"] == "task-quality-v1"
+        assert state["label_schema"]["schema"]["schema_version"] == "1.0.0"
         local_episode_id = state["episodes"][0]["id"]
 
         status, reviewed = request_json(
@@ -413,6 +441,13 @@ Frame Time: 0.010000
         assert status == 200
         assert submitted["job"]["status"] == "completed"
         assert submitted["local_task"]["status"] == "submitted"
+        assert job["submitted"]["label_set"] == {
+            "label_set_id": "task-quality-v1",
+            "label_schema_version": "1.0.0",
+            "label_schema_hash": "a" * 64,
+        }
+        assert job["submitted"]["episode_results"][0]["annotations"] == []
+        assert "annotations" not in job["submitted"]["episode_results"][0]["result"]
         assert (
             Path(job["result_upload_uri"])
             / "attempt-0001"

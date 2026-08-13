@@ -36,6 +36,60 @@ def test_flow_client_preserves_drf_list_error_message():
         client.request("POST", "/api/v1/qc/jobs/QCJ-001/work", {})
 
 
+def test_flow_client_sends_task_label_snapshot_and_direct_annotations():
+    client = FlowClient("http://flow.test")
+    client.request = Mock(return_value={"status": "completed"})
+
+    client.submit_result(
+        "QCJ-001",
+        label_set={
+            "label_set_id": "task-quality-v1",
+            "label_schema_version": "1.0.0",
+            "label_schema_hash": "a" * 64,
+        },
+        episode_results=[
+            {
+                "episode_id": "EP-001",
+                "decision": "pass_with_labels",
+                "annotation_count": 1,
+                "annotations": [
+                    {
+                        "annotation_id": "ann-local-001",
+                        "label_code": "camera_occlusion",
+                        "scope": "time_range",
+                        "start_offset_ns": 10,
+                        "end_offset_ns": 20,
+                        "target_type": "camera",
+                        "target_key": "front",
+                        "severity": "normal",
+                        "action": "keep_with_label",
+                        "comment": "遮挡",
+                        "attributes": {"source": "qc"},
+                    }
+                ],
+            }
+        ],
+    )
+
+    payload = client.request.call_args.args[2]
+    assert payload["label_set"]["label_set_id"] == "task-quality-v1"
+    assert payload["episode_results"][0]["annotations"] == [
+        {
+            "id": "ann-local-001",
+            "label_code": "camera_occlusion",
+            "scope": "time_range",
+            "start_offset_ns": 10,
+            "end_offset_ns": 20,
+            "target_type": "camera",
+            "target_key": "front",
+            "severity": "normal",
+            "action": "keep_with_label",
+            "comment": "遮挡",
+            "attributes": {"source": "qc"},
+        }
+    ]
+
+
 def test_atomic_json_writer_uses_platform_independent_lf(tmp_path: Path):
     target = tmp_path / "result.json"
     QualityCacheManager._write_json_atomic(target, {"name": "测试"})
@@ -248,6 +302,9 @@ def test_flow_job_is_fully_cached_verified_submitted_and_safely_evicted(tmp_path
         "asset_size_bytes": 0,
         "asset_nas_uri": str(asset_root),
         "source_uri": str(asset_root),
+        "label_set_id": "task-quality-v1",
+        "label_schema_version": "1.0.0",
+        "label_schema_hash": "a" * 64,
         "episodes": [
             {
                 "episode_id": "AST-001-EP0001",
@@ -307,6 +364,30 @@ def test_flow_job_is_fully_cached_verified_submitted_and_safely_evicted(tmp_path
                 "decision": "pass_with_labels",
                 "quality_grade": "good",
                 "annotation_count": 2,
+                "annotations": [
+                    {
+                        "annotation_id": "ann-001",
+                        "label_set_key": "task-quality-v1",
+                        "label_schema_version": "1.0.0",
+                        "label_code": "minor_jitter",
+                        "scope": "episode",
+                        "start_offset_ns": 0,
+                        "end_offset_ns": 0,
+                        "target_type": "global",
+                        "attributes": {},
+                    },
+                    {
+                        "annotation_id": "ann-002",
+                        "label_set_key": "task-quality-v1",
+                        "label_schema_version": "1.0.0",
+                        "label_code": "minor_jitter",
+                        "scope": "episode",
+                        "start_offset_ns": 0,
+                        "end_offset_ns": 0,
+                        "target_type": "global",
+                        "attributes": {},
+                    },
+                ],
                 "result": {"labels": ["minor_jitter"]},
             },
             {
@@ -314,6 +395,19 @@ def test_flow_job_is_fully_cached_verified_submitted_and_safely_evicted(tmp_path
                 "decision": "reject",
                 "quality_grade": "invalid",
                 "annotation_count": 1,
+                "annotations": [
+                    {
+                        "annotation_id": "ann-003",
+                        "label_set_key": "task-quality-v1",
+                        "label_schema_version": "1.0.0",
+                        "label_code": "minor_jitter",
+                        "scope": "episode",
+                        "start_offset_ns": 0,
+                        "end_offset_ns": 0,
+                        "target_type": "global",
+                        "attributes": {},
+                    }
+                ],
             },
         ],
         result={"reviewed_episode_count": 2},
@@ -336,6 +430,13 @@ def test_flow_job_is_fully_cached_verified_submitted_and_safely_evicted(tmp_path
     assert client.results[0]["result_manifest"]["result_sha256"] == client.results[0][
         "result_sha256"
     ]
+    assert client.results[0]["label_set"] == {
+        "label_set_id": "task-quality-v1",
+        "label_schema_version": "1.0.0",
+        "label_schema_hash": "a" * 64,
+    }
+    assert client.results[0]["episode_results"][0]["annotations"][0]["id"] == "ann-001"
+    assert "annotations" not in client.results[0]["episode_results"][0]["result"]
     assert (result_path.parent / "result_manifest.json").is_file()
     assert not any(Path(job["result_staging_uri"]).glob("*.partial"))
     state = json.loads(

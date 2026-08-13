@@ -17,6 +17,7 @@ from episode_qc.workspace import (
     delete_annotation,
     episode_detail,
     export_workspace,
+    import_flow_label_schema,
     import_label_schema,
     initialize_workspace,
     preview_label_schema,
@@ -761,6 +762,7 @@ def _cmd_platform_cache(args: argparse.Namespace) -> int:
         reserve_bytes=max(0, int(args.reserve_gb * 1024**3)),
     )
     cached = manager.cache_job(client, job)
+    import_flow_label_schema(args.workspace_db, job)
     indexed = scan_data_source(
         args.workspace_db,
         cached["cache_dir"],
@@ -854,11 +856,11 @@ def _cmd_platform_submit(args: argparse.Namespace) -> int:
             "episode_id": mapping["episode_id"],
             "decision": decision,
             "annotation_count": int(local_episode.get("annotation_count") or 0),
+            "annotations": detail["annotations"],
             "result": {
                 "local_episode_id": local_episode_id,
                 "review_status": local_episode.get("review_status"),
                 "reviewer_name": local_episode.get("reviewer_name"),
-                "annotations": detail["annotations"],
             },
         }
         if args.quality_grade:

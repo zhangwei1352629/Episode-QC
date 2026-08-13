@@ -43,6 +43,92 @@ class QualityCacheError(RuntimeError):
     pass
 
 
+_FLOW_LABEL_REFERENCE_FIELDS = (
+    "label_set_id",
+    "label_schema_version",
+    "label_schema_hash",
+)
+_FLOW_ANNOTATION_FIELDS = (
+    "label_code",
+    "scope",
+    "start_offset_ns",
+    "end_offset_ns",
+    "target_type",
+    "target_key",
+    "severity",
+    "action",
+    "comment",
+    "attributes",
+)
+_FLOW_OPTIONAL_ANNOTATION_TEXT_FIELDS = {
+    "target_key",
+    "severity",
+    "action",
+    "comment",
+}
+
+
+def normalize_flow_annotation(annotation: dict) -> dict:
+    """Translate one QC workspace annotation to Flow's public fact contract."""
+
+    if not isinstance(annotation, dict):
+        raise QualityCacheError("标注必须是对象")
+    normalized = {
+        field: annotation[field]
+        for field in _FLOW_ANNOTATION_FIELDS
+        if field in annotation
+    }
+    annotation_id = annotation.get("annotation_id", annotation.get("id"))
+    if annotation_id is not None:
+        normalized["id"] = str(annotation_id)
+    for field in _FLOW_OPTIONAL_ANNOTATION_TEXT_FIELDS:
+        if field in normalized and normalized[field] is None:
+            normalized[field] = ""
+    return normalized
+
+
+def build_quality_fact_submission(job: dict, episode_results: list[dict]) -> tuple[dict | None, list[dict]]:
+    """Return Flow fact fields, refusing local labels that are not task snapshots."""
+
+    has_annotations = any("annotations" in item for item in episode_results)
+    if not has_annotations:
+        return None, [dict(item) for item in episode_results]
+    missing_reference = [
+        field for field in _FLOW_LABEL_REFERENCE_FIELDS if not str(job.get(field) or "").strip()
+    ]
+    if missing_reference:
+        raise QualityCacheError(
+            "Flow 质检任务缺少冻结标签库引用，不能提交标注："
+            + "、".join(missing_reference)
+        )
+    label_set = {field: str(job[field]).strip() for field in _FLOW_LABEL_REFERENCE_FIELDS}
+    normalized_results = []
+    for episode_result in episode_results:
+        normalized = dict(episode_result)
+        if "annotations" not in normalized:
+            raise QualityCacheError("版本化标签提交必须为每个 Episode 提供 annotations")
+        annotations = normalized["annotations"]
+        if not isinstance(annotations, list):
+            raise QualityCacheError("Episode annotations 必须是列表")
+        if int(normalized.get("annotation_count") or 0) != len(annotations):
+            raise QualityCacheError("annotation_count 必须等于 annotations 数量")
+        normalized_annotations = []
+        for annotation in annotations:
+            if not isinstance(annotation, dict):
+                raise QualityCacheError("标注必须是对象")
+            for field in ("label_set_key", "label_schema_version"):
+                expected = label_set[
+                    "label_set_id" if field == "label_set_key" else field
+                ]
+                actual = annotation.get(field)
+                if actual is not None and str(actual) != expected:
+                    raise QualityCacheError("本地标注标签库与 Flow 任务冻结版本不一致")
+            normalized_annotations.append(normalize_flow_annotation(annotation))
+        normalized["annotations"] = normalized_annotations
+        normalized_results.append(normalized)
+    return label_set, normalized_results
+
+
 def _api_error_message(value: object) -> str:
     """Flatten DRF error payloads without assuming the payload is an object."""
 
@@ -146,6 +232,7 @@ class FlowClient:
         job_code: str,
         *,
         episode_results: list[dict],
+        label_set: dict | None = None,
         result: dict | None = None,
         result_nas_path: str = "",
         result_id: str = "",
@@ -167,6 +254,13 @@ class FlowClient:
             }
             if episode_result.get("quality_grade"):
                 normalized["quality_grade"] = episode_result["quality_grade"]
+            if "annotations" in episode_result:
+                annotations = episode_result["annotations"]
+                if not isinstance(annotations, list):
+                    raise FlowClientError("Episode annotations 必须是列表")
+                normalized["annotations"] = [
+                    normalize_flow_annotation(annotation) for annotation in annotations
+                ]
             normalized_results.append(normalized)
         payload = {
             "episode_results": normalized_results,
@@ -176,6 +270,8 @@ class FlowClient:
             "result_sha256": result_sha256,
             "result_manifest": result_manifest or {},
         }
+        if label_set is not None:
+            payload["label_set"] = dict(label_set)
         return self.request("POST", f"/api/v1/qc/jobs/{job_code}/result", payload)
 
 
@@ -357,6 +453,7 @@ class QualityCacheManager:
         state = json.loads(state_path.read_text(encoding="utf-8"))
         if state.get("asset_id") != job.get("asset_id"):
             raise QualityCacheError("本地缓存与质检任务的数据资产不一致")
+        label_set, episode_results = build_quality_fact_submission(job, episode_results)
         expected_ids = {item["episode_id"] for item in job.get("episodes", [])}
         submitted_ids = {item.get("episode_id") for item in episode_results}
         if len(submitted_ids) != len(episode_results) or submitted_ids != expected_ids:
@@ -395,6 +492,8 @@ class QualityCacheManager:
             "episode_results": normalized_results,
             "result": result or {},
         }
+        if label_set is not None:
+            result_document["label_set"] = label_set
         local_results = self.cache_root / "results-pending" / job_code
         local_results.mkdir(parents=True, exist_ok=True)
         local_result = local_results / "qc_result.json"
@@ -443,6 +542,7 @@ class QualityCacheManager:
         response = client.submit_result(
             job_code,
             episode_results=episode_results,
+            label_set=label_set,
             result=result or {},
             result_nas_path=result_nas_path,
             result_id=result_id,

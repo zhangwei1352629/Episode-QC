@@ -1745,6 +1745,71 @@ def import_label_schema(db_path: str | Path, schema_path: str | Path) -> dict[st
     if not preview["valid"]:
         raise ValueError("标签库校验失败: " + "; ".join(preview["errors"]))
     schema = preview["schema"]
+    _activate_label_schema(
+        db_path,
+        schema,
+        source_format=str(preview["source_format"]),
+        source_hash=str(preview["source_hash"]),
+    )
+    return {key: value for key, value in preview.items() if key != "schema"} | {"active": True}
+
+
+def import_flow_label_schema(db_path: str | Path, job: dict) -> dict[str, object] | None:
+    """Install the immutable task schema delivered with a Flow QC job."""
+
+    initialize_workspace(db_path)
+    reference_fields = (
+        "label_set_id",
+        "label_schema_version",
+        "label_schema_hash",
+    )
+    supplied = {field: str(job.get(field) or "").strip() for field in reference_fields}
+    if not any(supplied.values()):
+        return None
+    missing = [field for field, value in supplied.items() if not value]
+    if missing:
+        raise ValueError("Flow 质检任务的标签库引用不完整：" + "、".join(missing))
+    raw_schema = job.get("label_schema")
+    if not isinstance(raw_schema, dict):
+        raise ValueError("Flow 质检任务缺少冻结标签库快照")
+    schema = _normalize_label_schema(raw_schema, fallback_name=supplied["label_set_id"])
+    errors = validate_label_schema(schema)
+    if errors:
+        raise ValueError("Flow 任务标签库校验失败: " + "; ".join(errors))
+    header = schema["schema"]
+    if (
+        str(header["label_set_id"]) != supplied["label_set_id"]
+        or str(header["schema_version"]) != supplied["label_schema_version"]
+    ):
+        raise ValueError("Flow 任务标签库快照与冻结版本引用不一致")
+    with connect_workspace(db_path) as connection:
+        existing = connection.execute(
+            "SELECT source_hash FROM label_set WHERE label_set_key = ? AND version = ?",
+            (supplied["label_set_id"], supplied["label_schema_version"]),
+        ).fetchone()
+    if existing and str(existing["source_hash"]).lower() != supplied["label_schema_hash"].lower():
+        raise ValueError("本地已有同版本但摘要不同的标签库，必须使用新的 schema_version")
+    _activate_label_schema(
+        db_path,
+        schema,
+        source_format="flow",
+        source_hash=supplied["label_schema_hash"],
+    )
+    return {
+        "label_set_id": supplied["label_set_id"],
+        "version": supplied["label_schema_version"],
+        "source_hash": supplied["label_schema_hash"],
+        "active": True,
+    }
+
+
+def _activate_label_schema(
+    db_path: str | Path,
+    schema: dict[str, object],
+    *,
+    source_format: str,
+    source_hash: str,
+) -> None:
     header = schema["schema"]
     label_set_id = _stable_id("ls", header["label_set_id"], header["schema_version"])
     with connect_workspace(db_path) as connection:
@@ -1762,8 +1827,8 @@ def import_label_schema(db_path: str | Path, schema_path: str | Path) -> dict[st
                 header["label_set_name"],
                 header["schema_version"],
                 header.get("language", "zh-CN"),
-                preview["source_format"],
-                preview["source_hash"],
+                source_format,
+                source_hash,
                 _json(schema),
                 _now(),
             ),
@@ -1797,7 +1862,6 @@ def import_label_schema(db_path: str | Path, schema_path: str | Path) -> dict[st
                 ),
             )
         connection.execute("UPDATE workspace SET active_label_set_id = ?, updated_at = ?", (actual, _now()))
-    return {key: value for key, value in preview.items() if key != "schema"} | {"active": True}
 
 
 def _active_label_schema(connection: sqlite3.Connection) -> dict[str, object] | None:

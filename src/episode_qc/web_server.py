@@ -36,6 +36,7 @@ from episode_qc.workspace import (
     delete_annotation,
     episode_detail,
     export_workspace,
+    import_flow_label_schema,
     import_label_schema,
     activate_label_set,
     clear_local_task_history,
@@ -487,11 +488,11 @@ class EpisodeQcWebApplication:
                     "episode_id": mapping["episode_id"],
                     "decision": decision,
                     "annotation_count": int(episode.get("annotation_count") or 0),
+                    "annotations": detail["annotations"],
                     "result": {
                         "local_episode_id": mapping["local_episode_id"],
                         "review_status": episode.get("review_status"),
                         "reviewer_name": episode.get("reviewer_name"),
-                        "annotations": detail["annotations"],
                     },
                 }
             )
@@ -612,6 +613,7 @@ class EpisodeQcWebApplication:
         try:
             job = self._platform_job(client, job_code)
             cached = manager.cache_job(client, job, progress_callback=publish_progress)
+            import_flow_label_schema(self.paths.db_path, job)
             profile_path = (
                 self.paths.default_profile
                 if self.paths.default_profile.is_file()

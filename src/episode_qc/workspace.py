@@ -1857,14 +1857,17 @@ def install_flow_label_schema(
     with connect_workspace(db_path) as connection:
         existing = connection.execute(
             """
-            SELECT id, raw_schema_json FROM label_set
+            SELECT id, source_hash, raw_schema_json FROM label_set
             WHERE label_set_key = ? AND version = ?
             """,
             (label_set_key, version),
         ).fetchone()
         if existing is not None:
             existing_schema = _loads(existing["raw_schema_json"])
-            if canonical_json_sha256(existing_schema) != source_hash:
+            if (
+                str(existing["source_hash"]) != source_hash
+                or canonical_json_sha256(existing_schema) != source_hash
+            ):
                 raise ValueError("同一标签集版本已有不同的本地标签快照")
             actual = str(existing["id"])
             connection.execute("UPDATE label_set SET enabled = 1 WHERE id = ?", (actual,))

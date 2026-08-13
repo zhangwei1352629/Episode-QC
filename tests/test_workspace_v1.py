@@ -66,10 +66,13 @@ FLOW_SCHEMA = {
             "enabled": True,
             "annotation_scopes": ["episode"],
             "target_types": ["global"],
+            "description": "",
             "default_severity": "normal",
             "default_action": "keep",
             "shortcut": "W",
             "color": "#3377AA",
+            "applicable_profiles": [],
+            "fields": [],
         }
     ],
 }
@@ -121,6 +124,98 @@ def test_flow_label_schema_rejects_different_local_schema_at_same_version(tmp_pa
         install_flow_label_schema(db_path, flow_job)
 
     assert workspace_state(db_path)["label_schema"]["labels"][0]["code"] == "local_sway"
+
+
+def test_flow_label_schema_rejects_matching_content_with_different_stored_source_hash(
+    tmp_path: Path,
+):
+    db_path = tmp_path / "workspace.db"
+    local_path = tmp_path / "local-labels.yaml"
+    local_path.write_text(yaml.safe_dump(FLOW_SCHEMA, allow_unicode=True), encoding="utf-8")
+    import_label_schema(db_path, local_path)
+    before = _label_set_storage_state(db_path)
+    flow_job = {
+        "label_set_id": "task-quality",
+        "label_schema_version": "1.0.0",
+        "label_schema": FLOW_SCHEMA,
+        "label_schema_hash": canonical_json_sha256(FLOW_SCHEMA),
+    }
+
+    assert before["source_hash"] != flow_job["label_schema_hash"]
+    assert canonical_json_sha256(json.loads(before["raw_schema_json"])) == flow_job[
+        "label_schema_hash"
+    ]
+    with pytest.raises(ValueError, match="同一标签集版本"):
+        install_flow_label_schema(db_path, flow_job)
+
+    assert _label_set_storage_state(db_path) == before
+    assert _label_set_storage_state(db_path)["active_id"] == before["active_id"]
+
+
+@pytest.mark.parametrize(
+    "missing_field",
+    ("label_set_id", "label_schema_version", "label_schema_hash", "label_schema"),
+)
+def test_flow_label_schema_rejects_each_partial_reference_without_creating_workspace(
+    tmp_path: Path, missing_field: str
+):
+    db_path = tmp_path / "workspace.db"
+    flow_job = {
+        "label_set_id": "task-quality",
+        "label_schema_version": "1.0.0",
+        "label_schema": FLOW_SCHEMA,
+        "label_schema_hash": canonical_json_sha256(FLOW_SCHEMA),
+    }
+    del flow_job[missing_field]
+
+    with pytest.raises(ValueError, match="不完整"):
+        install_flow_label_schema(db_path, flow_job)
+
+    assert not db_path.exists()
+
+
+def test_flow_label_schema_rejects_bad_declared_hash_without_creating_workspace(tmp_path: Path):
+    db_path = tmp_path / "workspace.db"
+    flow_job = {
+        "label_set_id": "task-quality",
+        "label_schema_version": "1.0.0",
+        "label_schema": FLOW_SCHEMA,
+        "label_schema_hash": "0" * 64,
+    }
+
+    with pytest.raises(ValueError, match="摘要不匹配"):
+        install_flow_label_schema(db_path, flow_job)
+
+    assert not db_path.exists()
+
+
+def test_flow_label_schema_ignores_legacy_job_without_creating_workspace(tmp_path: Path):
+    db_path = tmp_path / "workspace.db"
+
+    assert install_flow_label_schema(db_path, {}) == {"active": False}
+
+    assert not db_path.exists()
+
+
+def test_flow_label_schema_content_conflict_leaves_local_storage_unchanged(tmp_path: Path):
+    db_path = tmp_path / "workspace.db"
+    local_schema = json.loads(json.dumps(FLOW_SCHEMA))
+    local_schema["labels"][0]["code"] = "local_sway"
+    local_path = tmp_path / "local-labels.yaml"
+    local_path.write_text(yaml.safe_dump(local_schema, allow_unicode=True), encoding="utf-8")
+    import_label_schema(db_path, local_path)
+    before = _label_set_storage_state(db_path)
+    flow_job = {
+        "label_set_id": "task-quality",
+        "label_schema_version": "1.0.0",
+        "label_schema": FLOW_SCHEMA,
+        "label_schema_hash": canonical_json_sha256(FLOW_SCHEMA),
+    }
+
+    with pytest.raises(ValueError, match="同一标签集版本"):
+        install_flow_label_schema(db_path, flow_job)
+
+    assert _label_set_storage_state(db_path) == before
 
 
 def test_v1_import_playback_annotation_and_export_round_trip(tmp_path: Path):
@@ -745,6 +840,27 @@ def _write_label_schema(path: Path) -> Path:
     }
     path.write_text(yaml.safe_dump(payload, allow_unicode=True, sort_keys=False), encoding="utf-8")
     return path
+
+
+def _label_set_storage_state(db_path: Path) -> dict[str, object]:
+    with sqlite3.connect(db_path) as connection:
+        label_set = connection.execute(
+            "SELECT id, source_hash, enabled, raw_schema_json FROM label_set"
+        ).fetchone()
+        definitions = connection.execute(
+            "SELECT * FROM label_definition ORDER BY id"
+        ).fetchall()
+        active_id = connection.execute(
+            "SELECT active_label_set_id FROM workspace LIMIT 1"
+        ).fetchone()[0]
+    return {
+        "id": label_set[0],
+        "source_hash": label_set[1],
+        "enabled": label_set[2],
+        "raw_schema_json": label_set[3],
+        "definitions": definitions,
+        "active_id": active_id,
+    }
 
 
 def _jpeg(index: int) -> bytes:

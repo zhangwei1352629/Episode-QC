@@ -18,7 +18,6 @@ from episode_qc.playback import ACTION_FRAME_ENCODING, MOTION_FRAME_ENCODING
 from episode_qc.platform_workflow import QualityCacheManager, canonical_json_sha256
 from episode_qc.web_server import (
     EpisodeQcRequestHandler,
-    PlatformCacheCleanupLoop,
     WebPaths,
     create_web_server,
     persistent_web_token,
@@ -67,26 +66,9 @@ def running_server(
         server.server_close()
 
 
-def test_platform_cache_cleanup_loop_runs_at_startup_and_stops():
-    calls = []
-    periodic = threading.Event()
-
-    class FakeManager:
-        def evict_expired(self):
-            calls.append("run")
-            if len(calls) == 2:
-                periodic.set()
-            return {"scanned_jobs": 1, "evicted_jobs": [], "skipped_jobs": [], "failed_jobs": [], "freed_bytes": 0}
-
-    loop = PlatformCacheCleanupLoop(lambda: FakeManager(), interval_seconds=0.01, log=lambda _: None)
-    loop.start()
-    assert periodic.wait(timeout=1)
-    loop.close()
-    assert not loop.is_running
-
-def test_web_application_starts_platform_cache_cleanup(tmp_path: Path):
+def test_web_application_does_not_start_an_automatic_platform_cache_cleanup(tmp_path: Path):
     with running_server(tmp_path) as (server, _):
-        assert server.application._platform_cache_cleanup.is_running
+        assert not hasattr(server.application, "_platform_cache_cleanup")
 
 def request_json(url: str, *, method: str = "GET", payload: dict[str, object] | None = None):
     body = None if payload is None else json.dumps(payload).encode("utf-8")
@@ -226,6 +208,283 @@ def test_platform_jobs_return_active_verification_progress_and_renderer_contract
     phase_marker = "local.phase === " + chr(34) + "verifying" + chr(34)
     assert phase_marker in renderer
     assert "校验 ${Number(local.verified_files || 0)}/${Number(local.total_files)} 个文件" in renderer
+    assert "job.local_caching || job.cache_complete === false" in renderer
+
+
+def test_platform_cache_indexes_ready_episode_while_job_still_caching(tmp_path: Path):
+    source = tmp_path / "nas" / "AST-WEB-PROGRESSIVE"
+    payload = b"""HIERARCHY
+ROOT Hips
+{
+  OFFSET 0 0 0
+  CHANNELS 6 Xposition Yposition Zposition Zrotation Yrotation Xrotation
+  End Site
+  {
+    OFFSET 0 10 0
+  }
+}
+MOTION
+Frames: 2
+Frame Time: 0.010000
+0 0 0 0 0 0
+1 0 0 0 0 0
+"""
+    episodes = []
+    for index in (1, 2):
+        relative_path = f"episodes/episode_{index:06d}"
+        primary = source / relative_path / "motion.bvh"
+        primary.parent.mkdir(parents=True, exist_ok=True)
+        primary.write_bytes(payload + str(index).encode("ascii"))
+        episodes.append(
+            {
+                "episode_id": f"AST-WEB-PROGRESSIVE-EP{index:04d}",
+                "relative_path": relative_path,
+                "primary_file": "motion.bvh",
+                "checksum_sha256": hashlib.sha256(primary.read_bytes()).hexdigest(),
+            }
+        )
+    job = {
+        "code": "QCJ-WEB-PROGRESSIVE",
+        "status": "pending",
+        "asset_id": "AST-WEB-PROGRESSIVE",
+        "task_name": "渐进缓存测试",
+        "source_uri": str(source),
+        "episodes": episodes,
+    }
+    first_ready = threading.Event()
+    continue_cache = threading.Event()
+    work_reports = []
+
+    class FakeFlowClient:
+        def jobs_response(self):
+            return {"reviewer": "Web 质检员", "jobs": [dict(job)]}
+
+        def jobs(self):
+            return [dict(job)]
+
+        def claim(self, job_code):
+            assert job_code == job["code"]
+            job["status"] = "claimed"
+            return dict(job)
+
+        def report_work(self, job_code, *, action, **values):
+            assert job_code == job["code"]
+            work_reports.append({"action": action, **values})
+            job["status"] = "in_progress"
+            return dict(job)
+
+    class ControlledCache(QualityCacheManager):
+        def cache_job(self, client, claimed_job, *, progress_callback=None, episode_ready_callback=None):
+            asset_root = self.cache_root / "ready" / claimed_job["code"] / claimed_job["asset_id"]
+            state_path = asset_root.parent / ".qc-cache.json"
+            state = {
+                "schema_version": 3,
+                "job_code": claimed_job["code"],
+                "asset_id": claimed_job["asset_id"],
+                "cache_complete": False,
+                "cached_episode_count": 0,
+                "total_episode_count": 2,
+                "cached_bytes": 0,
+                "total_bytes": 2,
+                "episodes": [
+                    {"episode_id": item["episode_id"], "relative_path": item["relative_path"], "status": "not_cached"}
+                    for item in claimed_job["episodes"]
+                ],
+            }
+            asset_root.mkdir(parents=True, exist_ok=True)
+
+            def publish(index: int):
+                source_file = source / claimed_job["episodes"][index]["relative_path"] / "motion.bvh"
+                target = asset_root / claimed_job["episodes"][index]["relative_path"] / "motion.bvh"
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(source_file.read_bytes())
+                state["episodes"][index]["status"] = "ready"
+                state["cached_episode_count"] = index + 1
+                state["cached_bytes"] = index + 1
+                self._write_json_atomic(state_path, state)
+                episode_ready_callback(
+                    {
+                        "cache_dir": str(asset_root),
+                        "episode_id": claimed_job["episodes"][index]["episode_id"],
+                        "cached_episode_count": index + 1,
+                        "total_episode_count": 2,
+                    }
+                )
+                self._preserve_local_episode_mappings(state_path, state)
+
+            publish(0)
+            first_ready.set()
+            assert continue_cache.wait(timeout=3)
+            publish(1)
+            state["cache_complete"] = True
+            self._write_json_atomic(state_path, state)
+            return {
+                "cache_dir": str(asset_root),
+                "cache_complete": True,
+                "cached_episode_count": 2,
+                "total_episode_count": 2,
+            }
+
+    fake_client = FakeFlowClient()
+    with running_server(tmp_path) as (server, base_url):
+        controlled_cache = ControlledCache(
+            server.application.paths.root / "platform-cache", reserve_bytes=0
+        )
+        server.application._flow_client = fake_client
+        server.application._quality_cache_manager = lambda: controlled_cache
+
+        status, accepted = request_json(
+            f"{base_url}/api/platform/jobs/{job['code']}/claim", method="POST"
+        )
+        assert status == 202
+        assert accepted["accepted"] is True
+        assert first_ready.wait(timeout=3)
+
+        status, platform = request_json(f"{base_url}/api/platform/jobs")
+        assert status == 200
+        visible = platform["jobs"][0]
+        assert visible["local_task_id"]
+        assert visible["local_caching"] is True
+        assert visible["cached_episode_count"] == 1
+        assert visible["total_episode_count"] == 2
+        assert len(work_reports) == 1
+        assert server.application.start_platform_job(job["code"])["started"] is False
+        assert len(work_reports) == 1
+
+        continue_cache.set()
+        for _ in range(200):
+            _status, platform = request_json(f"{base_url}/api/platform/jobs")
+            if not platform["jobs"][0]["local_caching"]:
+                break
+            time.sleep(0.01)
+        assert platform["jobs"][0]["cached_episode_count"] == 2
+
+
+def test_platform_login_resumes_an_incomplete_episode_cache_after_restart(tmp_path: Path):
+    job = {
+        "code": "QCJ-RESUME-WEB",
+        "status": "in_progress",
+        "asset_id": "AST-RESUME-WEB",
+        "episodes": [{"episode_id": "AST-RESUME-WEB-EP0001"}],
+    }
+    resumed = threading.Event()
+
+    class FakeFlowClient:
+        def jobs_response(self):
+            return {"reviewer": "Web 质检员", "jobs": [dict(job)]}
+
+    with running_server(tmp_path) as (server, base_url):
+        state_path = (
+            server.application.paths.root
+            / "platform-cache"
+            / "ready"
+            / job["code"]
+            / ".qc-cache.json"
+        )
+        QualityCacheManager._write_json_atomic(
+            state_path,
+            {
+                "schema_version": 3,
+                "job_code": job["code"],
+                "asset_id": job["asset_id"],
+                "cache_complete": False,
+                "cached_episode_count": 1,
+                "total_episode_count": 1,
+                "cached_bytes": 1,
+                "total_bytes": 2,
+                "episodes": [
+                    {
+                        "episode_id": "AST-RESUME-WEB-EP0001",
+                        "status": "ready",
+                    }
+                ],
+            },
+        )
+        server.application._flow_client_factory = lambda *_args: FakeFlowClient()
+        server.application._cache_platform_job = lambda _client, code: (
+            resumed.set() if code == job["code"] else None
+        )
+
+        status, payload = request_json(
+            f"{base_url}/api/platform/login",
+            method="POST",
+            payload={
+                "baseUrl": "http://flow.test:8000",
+                "username": "reviewer",
+                "password": "secret",
+            },
+        )
+
+        assert status == 200
+        assert resumed.wait(timeout=3)
+        assert payload["jobs"][0]["local_caching"] is True
+
+
+def test_platform_login_replays_a_pending_final_cache_report(tmp_path: Path):
+    job = {
+        "code": "QCJ-PENDING-WEB-REPORT",
+        "status": "in_progress",
+        "asset_id": "AST-PENDING-WEB-REPORT",
+    }
+
+    class FakeFlowClient:
+        def __init__(self):
+            self.reports = []
+
+        def jobs_response(self):
+            return {"reviewer": "Web 质检员", "jobs": [dict(job)]}
+
+        def report_cache(self, job_code, **values):
+            self.reports.append((job_code, values))
+            return dict(job)
+
+    fake_client = FakeFlowClient()
+    with running_server(tmp_path) as (server, base_url):
+        state_path = (
+            server.application.paths.root
+            / "platform-cache"
+            / "ready"
+            / job["code"]
+            / ".qc-cache.json"
+        )
+        QualityCacheManager._write_json_atomic(
+            state_path,
+            {
+                "schema_version": 3,
+                "job_code": job["code"],
+                "asset_id": job["asset_id"],
+                "cache_complete": True,
+                "pending_cache_report": {
+                    "status": "cache_ready",
+                    "cache_progress": 100,
+                    "cached_bytes": 9,
+                    "cache_workstation": "QC-WS",
+                },
+            },
+        )
+        server.application._flow_client_factory = lambda *_args: fake_client
+        status, _payload = request_json(
+            f"{base_url}/api/platform/login",
+            method="POST",
+            payload={
+                "baseUrl": "http://flow.test:8000",
+                "username": "reviewer",
+                "password": "secret",
+            },
+        )
+
+        assert status == 200
+        assert fake_client.reports == [
+            (job["code"], {
+                "status": "cache_ready",
+                "cache_progress": 100,
+                "cached_bytes": 9,
+                "cache_workstation": "QC-WS",
+            })
+        ]
+        assert "pending_cache_report" not in json.loads(
+            state_path.read_text(encoding="utf-8")
+        )
 
 
 def test_web_claims_caches_and_submits_flow_job(tmp_path: Path):
@@ -330,7 +589,13 @@ Frame Time: 0.010000
 
         def report_cache(self, job_code, **values):
             assert job_code == job["code"]
-            job.update(values)
+            if job.get("status") == "in_progress" and values.get("status") in {
+                "caching",
+                "cache_ready",
+            }:
+                job.update({key: value for key, value in values.items() if key != "status"})
+            else:
+                job.update(values)
             return dict(job)
 
         def report_work(self, job_code, *, action, **values):
@@ -385,6 +650,11 @@ Frame Time: 0.010000
             time.sleep(0.01)
         assert local_task_id
         assert job["status"] == "in_progress"
+        assert visible_job["cached_episode_count"] == 1
+        assert visible_job["total_episode_count"] == 1
+        assert "已缓存 ${cachedEpisodes}/${totalEpisodes} Episode" in (
+            Path(__file__).resolve().parents[1] / "app" / "renderer" / "renderer.js"
+        ).read_text(encoding="utf-8")
 
         status, state = request_json(
             f"{base_url}/api/workspace?task_id={local_task_id}"

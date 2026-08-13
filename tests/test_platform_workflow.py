@@ -197,6 +197,7 @@ def test_cache_job_verifies_each_cached_file_once_and_reports_file_progress(
     original_sha256_file = platform_workflow.sha256_file
     cache_hash_calls: dict[str, int] = {}
     downloading_root = cache_root / "downloading"
+    ready_root = cache_root / "ready" / "QCJ-SINGLE-PASS" / "AST-SINGLE-PASS"
 
     def count_cache_hashes(path: str | Path) -> str:
         path = Path(path)
@@ -204,6 +205,9 @@ def test_cache_job_verifies_each_cached_file_once_and_reports_file_progress(
             relative = path.relative_to(
                 downloading_root / "QCJ-SINGLE-PASS.partial" / "AST-SINGLE-PASS"
             ).as_posix()
+            cache_hash_calls[relative] = cache_hash_calls.get(relative, 0) + 1
+        elif path.is_relative_to(ready_root):
+            relative = path.relative_to(ready_root).as_posix()
             cache_hash_calls[relative] = cache_hash_calls.get(relative, 0) + 1
         return original_sha256_file(path)
 
@@ -225,6 +229,406 @@ def test_cache_job_verifies_each_cached_file_once_and_reports_file_progress(
         "episodes/episode_000002/motion.bvh",
     ]
     assert all(item["total_files"] == 3 for item in verification)
+
+
+def test_cache_job_publishes_each_episode_before_copying_the_next_one(
+    tmp_path: Path, monkeypatch
+):
+    """A reviewer may start on Episode 1 while the worker downloads Episode 2."""
+    asset_root = tmp_path / "nas" / "AST-PROGRESSIVE"
+    first_source = asset_root / "episodes" / "episode_000001"
+    second_source = asset_root / "episodes" / "episode_000002"
+    first_source.mkdir(parents=True)
+    second_source.mkdir(parents=True)
+    first_primary = first_source / "motion.bvh"
+    second_primary = second_source / "motion.bvh"
+    first_primary.write_bytes(b"first Episode")
+    second_primary.write_bytes(b"second Episode")
+    job = {
+        "code": "QCJ-PROGRESSIVE",
+        "asset_id": "AST-PROGRESSIVE",
+        "source_uri": str(asset_root),
+        "episodes": [
+            {
+                "episode_id": "AST-PROGRESSIVE-EP0001",
+                "relative_path": "episodes/episode_000001",
+                "primary_file": "motion.bvh",
+                "checksum_sha256": hashlib.sha256(first_primary.read_bytes()).hexdigest(),
+            },
+            {
+                "episode_id": "AST-PROGRESSIVE-EP0002",
+                "relative_path": "episodes/episode_000002",
+                "primary_file": "motion.bvh",
+                "checksum_sha256": hashlib.sha256(second_primary.read_bytes()).hexdigest(),
+            },
+        ],
+    }
+    publish_asset_manifest(
+        asset_root,
+        job,
+        [
+            "episodes/episode_000001/motion.bvh",
+            "episodes/episode_000002/motion.bvh",
+        ],
+    )
+    manager = QualityCacheManager(tmp_path / "qc-cache", reserve_bytes=0, chunk_size=3)
+    episode_ready: list[dict] = []
+    original_copy = manager._copy_resumable
+
+    def observe_second_episode_copy(source, *args, **kwargs):
+        if Path(source) == second_primary:
+            assert [item["episode_id"] for item in episode_ready] == [
+                "AST-PROGRESSIVE-EP0001"
+            ]
+            assert (
+                tmp_path
+                / "qc-cache"
+                / "ready"
+                / "QCJ-PROGRESSIVE"
+                / "AST-PROGRESSIVE"
+                / "episodes"
+                / "episode_000001"
+                / "motion.bvh"
+            ).read_bytes() == b"first Episode"
+            state = json.loads(
+                (
+                    tmp_path
+                    / "qc-cache"
+                    / "ready"
+                    / "QCJ-PROGRESSIVE"
+                    / ".qc-cache.json"
+                ).read_text(encoding="utf-8")
+            )
+            assert state["cache_status"] == "partially_ready"
+        return original_copy(source, *args, **kwargs)
+
+    monkeypatch.setattr(manager, "_copy_resumable", observe_second_episode_copy)
+
+    cached = manager.cache_job(
+        FakeFlowClient(job),
+        job,
+        episode_ready_callback=episode_ready.append,
+    )
+
+    assert cached["cache_complete"] is True
+    assert [item["episode_id"] for item in episode_ready] == [
+        "AST-PROGRESSIVE-EP0001",
+        "AST-PROGRESSIVE-EP0002",
+    ]
+
+
+def test_submit_result_rejects_a_job_whose_episode_cache_is_incomplete(tmp_path: Path):
+    cache = QualityCacheManager(tmp_path / "qc-cache", reserve_bytes=0)
+    job = {
+        "code": "QCJ-INCOMPLETE",
+        "asset_id": "AST-INCOMPLETE",
+        "episodes": [],
+    }
+    state_path = tmp_path / "qc-cache" / "ready" / job["code"] / ".qc-cache.json"
+    QualityCacheManager._write_json_atomic(
+        state_path,
+        {
+            "schema_version": 3,
+            "job_code": job["code"],
+            "asset_id": job["asset_id"],
+            "cache_complete": False,
+        },
+    )
+
+    with pytest.raises(QualityCacheError, match="尚未完整缓存"):
+        cache.submit_result(FakeFlowClient(job), job, episode_results=[])
+
+
+def test_submit_result_rejects_a_completed_flag_with_a_failed_episode(tmp_path: Path):
+    cache = QualityCacheManager(tmp_path / "qc-cache", reserve_bytes=0)
+    job = {
+        "code": "QCJ-FAILED-EPISODE",
+        "asset_id": "AST-FAILED-EPISODE",
+        "episodes": [{"episode_id": "AST-FAILED-EPISODE-EP0001"}],
+    }
+    state_path = tmp_path / "qc-cache" / "ready" / job["code"] / ".qc-cache.json"
+    QualityCacheManager._write_json_atomic(
+        state_path,
+        {
+            "schema_version": 3,
+            "job_code": job["code"],
+            "asset_id": job["asset_id"],
+            "cache_complete": True,
+            "episodes": [
+                {
+                    "episode_id": "AST-FAILED-EPISODE-EP0001",
+                    "status": "failed",
+                }
+            ],
+        },
+    )
+
+    with pytest.raises(QualityCacheError, match="尚未完整缓存"):
+        cache.submit_result(FakeFlowClient(job), job, episode_results=[])
+
+
+def test_cache_job_resumes_from_the_first_verified_episode_after_a_restart(
+    tmp_path: Path, monkeypatch
+):
+    asset_root = tmp_path / "nas" / "AST-RESUME"
+    first_source = asset_root / "episodes" / "episode_000001"
+    second_source = asset_root / "episodes" / "episode_000002"
+    first_source.mkdir(parents=True)
+    second_source.mkdir(parents=True)
+    first_primary = first_source / "motion.bvh"
+    second_primary = second_source / "motion.bvh"
+    first_primary.write_bytes(b"first retained Episode")
+    second_primary.write_bytes(b"second resumable Episode")
+    job = {
+        "code": "QCJ-RESUME",
+        "asset_id": "AST-RESUME",
+        "source_uri": str(asset_root),
+        "episodes": [
+            {
+                "episode_id": "AST-RESUME-EP0001",
+                "relative_path": "episodes/episode_000001",
+                "primary_file": "motion.bvh",
+                "checksum_sha256": hashlib.sha256(first_primary.read_bytes()).hexdigest(),
+            },
+            {
+                "episode_id": "AST-RESUME-EP0002",
+                "relative_path": "episodes/episode_000002",
+                "primary_file": "motion.bvh",
+                "checksum_sha256": hashlib.sha256(second_primary.read_bytes()).hexdigest(),
+            },
+        ],
+    }
+    publish_asset_manifest(
+        asset_root,
+        job,
+        [
+            "episodes/episode_000001/motion.bvh",
+            "episodes/episode_000002/motion.bvh",
+        ],
+    )
+    cache_root = tmp_path / "qc-cache"
+    first_manager = QualityCacheManager(cache_root, reserve_bytes=0)
+    original_copy = first_manager._copy_resumable
+
+    def interrupt_second_episode(source, target, *args, **kwargs):
+        if Path(source) == second_primary:
+            partial = Path(target).with_name(Path(target).name + ".partial")
+            partial.parent.mkdir(parents=True, exist_ok=True)
+            partial.write_bytes(second_primary.read_bytes()[:7])
+            raise QualityCacheError("simulated restart")
+        return original_copy(source, target, *args, **kwargs)
+
+    monkeypatch.setattr(first_manager, "_copy_resumable", interrupt_second_episode)
+    with pytest.raises(QualityCacheError, match="simulated restart"):
+        first_manager.cache_job(FakeFlowClient(job), job)
+
+    state_path = cache_root / "ready" / job["code"] / ".qc-cache.json"
+    interrupted = json.loads(state_path.read_text(encoding="utf-8"))
+    assert interrupted["cache_complete"] is False
+    assert [item["status"] for item in interrupted["episodes"]] == ["ready", "failed"]
+    partial_path = (
+        cache_root
+        / "downloading"
+        / f"{job['code']}.partial"
+        / job["asset_id"]
+        / "episodes"
+        / "episode_000002"
+        / "motion.bvh.partial"
+    )
+    assert partial_path.read_bytes() == second_primary.read_bytes()[:7]
+
+    resumed_manager = QualityCacheManager(cache_root, reserve_bytes=0)
+    resumed_sources: list[Path] = []
+    resumed_copy = resumed_manager._copy_resumable
+
+    def track_resumed_copy(source, *args, **kwargs):
+        resumed_sources.append(Path(source))
+        return resumed_copy(source, *args, **kwargs)
+
+    monkeypatch.setattr(resumed_manager, "_copy_resumable", track_resumed_copy)
+    resumed = resumed_manager.cache_job(FakeFlowClient(job), job)
+
+    assert resumed["cache_complete"] is True
+    assert first_primary not in resumed_sources
+    assert second_primary in resumed_sources
+    assert not partial_path.exists()
+
+
+def test_cache_job_recovers_an_episode_moved_before_its_state_was_saved(tmp_path: Path):
+    asset_root = tmp_path / "nas" / "AST-MOVED"
+    episode_root = asset_root / "episodes" / "episode_000001"
+    episode_root.mkdir(parents=True)
+    primary = episode_root / "motion.bvh"
+    primary.write_bytes(b"atomically moved Episode")
+    job = {
+        "code": "QCJ-MOVED",
+        "asset_id": "AST-MOVED",
+        "source_uri": str(asset_root),
+        "episodes": [
+            {
+                "episode_id": "AST-MOVED-EP0001",
+                "relative_path": "episodes/episode_000001",
+                "primary_file": "motion.bvh",
+                "checksum_sha256": hashlib.sha256(primary.read_bytes()).hexdigest(),
+            }
+        ],
+    }
+    publish_asset_manifest(asset_root, job, ["episodes/episode_000001/motion.bvh"])
+    manager = QualityCacheManager(tmp_path / "qc-cache", reserve_bytes=0)
+    manager.cache_job(FakeFlowClient(job), job)
+
+    state_path = tmp_path / "qc-cache" / "ready" / job["code"] / ".qc-cache.json"
+    interrupted = json.loads(state_path.read_text(encoding="utf-8"))
+    interrupted["cache_complete"] = False
+    interrupted["episodes"][0]["status"] = "caching"
+    interrupted["episodes"][0]["primary_files"] = []
+    QualityCacheManager._write_json_atomic(state_path, interrupted)
+
+    resumed = QualityCacheManager(tmp_path / "qc-cache", reserve_bytes=0).cache_job(
+        FakeFlowClient(job), job
+    )
+
+    assert resumed["cache_complete"] is True
+
+
+def test_cache_job_keeps_processing_later_episodes_after_one_episode_fails(
+    tmp_path: Path, monkeypatch
+):
+    asset_root = tmp_path / "nas" / "AST-FAILURE"
+    episode_ids = []
+    relative_files = []
+    episodes = []
+    sources = []
+    for index, payload in enumerate((b"first", b"broken", b"last"), start=1):
+        relative_directory = f"episodes/episode_{index:06d}"
+        source = asset_root / relative_directory / "motion.bvh"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_bytes(payload)
+        episode_id = f"AST-FAILURE-EP{index:04d}"
+        episode_ids.append(episode_id)
+        relative_files.append(f"{relative_directory}/motion.bvh")
+        episodes.append(
+            {
+                "episode_id": episode_id,
+                "relative_path": relative_directory,
+                "primary_file": "motion.bvh",
+                "checksum_sha256": hashlib.sha256(payload).hexdigest(),
+            }
+        )
+        sources.append(source)
+    job = {
+        "code": "QCJ-FAILURE",
+        "asset_id": "AST-FAILURE",
+        "source_uri": str(asset_root),
+        "episodes": episodes,
+    }
+    publish_asset_manifest(asset_root, job, relative_files)
+    manager = QualityCacheManager(tmp_path / "qc-cache", reserve_bytes=0)
+    original_copy = manager._copy_resumable
+    failed_copy_attempts = 0
+
+    def fail_only_second_episode(source, *args, **kwargs):
+        nonlocal failed_copy_attempts
+        if Path(source) == sources[1]:
+            failed_copy_attempts += 1
+            raise QualityCacheError("simulated unreadable Episode")
+        return original_copy(source, *args, **kwargs)
+
+    monkeypatch.setattr(manager, "_copy_resumable", fail_only_second_episode)
+    with pytest.raises(QualityCacheError, match="simulated unreadable Episode"):
+        manager.cache_job(FakeFlowClient(job), job)
+
+    state = json.loads(
+        (tmp_path / "qc-cache" / "ready" / job["code"] / ".qc-cache.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert [item["status"] for item in state["episodes"]] == ["ready", "failed", "ready"]
+    assert failed_copy_attempts == 3
+    assert "simulated unreadable Episode" in state["episodes"][1]["error"]
+    assert (
+        tmp_path
+        / "qc-cache"
+        / "ready"
+        / job["code"]
+        / job["asset_id"]
+        / "episodes"
+        / "episode_000003"
+        / "motion.bvh"
+    ).read_bytes() == b"last"
+
+
+def test_cache_job_continues_when_initial_flow_cache_report_is_temporarily_unavailable(
+    tmp_path: Path, monkeypatch
+):
+    asset_root = tmp_path / "nas" / "AST-FLOW-RETRY"
+    episode_root = asset_root / "episodes" / "episode_000001"
+    episode_root.mkdir(parents=True)
+    primary = episode_root / "motion.bvh"
+    primary.write_bytes(b"cache survives Flow outage")
+    job = {
+        "code": "QCJ-FLOW-RETRY",
+        "asset_id": "AST-FLOW-RETRY",
+        "source_uri": str(asset_root),
+        "episodes": [{
+            "episode_id": "AST-FLOW-RETRY-EP0001",
+            "relative_path": "episodes/episode_000001",
+            "primary_file": "motion.bvh",
+            "checksum_sha256": hashlib.sha256(primary.read_bytes()).hexdigest(),
+        }],
+    }
+    publish_asset_manifest(asset_root, job, ["episodes/episode_000001/motion.bvh"])
+
+    class TransientFlowClient(FakeFlowClient):
+        def __init__(self, value):
+            super().__init__(value)
+            self.failed_reports = 0
+
+        def report_cache(self, job_code, **values):
+            if self.failed_reports < 3:
+                self.failed_reports += 1
+                raise FlowClientError("temporary Flow outage")
+            return super().report_cache(job_code, **values)
+
+    monkeypatch.setattr(platform_workflow.time, "sleep", lambda _delay: None)
+    client = TransientFlowClient(job)
+    cached = QualityCacheManager(tmp_path / "qc-cache", reserve_bytes=0).cache_job(client, job)
+
+    assert cached["cache_complete"] is True
+    assert client.failed_reports == 3
+    assert client.cache_reports[-1]["status"] == "cache_ready"
+
+
+def test_pending_final_flow_cache_report_is_retried_after_reconnect(tmp_path: Path, monkeypatch):
+    cache = QualityCacheManager(tmp_path / "qc-cache", reserve_bytes=0)
+    state_path = tmp_path / "qc-cache" / "ready" / "QCJ-PENDING-REPORT" / ".qc-cache.json"
+    QualityCacheManager._write_json_atomic(
+        state_path,
+        {
+            "schema_version": 3,
+            "job_code": "QCJ-PENDING-REPORT",
+            "asset_id": "AST-PENDING-REPORT",
+            "cache_complete": True,
+            "pending_cache_report": {
+                "status": "cache_ready",
+                "cache_progress": 100,
+                "cached_bytes": 42,
+                "cache_workstation": "QC-WS",
+            },
+        },
+    )
+    monkeypatch.setattr(platform_workflow.time, "sleep", lambda _delay: None)
+    client = FakeFlowClient({"code": "QCJ-PENDING-REPORT"})
+
+    assert cache.flush_pending_cache_report(client, "QCJ-PENDING-REPORT") is True
+    assert client.cache_reports == [{
+        "status": "cache_ready",
+        "cache_progress": 100,
+        "cached_bytes": 42,
+        "cache_workstation": "QC-WS",
+    }]
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert "pending_cache_report" not in state
 
 
 def test_flow_job_is_fully_cached_verified_submitted_and_safely_evicted(tmp_path: Path):
@@ -289,9 +693,26 @@ def test_flow_job_is_fully_cached_verified_submitted_and_safely_evicted(tmp_path
     assert client.cache_reports[-1]["status"] == "cache_ready"
     assert client.cache_reports[-1]["cache_progress"] == 100
     assert progress[-1]["status"] == "cache_ready"
+    legacy_state_path = tmp_path / "qc-cache" / "ready" / job["code"] / ".qc-cache.json"
+    legacy_state = json.loads(legacy_state_path.read_text(encoding="utf-8"))
+    legacy_state["schema_version"] = 2
+    for key in (
+        "episodes",
+        "asset_manifest_ready",
+        "cache_complete",
+        "cache_status",
+        "cached_episode_count",
+        "total_episode_count",
+    ):
+        legacy_state.pop(key, None)
+    QualityCacheManager._write_json_atomic(legacy_state_path, legacy_state)
     reused = cache.cache_job(client, job)
     assert reused["reused"] is True
     assert reused["primary_files"] == cached["primary_files"]
+    migrated_state = json.loads(legacy_state_path.read_text(encoding="utf-8"))
+    assert migrated_state["schema_version"] == 3
+    assert migrated_state["cache_complete"] is True
+    assert [item["status"] for item in migrated_state["episodes"]] == ["ready", "ready"]
 
     cache.start_review(client, job["code"])
     assert client.work_reports == [{"action": "start", "workstation": "QC-WS-TEST"}]
@@ -440,7 +861,7 @@ def test_evict_expired_keeps_nonobject_state_and_download_partial(tmp_path: Path
     assert malformed.is_dir()
     assert partial.is_dir()
 
-def test_cache_job_evicts_expired_before_checking_disk_space(tmp_path: Path, monkeypatch):
+def test_cache_job_does_not_evict_existing_caches_before_checking_episode_disk_space(tmp_path: Path, monkeypatch):
     asset_root = tmp_path / "nas" / "AST-003"
     source = asset_root / "episodes" / "episode_000001"
     source.mkdir(parents=True)
@@ -474,7 +895,7 @@ def test_cache_job_evicts_expired_before_checking_disk_space(tmp_path: Path, mon
 
     manager.cache_job(FakeFlowClient(job), job)
 
-    assert calls[:2] == ["evict_expired", "ensure_disk_space"]
+    assert calls == ["ensure_disk_space"]
 
 def test_cache_rejects_wrong_manifest_checksum(tmp_path: Path):
     asset_root = tmp_path / "nas" / "AST-002"

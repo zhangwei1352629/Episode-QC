@@ -16,7 +16,7 @@ import secrets
 import threading
 import traceback
 import shutil
-from typing import Any, Callable
+from typing import Any
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 import webbrowser
 
@@ -213,66 +213,6 @@ class PlaybackRegistry:
         return value
 
 
-class PlatformCacheCleanupLoop:
-    def __init__(
-        self,
-        manager_factory: Callable[[], QualityCacheManager],
-        *,
-        interval_seconds: float = 3600.0,
-        log: Callable[[str], None] = print,
-    ) -> None:
-        if interval_seconds <= 0:
-            raise ValueError("缓存清理间隔必须大于零")
-        self._manager_factory = manager_factory
-        self._interval_seconds = interval_seconds
-        self._log = log
-        self._stop = threading.Event()
-        self._lock = threading.Lock()
-        self._thread: threading.Thread | None = None
-
-    @property
-    def is_running(self) -> bool:
-        return bool(self._thread and self._thread.is_alive())
-
-    def start(self) -> None:
-        with self._lock:
-            if self.is_running:
-                return
-            self._stop.clear()
-            self.run_once("startup")
-            self._thread = threading.Thread(
-                target=self._run, name="episode-qc-platform-cache-cleanup", daemon=True
-            )
-            self._thread.start()
-
-    def close(self) -> None:
-        self._stop.set()
-        with self._lock:
-            thread = self._thread
-        if thread and thread is not threading.current_thread():
-            thread.join(timeout=5)
-        with self._lock:
-            self._thread = None
-
-    def run_once(self, reason: str) -> dict[str, object] | None:
-        try:
-            result = self._manager_factory().evict_expired()
-        except Exception as exc:
-            self._log(f"QC 平台缓存清理[{reason}]失败：{exc}")
-            return None
-        self._log(
-            "QC 平台缓存清理"
-            f"[{reason}]：扫描 {result['scanned_jobs']} 个，"
-            f"删除 {len(result['evicted_jobs'])} 个，"
-            f"释放 {result['freed_bytes']} 字节，"
-            f"失败 {len(result['failed_jobs'])} 个 {result['failed_jobs']}"
-        )
-        return result
-
-    def _run(self) -> None:
-        while not self._stop.wait(self._interval_seconds):
-            self.run_once("periodic")
-
 class EpisodeQcWebApplication:
     def __init__(
         self,
@@ -306,11 +246,8 @@ class EpisodeQcWebApplication:
         paths.root.mkdir(parents=True, exist_ok=True)
         initialize_workspace(paths.db_path)
         self._connect_platform_from_environment()
-        self._platform_cache_cleanup = PlatformCacheCleanupLoop(self._quality_cache_manager)
-        self._platform_cache_cleanup.start()
 
     def close(self) -> None:
-        self._platform_cache_cleanup.close()
         self._executor.shutdown(wait=False, cancel_futures=True)
         self._platform_executor.shutdown(wait=False, cancel_futures=True)
 
@@ -399,6 +336,7 @@ class EpisodeQcWebApplication:
                 "reviewer": str(response.get("reviewer") or reviewer_name),
             }
             self._flow_error = ""
+        self._resume_incomplete_platform_caches(client, response)
         return self._platform_payload(response)
 
     def disconnect_platform(self) -> dict[str, object]:
@@ -428,6 +366,30 @@ class EpisodeQcWebApplication:
             }
         return self._platform_payload(client.jobs_response())
 
+    def _resume_incomplete_platform_caches(self, client, response: dict[str, object]) -> None:
+        """Continue durable Episode queues once a reviewer reconnects to Flow."""
+        manager = self._quality_cache_manager()
+        for item in response.get("jobs", []):
+            if not isinstance(item, dict):
+                continue
+            job_code = str(item.get("code") or "")
+            if not job_code:
+                continue
+            try:
+                manager.flush_pending_cache_report(client, job_code)
+                summary = manager.cache_summary(job_code)
+            except QualityCacheError:
+                continue
+            if item.get("status") in {"completed", "waiting_data"}:
+                continue
+            if summary is None or summary.get("cache_complete"):
+                continue
+            with self._platform_lock:
+                if job_code in self._platform_jobs:
+                    continue
+                self._platform_jobs.add(job_code)
+            self._platform_executor.submit(self._cache_platform_job, client, job_code)
+
     def claim_platform_job(self, job_code: str) -> dict[str, object]:
         self._assert_flow_enabled()
         client = self._require_flow_client()
@@ -437,8 +399,20 @@ class EpisodeQcWebApplication:
         if job.get("status") == "completed":
             raise ValueError("质检任务已经完成")
         local_task = self._local_task_for_job(job_code)
+        summary = None
         if local_task and local_task.get("status") != "failed":
-            return {"accepted": False, "job": job, "local_task": local_task}
+            summary = self._quality_cache_manager().cache_summary(job_code)
+            if summary and summary.get("cache_complete"):
+                return {"accepted": False, "job": job, "local_task": local_task}
+        if summary and not summary.get("cache_complete"):
+            # The job is already owned locally.  Resuming its durable queue
+            # must not re-claim an active Flow work session.
+            with self._platform_lock:
+                if job_code in self._platform_jobs:
+                    return {"accepted": False, "job": job, "caching": True}
+                self._platform_jobs.add(job_code)
+            self._platform_executor.submit(self._cache_platform_job, client, job_code)
+            return {"accepted": True, "job": job, "caching": True}
         claimed = client.claim(job_code)
         with self._platform_lock:
             if job_code in self._platform_jobs:
@@ -455,6 +429,8 @@ class EpisodeQcWebApplication:
         if task is None:
             raise ValueError("质检任务尚未完整缓存到本地")
         if task.get("status") in {"completed", "submitted", "archived"}:
+            return {"job": job, "local_task": task, "started": False}
+        if job.get("status") == "in_progress":
             return {"job": job, "local_task": task, "started": False}
         manager = self._quality_cache_manager()
         manager.start_review(client, job_code)
@@ -538,6 +514,15 @@ class EpisodeQcWebApplication:
             for task in tasks
             if task.get("flow_job_code")
         }
+        cache_by_job = {}
+        manager = self._quality_cache_manager()
+        for job_code in local_by_job:
+            try:
+                summary = manager.cache_summary(job_code)
+            except QualityCacheError:
+                summary = None
+            if summary is not None:
+                cache_by_job[job_code] = summary
         with self._platform_lock:
             caching = set(self._platform_jobs)
             progress_by_job = {
@@ -553,12 +538,14 @@ class EpisodeQcWebApplication:
                 continue
             code = str(item.get("code") or "")
             local_task = local_by_job.get(code)
+            cache_summary = cache_by_job.get(code, {})
             jobs.append(
                 {
                     **item,
                     "local_task_id": local_task.get("id") if local_task else None,
                     "local_task_status": local_task.get("status") if local_task else None,
                     "local_caching": code in caching,
+                    **cache_summary,
                     **(
                         {"local_progress": progress_by_job[code]}
                         if code in caching and code in progress_by_job
@@ -601,6 +588,8 @@ class EpisodeQcWebApplication:
         manager = self._quality_cache_manager()
         local_ready = False
         indexed_task_id = ""
+        review_started = False
+        job: dict[str, object] = {}
 
         def publish_progress(values: dict[str, object]) -> None:
             with self._platform_lock:
@@ -609,9 +598,8 @@ class EpisodeQcWebApplication:
                 {"type": "platform_job", "jobCode": job_code, **values}
             )
 
-        try:
-            job = self._platform_job(client, job_code)
-            cached = manager.cache_job(client, job, progress_callback=publish_progress)
+        def index_ready_episode(values: dict[str, object]) -> None:
+            nonlocal indexed_task_id, local_ready, review_started
             profile_path = (
                 self.paths.default_profile
                 if self.paths.default_profile.is_file()
@@ -619,7 +607,7 @@ class EpisodeQcWebApplication:
             )
             indexed = scan_data_source(
                 self.paths.db_path,
-                cached["cache_dir"],
+                str(values["cache_dir"]),
                 profile_path=profile_path,
                 task_code=job_code,
                 task_name=str(job.get("task_name") or job.get("asset_id") or job_code),
@@ -629,14 +617,10 @@ class EpisodeQcWebApplication:
                 source_uri=str(job.get("source_uri") or job.get("asset_nas_uri") or ""),
                 task_metadata={"flow_job": job},
             )
-            ready = [
-                item
-                for item in indexed["episodes"]
-                if item["import_status"] == "ready"
-            ]
             ready_by_path = {
                 str(Path(item["relative_path"]).as_posix()).strip("./"): item
-                for item in ready
+                for item in indexed["episodes"]
+                if item["import_status"] == "ready"
             }
             mappings = []
             for platform_episode in job.get("episodes", []):
@@ -644,69 +628,101 @@ class EpisodeQcWebApplication:
                     Path(platform_episode["relative_path"]).as_posix()
                 ).strip("./")
                 local_episode = ready_by_path.get(relative_path)
-                if local_episode is None:
-                    raise QualityCacheError(
-                        "本地缓存未索引到 Flow Episode："
-                        f"{platform_episode['episode_id']} ({relative_path})"
+                if local_episode is not None:
+                    mappings.append(
+                        {
+                            "episode_id": platform_episode["episode_id"],
+                            "local_episode_id": local_episode["id"],
+                            "relative_path": relative_path,
+                        }
                     )
-                mappings.append(
-                    {
-                        "episode_id": platform_episode["episode_id"],
-                        "local_episode_id": local_episode["id"],
-                        "relative_path": relative_path,
-                    }
-                )
-            if len(mappings) != len(ready):
+            if len(mappings) != len(ready_by_path):
                 raise QualityCacheError(
                     f"资产缓存包含未登记的 Episode：Flow {len(mappings)} 个，"
-                    f"本地 {len(ready)} 个"
+                    f"本地 {len(ready_by_path)} 个"
                 )
+            if not mappings:
+                raise QualityCacheError("本地缓存尚未索引到已验证的 Flow Episode")
             manager.record_local_episodes(job_code, mappings)
             local_ready = True
             indexed_task_id = str(indexed["task_id"])
-            try:
-                started = manager.start_review(client, job_code)
-            except Exception as exc:
-                # The asset is already fully downloaded, verified and indexed.
-                # A work-session conflict is not a NAS/cache failure; keep the
-                # task ready so opening it can retry the start operation.
-                publish_progress(
-                    {
-                        "status": "ready",
-                        "progress": 100,
-                        "taskId": indexed_task_id,
-                        "warning": str(exc),
-                    }
+            cache_summary = manager.cache_summary(job_code) or {}
+            cache_progress = (
+                int(
+                    int(cache_summary.get("cached_bytes") or 0)
+                    * 100
+                    / int(cache_summary.get("total_bytes") or 1)
                 )
-                return
+                if cache_summary.get("total_bytes")
+                else 0
+            )
+            warning = ""
+            if not review_started:
+                review_started = True
+                try:
+                    started = manager.start_review(client, job_code)
+                except Exception as exc:
+                    # Local review may still be opened. The explicit start action
+                    # can retry a transient Flow work-session conflict later.
+                    warning = str(exc)
+                else:
+                    publish_progress(
+                        {
+                            "status": "caching",
+                            "progress": cache_progress,
+                            "taskId": indexed_task_id,
+                            "job": started,
+                            "cached_episode_count": values.get("cached_episode_count", 0),
+                            "total_episode_count": values.get("total_episode_count", 0),
+                        }
+                    )
+                    return
+            publish_progress(
+                {
+                    "status": "caching",
+                    "progress": cache_progress,
+                    "taskId": indexed_task_id,
+                    "warning": warning,
+                    "cached_episode_count": values.get("cached_episode_count", 0),
+                    "total_episode_count": values.get("total_episode_count", 0),
+                }
+            )
+
+        try:
+            job = self._platform_job(client, job_code)
+            cached = manager.cache_job(
+                client,
+                job,
+                progress_callback=publish_progress,
+                episode_ready_callback=index_ready_episode,
+            )
+            if not local_ready:
+                raise QualityCacheError("完整缓存未建立本地 Episode 任务")
             publish_progress(
                 {
                     "status": "ready",
                     "progress": 100,
-                    "taskId": indexed["task_id"],
-                    "job": started,
+                    "taskId": indexed_task_id,
+                    "cached_episode_count": cached.get("total_episode_count", 0),
+                    "total_episode_count": cached.get("total_episode_count", 0),
                 }
             )
         except Exception as exc:
-            if local_ready:
-                publish_progress(
-                    {
-                        "status": "ready",
-                        "progress": 100,
-                        "taskId": indexed_task_id,
-                        "warning": str(exc),
-                    }
+            try:
+                client.report_cache(
+                    job_code,
+                    status="failed",
+                    cache_error=str(exc),
                 )
-            else:
-                try:
-                    client.report_cache(
-                        job_code,
-                        status="failed",
-                        cache_error=str(exc),
-                    )
-                except Exception:
-                    pass
-                publish_progress({"status": "failed", "error": str(exc)})
+            except Exception:
+                pass
+            publish_progress(
+                {
+                    "status": "cache_failed" if local_ready else "failed",
+                    "taskId": indexed_task_id or None,
+                    "error": str(exc),
+                }
+            )
         finally:
             with self._platform_lock:
                 self._platform_jobs.discard(job_code)

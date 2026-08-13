@@ -380,12 +380,18 @@ async function refreshPlatformJobs({ quiet = false } = {}) {
     state.platform = payload;
     renderPlatformJobs();
     const claimed = payload.jobs?.find(
-      (item) => item.code === state.pendingFlowJobCode && item.local_task_id && !item.local_caching,
+      (item) => item.code === state.pendingFlowJobCode && item.local_task_id,
     );
     if (claimed) {
       state.pendingFlowJobCode = null;
-      stopFlowPolling();
-      toast(`任务 ${claimed.code} 已缓存并进入质检`, "success", 5500);
+      if (!claimed.local_caching) stopFlowPolling();
+      toast(
+        claimed.local_caching
+          ? `任务 ${claimed.code} 的首个 Episode 已就绪，后台继续缓存`
+          : `任务 ${claimed.code} 已缓存并进入质检`,
+        "success",
+        5500,
+      );
       await switchTask(claimed.local_task_id);
       return;
     }
@@ -430,7 +436,7 @@ function renderPlatformJobs() {
   }
   els.flowTaskList.innerHTML = platform.jobs.map((job) => {
     const action = flowJobAction(job);
-    const progress = ["claimed", "caching", "cache_ready"].includes(job.status)
+    const progress = (job.local_caching || job.cache_complete === false || ["claimed", "caching", "cache_ready"].includes(job.status))
       ? ` · ${flowJobProgressLabel(job)}`
       : "";
     return `
@@ -450,12 +456,19 @@ function flowJobProgressLabel(job) {
   if (local.phase === "verifying" && Number(local.total_files) > 0) {
     return `校验 ${Number(local.verified_files || 0)}/${Number(local.total_files)} 个文件`;
   }
-  return `缓存 ${Number(job.cache_progress || local.progress || 0)}%`;
+  const cachedEpisodes = Number(local.cached_episode_count ?? job.cached_episode_count ?? 0);
+  const totalEpisodes = Number(local.total_episode_count ?? job.total_episode_count ?? 0);
+  const progress = Number(job.cache_progress || local.progress || 0);
+  if (totalEpisodes > 0) return `已缓存 ${cachedEpisodes}/${totalEpisodes} Episode · ${progress}%`;
+  return `缓存 ${progress}%`;
 }
 
 function flowJobAction(job) {
-  if (job.local_caching) return { name: "none", label: flowJobProgressLabel(job), disabled: true };
+  if (job.local_task_id && job.cache_complete === false && !job.local_caching) {
+    return { name: "claim", label: "继续缓存", disabled: false };
+  }
   if (job.local_task_id) return { name: "open", label: job.local_task_status === "submitted" ? "已提交" : "打开任务", disabled: false };
+  if (job.local_caching) return { name: "none", label: flowJobProgressLabel(job), disabled: true };
   if (["claimed", "caching", "cache_ready"].includes(job.status)) return { name: "claim", label: "继续缓存", disabled: false };
   if (job.status === "pending") return { name: "claim", label: "领取并缓存", disabled: false };
   if (job.status === "failed") return { name: "claim", label: "重试缓存", disabled: false };

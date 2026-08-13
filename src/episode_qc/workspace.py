@@ -1710,6 +1710,16 @@ def validate_label_schema(schema: dict[str, object]) -> list[str]:
     return errors
 
 
+def canonical_json_sha256(value: object) -> str:
+    canonical_json = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
+
+
 def preview_label_schema(db_path: str | Path, schema_path: str | Path) -> dict[str, object]:
     initialize_workspace(db_path)
     schema, source_format, source_hash, template_mode = parse_label_schema(schema_path)
@@ -1798,6 +1808,121 @@ def import_label_schema(db_path: str | Path, schema_path: str | Path) -> dict[st
             )
         connection.execute("UPDATE workspace SET active_label_set_id = ?, updated_at = ?", (actual, _now()))
     return {key: value for key, value in preview.items() if key != "schema"} | {"active": True}
+
+
+def install_flow_label_schema(
+    db_path: str | Path, job: dict[str, object]
+) -> dict[str, object]:
+    """Install the exact label snapshot frozen on a Flow QC job."""
+
+    reference_fields = (
+        "label_set_id",
+        "label_schema_version",
+        "label_schema_hash",
+        "label_schema",
+    )
+    provided = {field: job.get(field) for field in reference_fields if job.get(field) is not None}
+    if not provided:
+        return {"active": False}
+    if len(provided) != len(reference_fields):
+        raise ValueError("Flow 冻结标签引用不完整")
+
+    label_set_key = provided["label_set_id"]
+    version = provided["label_schema_version"]
+    declared_hash = provided["label_schema_hash"]
+    schema = provided["label_schema"]
+    if not isinstance(label_set_key, str) or not label_set_key:
+        raise ValueError("Flow 标签集 ID 无效")
+    if not isinstance(version, str) or not version:
+        raise ValueError("Flow 标签版本无效")
+    if not isinstance(declared_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", declared_hash):
+        raise ValueError("Flow 标签快照摘要必须是 64 位小写十六进制 SHA-256")
+    if not isinstance(schema, dict):
+        raise ValueError("Flow 标签快照必须是 JSON 对象")
+
+    source_hash = canonical_json_sha256(schema)
+    if source_hash != declared_hash:
+        raise ValueError("Flow 标签快照摘要不匹配")
+    errors = validate_label_schema(schema)
+    if errors:
+        raise ValueError("Flow 标签快照校验失败: " + "; ".join(errors))
+    header = schema["schema"]
+    if (
+        header.get("label_set_id") != label_set_key
+        or header.get("schema_version") != version
+    ):
+        raise ValueError("Flow 标签快照与任务引用不一致")
+
+    initialize_workspace(db_path)
+    with connect_workspace(db_path) as connection:
+        existing = connection.execute(
+            """
+            SELECT id, raw_schema_json FROM label_set
+            WHERE label_set_key = ? AND version = ?
+            """,
+            (label_set_key, version),
+        ).fetchone()
+        if existing is not None:
+            existing_schema = _loads(existing["raw_schema_json"])
+            if canonical_json_sha256(existing_schema) != source_hash:
+                raise ValueError("同一标签集版本已有不同的本地标签快照")
+            actual = str(existing["id"])
+            connection.execute("UPDATE label_set SET enabled = 1 WHERE id = ?", (actual,))
+        else:
+            actual = _stable_id("ls", label_set_key, version)
+            connection.execute(
+                """
+                INSERT INTO label_set(
+                    id, label_set_key, name, version, language, source_format,
+                    source_hash, enabled, raw_schema_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, 'flow', ?, 1, ?, ?)
+                """,
+                (
+                    actual,
+                    label_set_key,
+                    header["label_set_name"],
+                    version,
+                    header.get("language", "zh-CN"),
+                    source_hash,
+                    _json(schema),
+                    _now(),
+                ),
+            )
+            for label in schema["labels"]:
+                connection.execute(
+                    """
+                    INSERT INTO label_definition VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        _stable_id("lbl", actual, label["code"]),
+                        actual,
+                        label["code"],
+                        label["name"],
+                        label["group"],
+                        label.get("description"),
+                        1 if label.get("enabled", True) else 0,
+                        _json(label["annotation_scopes"]),
+                        _json(label["target_types"]),
+                        label.get("default_severity"),
+                        label.get("default_action"),
+                        label.get("shortcut"),
+                        label.get("color"),
+                        _json(label.get("applicable_profiles", [])),
+                        _json(label.get("fields", [])),
+                    ),
+                )
+        connection.execute(
+            "UPDATE workspace SET active_label_set_id = ?, updated_at = ?",
+            (actual, _now()),
+        )
+    return {
+        "id": actual,
+        "label_set_id": label_set_key,
+        "version": version,
+        "source_format": "flow",
+        "source_hash": source_hash,
+        "active": True,
+    }
 
 
 def _active_label_schema(connection: sqlite3.Connection) -> dict[str, object] | None:

@@ -23,12 +23,14 @@ from episode_qc.playback import (
 )
 from episode_qc.workspace import (
     activate_label_set,
+    canonical_json_sha256,
     clear_local_task_history,
     delete_label_set,
     delete_annotation,
     episode_detail,
     export_workspace,
     import_label_schema,
+    install_flow_label_schema,
     initialize_workspace,
     list_label_sets,
     list_qc_tasks,
@@ -43,6 +45,82 @@ from episode_qc.workspace import (
     WorkspaceConflictError,
     workspace_state,
 )
+
+
+FLOW_SCHEMA = {
+    "schema": {
+        "schema_type": "annotation_label_schema",
+        "schema_version": "1.0.0",
+        "label_set_id": "task-quality",
+        "label_set_name": "任务质量标签",
+        "language": "zh-CN",
+    },
+    "severity_levels": [{"code": "normal", "name": "一般", "order": 1}],
+    "actions": [{"code": "keep", "name": "保留"}],
+    "groups": [{"code": "motion", "name": "动作", "order": 1}],
+    "labels": [
+        {
+            "code": "body_sway",
+            "name": "身体摇晃",
+            "group": "motion",
+            "enabled": True,
+            "annotation_scopes": ["episode"],
+            "target_types": ["global"],
+            "default_severity": "normal",
+            "default_action": "keep",
+            "shortcut": "W",
+            "color": "#3377AA",
+        }
+    ],
+}
+
+
+def test_flow_label_schema_installs_exact_snapshot_and_accepts_its_label(tmp_path: Path):
+    root = tmp_path / "dataset"
+    _write_sample_episode(root / "episode_000001")
+    db_path = tmp_path / "workspace.db"
+    episode_id = scan_data_source(db_path, root)["episodes"][0]["id"]
+    flow_job = {
+        "label_set_id": "task-quality",
+        "label_schema_version": "1.0.0",
+        "label_schema": FLOW_SCHEMA,
+        "label_schema_hash": canonical_json_sha256(FLOW_SCHEMA),
+    }
+
+    installed = install_flow_label_schema(db_path, flow_job)
+    annotation = save_annotation(
+        db_path,
+        {
+            "episode_id": episode_id,
+            "label_code": "body_sway",
+            "scope": "episode",
+            "target_type": "global",
+        },
+    )
+
+    assert installed["label_set_id"] == "task-quality"
+    assert installed["active"] is True
+    assert annotation["label_code"] == "body_sway"
+
+
+def test_flow_label_schema_rejects_different_local_schema_at_same_version(tmp_path: Path):
+    db_path = tmp_path / "workspace.db"
+    local_schema = json.loads(json.dumps(FLOW_SCHEMA))
+    local_schema["labels"][0]["code"] = "local_sway"
+    local_path = tmp_path / "local-labels.yaml"
+    local_path.write_text(yaml.safe_dump(local_schema, allow_unicode=True), encoding="utf-8")
+    import_label_schema(db_path, local_path)
+    flow_job = {
+        "label_set_id": "task-quality",
+        "label_schema_version": "1.0.0",
+        "label_schema": FLOW_SCHEMA,
+        "label_schema_hash": canonical_json_sha256(FLOW_SCHEMA),
+    }
+
+    with pytest.raises(ValueError, match="同一标签集版本"):
+        install_flow_label_schema(db_path, flow_job)
+
+    assert workspace_state(db_path)["label_schema"]["labels"][0]["code"] == "local_sway"
 
 
 def test_v1_import_playback_annotation_and_export_round_trip(tmp_path: Path):

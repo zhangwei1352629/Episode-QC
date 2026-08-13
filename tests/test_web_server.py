@@ -121,9 +121,54 @@ def running_server(
         server.server_close()
 
 
-def test_web_application_does_not_start_an_automatic_platform_cache_cleanup(tmp_path: Path):
-    with running_server(tmp_path) as (server, _):
-        assert not hasattr(server.application, "_platform_cache_cleanup")
+def test_web_application_evicts_expired_platform_cache_on_startup(tmp_path: Path):
+    expired = tmp_path / "workspace" / "platform-cache" / "ready" / "QCJ-expired"
+    expired.mkdir(parents=True)
+    (expired / ".qc-cache.json").write_text(
+        json.dumps({
+            "result_synced": True,
+            "result_synced_at": "2026-08-09T11:59:59+00:00",
+        }),
+        encoding="utf-8",
+    )
+    (expired / "asset.bin").write_bytes(b"synced-cache")
+
+    with running_server(tmp_path):
+        assert not expired.exists()
+
+
+def test_web_application_starts_and_closes_platform_cache_cleanup(tmp_path: Path, monkeypatch):
+    events = []
+
+    class ControlledCleanup:
+        def __init__(self, manager_factory, *, interval_seconds):
+            self.manager_factory = manager_factory
+            events.append(("created", interval_seconds))
+
+        def start(self):
+            events.append("started")
+
+        def close(self):
+            events.append("closed")
+
+    monkeypatch.setattr(web_server, "PlatformCacheCleanup", ControlledCleanup, raising=False)
+
+    with running_server(tmp_path):
+        assert events == [("created", 3600), "started"]
+
+    assert events == [("created", 3600), "started", "closed"]
+
+
+def test_cleanup_failure_does_not_stop_the_web_server(tmp_path: Path, monkeypatch, caplog):
+    def fail_cleanup(_manager):
+        raise RuntimeError("cleanup disk error")
+
+    monkeypatch.setattr(QualityCacheManager, "evict_expired", fail_cleanup)
+
+    with running_server(tmp_path) as (_, base_url):
+        assert request_json(f"{base_url}/api/workspace")
+
+    assert "platform cache cleanup failed source=startup" in caplog.text
 
 
 def test_web_flow_label_schema_is_installed_before_ready_episode_indexing(tmp_path: Path, monkeypatch):

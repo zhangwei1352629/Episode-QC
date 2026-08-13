@@ -7,6 +7,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import ipaddress
 import json
+import logging
 import mimetypes
 import os
 from pathlib import Path
@@ -63,6 +64,8 @@ ACTION_KEYS = {"policy", "policy_target", "policy_command", "soma"}
 WEB_TOKEN_FILE = ".web-token"
 LOCAL_WEB_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 WILDCARD_WEB_HOSTS = frozenset({"0.0.0.0", "::"})
+PLATFORM_CACHE_CLEANUP_INTERVAL_SECONDS = 60 * 60
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -214,6 +217,49 @@ class PlaybackRegistry:
         return value
 
 
+class PlatformCacheCleanup:
+    """Schedule only the existing safe retention policy for one QC workspace."""
+
+    def __init__(self, manager_factory, *, interval_seconds: int) -> None:
+        self._manager_factory = manager_factory
+        self._interval_seconds = interval_seconds
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        self.run_once("startup")
+        self._thread = threading.Thread(
+            target=self._run,
+            name="episode-qc-platform-cache-cleanup",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def run_once(self, source: str) -> None:
+        try:
+            summary = self._manager_factory().evict_expired()
+        except Exception:
+            LOGGER.exception("platform cache cleanup failed source=%s", source)
+            return
+        LOGGER.info(
+            "platform cache cleanup source=%s scanned=%s evicted=%s freed_bytes=%s failed=%s",
+            source,
+            summary.get("scanned_jobs", 0),
+            len(summary.get("evicted_jobs", [])),
+            summary.get("freed_bytes", 0),
+            len(summary.get("failed_jobs", {})),
+        )
+
+    def close(self) -> None:
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+
+    def _run(self) -> None:
+        while not self._stop_event.wait(self._interval_seconds):
+            self.run_once("periodic")
+
+
 class EpisodeQcWebApplication:
     def __init__(
         self,
@@ -246,9 +292,15 @@ class EpisodeQcWebApplication:
         self.session_id = f"web-{self.token[:12]}"
         paths.root.mkdir(parents=True, exist_ok=True)
         initialize_workspace(paths.db_path)
+        self._platform_cache_cleanup = PlatformCacheCleanup(
+            self._quality_cache_manager,
+            interval_seconds=PLATFORM_CACHE_CLEANUP_INTERVAL_SECONDS,
+        )
+        self._platform_cache_cleanup.start()
         self._connect_platform_from_environment()
 
     def close(self) -> None:
+        self._platform_cache_cleanup.close()
         self._executor.shutdown(wait=False, cancel_futures=True)
         self._platform_executor.shutdown(wait=False, cancel_futures=True)
 

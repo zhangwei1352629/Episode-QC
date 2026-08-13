@@ -15,6 +15,7 @@ import yaml
 from mcap.reader import make_reader
 
 from episode_qc.bvh import read_bvh_header
+from episode_qc.platform_workflow import canonical_json_sha256
 from episode_qc.source_paths import resolve_source_directory
 
 
@@ -1772,6 +1773,9 @@ def import_flow_label_schema(db_path: str | Path, job: dict) -> dict[str, object
     raw_schema = job.get("label_schema")
     if not isinstance(raw_schema, dict):
         raise ValueError("Flow 质检任务缺少冻结标签库快照")
+    schema_hash = canonical_json_sha256(raw_schema)
+    if schema_hash.lower() != supplied["label_schema_hash"].lower():
+        raise ValueError("Flow 任务标签库快照摘要与冻结版本引用不一致")
     schema = _normalize_label_schema(raw_schema, fallback_name=supplied["label_set_id"])
     errors = validate_label_schema(schema)
     if errors:

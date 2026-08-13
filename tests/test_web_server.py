@@ -305,6 +305,7 @@ Frame Time: 0.010000
         ],
         "cache_progress": 0,
     }
+    job["label_schema_hash"] = canonical_json_sha256(job["label_schema"])
     manifest = {
         "schema_version": 1,
         "asset_id": job["asset_id"],
@@ -444,7 +445,7 @@ Frame Time: 0.010000
         assert job["submitted"]["label_set"] == {
             "label_set_id": "task-quality-v1",
             "label_schema_version": "1.0.0",
-            "label_schema_hash": "a" * 64,
+            "label_schema_hash": job["label_schema_hash"],
         }
         assert job["submitted"]["episode_results"][0]["annotations"] == []
         assert "annotations" not in job["submitted"]["episode_results"][0]["result"]

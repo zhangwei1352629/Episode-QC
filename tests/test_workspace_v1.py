@@ -21,6 +21,7 @@ from episode_qc.playback import (
     read_cached_motion_frame,
     read_cached_robot_action_frame,
 )
+from episode_qc.platform_workflow import canonical_json_sha256
 from episode_qc.workspace import (
     activate_label_set,
     clear_local_task_history,
@@ -28,6 +29,7 @@ from episode_qc.workspace import (
     delete_annotation,
     episode_detail,
     export_workspace,
+    import_flow_label_schema,
     import_label_schema,
     initialize_workspace,
     list_label_sets,
@@ -43,6 +45,49 @@ from episode_qc.workspace import (
     WorkspaceConflictError,
     workspace_state,
 )
+
+
+def test_flow_label_schema_rejects_snapshot_hash_mismatch(tmp_path: Path):
+    schema = {
+        "schema": {
+            "schema_type": "annotation_label_schema",
+            "schema_version": "1.0.0",
+            "label_set_id": "flow_task_quality",
+            "label_set_name": "Flow 任务标签",
+            "language": "zh-CN",
+        },
+        "severity_levels": [],
+        "actions": [],
+        "groups": [{"code": "quality", "name": "质量", "order": 1}],
+        "labels": [
+            {
+                "code": "camera_occlusion",
+                "name": "相机遮挡",
+                "group": "quality",
+                "enabled": True,
+                "annotation_scopes": ["episode"],
+                "target_types": ["global"],
+                "fields": [],
+            }
+        ],
+    }
+    job = {
+        "label_set_id": "flow_task_quality",
+        "label_schema_version": "1.0.0",
+        "label_schema_hash": canonical_json_sha256(schema),
+        "label_schema": schema,
+    }
+    db_path = tmp_path / "workspace.db"
+
+    tampered = json.loads(json.dumps(job, ensure_ascii=False))
+    tampered["label_schema"]["labels"][0]["name"] = "被篡改的标签"
+    with pytest.raises(ValueError, match="摘要"):
+        import_flow_label_schema(db_path, tampered)
+
+    imported = import_flow_label_schema(db_path, job)
+    assert imported is not None
+    assert imported["source_hash"] == job["label_schema_hash"]
+    assert workspace_state(db_path)["label_schema"]["labels"][0]["name"] == "相机遮挡"
 
 
 def test_v1_import_playback_annotation_and_export_round_trip(tmp_path: Path):

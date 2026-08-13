@@ -881,6 +881,55 @@ def test_legacy_annotations_are_rejected_before_result_publication(tmp_path: Pat
     assert client.results == []
 
 
+def test_partial_label_reference_is_rejected_before_result_publication(
+    tmp_path: Path, monkeypatch
+):
+    """Catches partial frozen references reaching NAS even when no facts exist."""
+    cache = QualityCacheManager(tmp_path / "qc-cache", reserve_bytes=0)
+    job = {
+        "code": "QCJ-PARTIAL-LABEL-REFERENCE",
+        "asset_id": "AST-PARTIAL-LABEL-REFERENCE",
+        "label_set_id": "task-quality",
+        "episodes": [{"episode_id": "AST-PARTIAL-LABEL-REFERENCE-EP0001"}],
+    }
+    state_path = tmp_path / "qc-cache" / "ready" / job["code"] / ".qc-cache.json"
+    QualityCacheManager._write_json_atomic(
+        state_path,
+        {
+            "schema_version": 3,
+            "job_code": job["code"],
+            "asset_id": job["asset_id"],
+            "cache_complete": True,
+            "episodes": [
+                {
+                    "episode_id": "AST-PARTIAL-LABEL-REFERENCE-EP0001",
+                    "status": "ready",
+                }
+            ],
+        },
+    )
+    publish_calls = []
+    monkeypatch.setattr(cache, "_publish_result", lambda *args: publish_calls.append(args))
+    client = FakeFlowClient(job)
+
+    with pytest.raises(QualityCacheError, match="标签库引用"):
+        cache.submit_result(
+            client,
+            job,
+            episode_results=[
+                {
+                    "episode_id": "AST-PARTIAL-LABEL-REFERENCE-EP0001",
+                    "decision": "pass",
+                    "annotation_count": 0,
+                }
+            ],
+        )
+
+    assert not (tmp_path / "qc-cache" / "results-pending" / job["code"]).exists()
+    assert publish_calls == []
+    assert client.results == []
+
+
 def test_cache_job_accepts_partial_job_coverage_and_copies_only_covered_files(tmp_path: Path):
     """Catches partial Flow QC Jobs being rejected or downloading unscoped Episode files."""
     asset_root = tmp_path / "nas" / "AST-PARTIAL-001"

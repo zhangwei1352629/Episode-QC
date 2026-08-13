@@ -15,6 +15,115 @@ def test_cli_help(capsys):
     assert "Quality-control helpers" in capsys.readouterr().out
 
 
+def test_platform_submit_moves_workspace_annotations_to_direct_facts(
+    monkeypatch, tmp_path, capsys
+):
+    """Catches labeled CLI submissions hiding Flow facts inside local metadata."""
+    submitted = []
+
+    class FakeManager:
+        def __init__(self, cache_root):
+            assert cache_root == tmp_path / "qc-cache"
+
+        def local_episode_mappings(self, job_code):
+            assert job_code == "QCJ-CLI-LABELS"
+            return [
+                {"episode_id": "FLOW-EP-1", "local_episode_id": "local-ep-1"},
+                {"episode_id": "FLOW-EP-2", "local_episode_id": "local-ep-2"},
+            ]
+
+        def submit_result(self, client, job, *, episode_results, result):
+            submitted.append(
+                {
+                    "client": client,
+                    "job": job,
+                    "episode_results": episode_results,
+                    "result": result,
+                }
+            )
+            return {"status": "completed"}
+
+    client = object()
+    job = {"code": "QCJ-CLI-LABELS"}
+    annotation = {"annotation_id": "ann-cli-1", "label_code": "body_sway"}
+    monkeypatch.setattr(cli, "QualityCacheManager", FakeManager)
+    monkeypatch.setattr(cli, "_platform_client", lambda args: client)
+    monkeypatch.setattr(cli, "_platform_job", lambda current_client, job_code: job)
+    monkeypatch.setattr(
+        cli,
+        "episode_detail",
+        lambda db_path, episode_id: (
+            {
+                "episode": {
+                    "quality_decision": "pass_with_labels",
+                    "annotation_count": 1,
+                    "review_status": "completed",
+                    "reviewer_name": "Reviewer",
+                },
+                "annotations": [annotation],
+            }
+            if episode_id == "local-ep-1"
+            else {
+                "episode": {
+                    "quality_decision": "pass",
+                    "annotation_count": 0,
+                    "review_status": "completed",
+                    "reviewer_name": "Reviewer",
+                },
+                "annotations": [],
+            }
+        ),
+    )
+
+    assert (
+        cli.main(
+            [
+                "platform-submit",
+                "--username",
+                "reviewer",
+                "--password",
+                "secret",
+                "QCJ-CLI-LABELS",
+                str(tmp_path / "qc-cache"),
+                str(tmp_path / "workspace.db"),
+            ]
+        )
+        == 0
+    )
+
+    assert submitted == [
+        {
+            "client": client,
+            "job": job,
+            "episode_results": [
+                {
+                    "episode_id": "FLOW-EP-1",
+                    "decision": "pass_with_labels",
+                    "annotation_count": 1,
+                    "annotations": [annotation],
+                    "result": {
+                        "local_episode_id": "local-ep-1",
+                        "review_status": "completed",
+                        "reviewer_name": "Reviewer",
+                    },
+                },
+                {
+                    "episode_id": "FLOW-EP-2",
+                    "decision": "pass",
+                    "annotation_count": 0,
+                    "result": {
+                        "local_episode_id": "local-ep-2",
+                        "review_status": "completed",
+                        "reviewer_name": "Reviewer",
+                    },
+                }
+            ],
+            "result": {"episode_count": 2},
+        }
+    ]
+    assert '"status": "completed"' in capsys.readouterr().out
+
+
 def test_web_cli_accepts_multiple_lan_hosts():
     args = cli.build_parser().parse_args(
         [

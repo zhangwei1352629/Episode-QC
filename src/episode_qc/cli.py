@@ -858,9 +858,10 @@ def _cmd_platform_submit(args: argparse.Namespace) -> int:
                 "local_episode_id": local_episode_id,
                 "review_status": local_episode.get("review_status"),
                 "reviewer_name": local_episode.get("reviewer_name"),
-                "annotations": detail["annotations"],
             },
         }
+        if detail["annotations"]:
+            episode_result["annotations"] = detail["annotations"]
         if args.quality_grade:
             episode_result["quality_grade"] = args.quality_grade
         episode_results.append(episode_result)

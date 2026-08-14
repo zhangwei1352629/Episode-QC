@@ -937,6 +937,54 @@ def test_legacy_annotations_are_rejected_before_result_publication(tmp_path: Pat
     assert client.results == []
 
 
+def test_unlabeled_positive_annotation_count_is_rejected_before_result_publication(
+    tmp_path: Path, monkeypatch
+):
+    """Catches legacy unlabeled payloads claiming annotations without listing them."""
+    cache = QualityCacheManager(tmp_path / "qc-cache", reserve_bytes=0)
+    job = {
+        "code": "QCJ-UNLABELED-POSITIVE-COUNT",
+        "asset_id": "AST-UNLABELED-POSITIVE-COUNT",
+        "episodes": [{"episode_id": "AST-UNLABELED-POSITIVE-COUNT-EP0001"}],
+    }
+    state_path = tmp_path / "qc-cache" / "ready" / job["code"] / ".qc-cache.json"
+    QualityCacheManager._write_json_atomic(
+        state_path,
+        {
+            "schema_version": 3,
+            "job_code": job["code"],
+            "asset_id": job["asset_id"],
+            "cache_complete": True,
+            "episodes": [
+                {
+                    "episode_id": "AST-UNLABELED-POSITIVE-COUNT-EP0001",
+                    "status": "ready",
+                }
+            ],
+        },
+    )
+    publish_calls = []
+    monkeypatch.setattr(cache, "_publish_result", lambda *args: publish_calls.append(args))
+    client = FakeFlowClient(job)
+
+    with pytest.raises(QualityCacheError, match="标签库引用"):
+        cache.submit_result(
+            client,
+            job,
+            episode_results=[
+                {
+                    "episode_id": "AST-UNLABELED-POSITIVE-COUNT-EP0001",
+                    "decision": "pass_with_labels",
+                    "annotation_count": 1,
+                }
+            ],
+        )
+
+    assert not (tmp_path / "qc-cache" / "results-pending" / job["code"]).exists()
+    assert publish_calls == []
+    assert client.results == []
+
+
 def test_partial_label_reference_is_rejected_before_result_publication(
     tmp_path: Path, monkeypatch
 ):

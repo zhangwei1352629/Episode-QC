@@ -698,6 +698,8 @@ class QualityCacheManager:
                 else []
             )
             annotation_count = int(episode_result.get("annotation_count") or 0)
+            if label_set is None and annotation_count > 0:
+                raise QualityCacheError("无 Flow 标签库引用的质检结果只允许零标注")
             if label_set is not None or has_direct_annotations:
                 if annotation_count != len(annotations):
                     raise QualityCacheError("annotation_count 必须等于 annotations 数量")

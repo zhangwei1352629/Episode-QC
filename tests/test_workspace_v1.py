@@ -223,6 +223,20 @@ def test_flow_label_schema_ignores_legacy_job_without_creating_workspace(tmp_pat
     assert not db_path.exists()
 
 
+def test_flow_label_schema_treats_empty_flow_reference_as_unlabeled(tmp_path: Path):
+    """Catches Flow's empty hash being mistaken for a partial label snapshot."""
+    db_path = tmp_path / "workspace.db"
+    flow_job = {
+        "label_set_id": None,
+        "label_schema_version": None,
+        "label_schema_hash": "",
+        "label_schema": None,
+    }
+
+    assert install_flow_label_schema(db_path, flow_job) == {"active": False}
+    assert not db_path.exists()
+
+
 def test_flow_label_schema_content_conflict_leaves_local_storage_unchanged(tmp_path: Path):
     db_path = tmp_path / "workspace.db"
     local_schema = json.loads(json.dumps(FLOW_SCHEMA))

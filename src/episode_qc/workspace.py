@@ -1847,7 +1847,14 @@ def install_flow_label_schema(
         "label_schema_hash",
         "label_schema",
     )
-    provided = {field: job.get(field) for field in reference_fields if job.get(field) is not None}
+    provided = {
+        field: job.get(field)
+        for field in reference_fields
+        if (
+            job.get(field) is not None
+            and (field == "label_schema" or job.get(field) != "")
+        )
+    }
     if not provided:
         return {"active": False}
     if len(provided) != len(reference_fields):

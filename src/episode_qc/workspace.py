@@ -904,9 +904,17 @@ def _restore_task_annotations(
     ).fetchall()
     if not episode_rows:
         return 0, []
-    episode_by_path: dict[str, sqlite3.Row] = {
-        str(row["relative_path"]): row for row in episode_rows if row["relative_path"]
-    }
+    episode_by_path: dict[str, sqlite3.Row] = {}
+    for row in episode_rows:
+        relative_path = _normalize_relative_episode_path(row["relative_path"])
+        if relative_path is None:
+            continue
+        episode_by_path[relative_path] = row
+        prefixed_path = _normalize_relative_episode_path(
+            f"{root_path.name}/{relative_path}"
+        )
+        if prefixed_path is not None:
+            episode_by_path.setdefault(prefixed_path, row)
     episode_by_id: dict[str, sqlite3.Row] = {str(row["id"]): row for row in episode_rows}
     restored = 0
     import_warnings: list[str] = []

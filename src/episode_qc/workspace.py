@@ -655,6 +655,7 @@ def scan_data_source(
                     "UPDATE episode SET import_status = 'source_missing', import_error = ?, updated_at = ? WHERE id = ?",
                     ("源文件在本次重扫中未找到", _now(), row["id"]),
                 )
+        restored_annotations, import_warnings = _restore_task_annotations(connection, source_id, root)
 
     failures = [item for item in indexed if item["import_status"] != "ready"]
     with connect_workspace(db_path) as connection:
@@ -683,6 +684,8 @@ def scan_data_source(
         "ready": len(indexed) - len(failures),
         "failed": len(failures),
         "unchanged": sum(1 for item in indexed if item.get("unchanged")),
+        "restored_annotations": restored_annotations,
+        "import_warnings": import_warnings,
         "episodes": indexed,
     }
 
@@ -706,6 +709,225 @@ def _discover_episode_mcaps(root: Path, profile: dict[str, object]) -> list[Path
             if current is None or _episode_file_rank(resolved) < _episode_file_rank(current):
                 paths_by_directory[resolved.parent] = resolved
     return sorted(paths_by_directory.values(), key=lambda item: _natural_key(str(item.relative_to(root))))
+
+
+def _discover_annotation_result_files(root: Path) -> list[Path]:
+    if not root.is_dir():
+        return []
+    discovered: list[Path] = []
+    seen: set[str] = set()
+    preferred = root / "qc_result.json"
+    if preferred.is_file():
+        discovered.append(preferred)
+        seen.add(str(preferred))
+    for path in sorted(root.glob("*标注结果.json")):
+        if path.is_file() and str(path) not in seen:
+            discovered.append(path)
+            seen.add(str(path))
+    return discovered
+
+
+def _normalize_relative_episode_path(raw_path: object) -> str | None:
+    if not raw_path:
+        return None
+    if not isinstance(raw_path, str):
+        return None
+    value = raw_path.strip().replace("\\", "/")
+    if not value:
+        return None
+    if value.startswith("/") or re.match(r"^[A-Za-z]:/", value):
+        return None
+    while value.startswith("./"):
+        value = value[2:].lstrip("/")
+    value = value.lstrip("./")
+    if not value:
+        return None
+    return str(Path(value).as_posix())
+
+
+def _extract_annotations_for_import(document: object) -> list[dict[str, object]]:
+    if not isinstance(document, dict):
+        return []
+    raw_annotations = document.get("annotations")
+    if isinstance(raw_annotations, list):
+        return [item for item in raw_annotations if isinstance(item, dict)]
+    return []
+
+
+def _normalize_imported_annotation(item: dict[str, object]) -> dict[str, object]:
+    value = dict(item)
+    if "attributes" not in value and "attributes_json" in value:
+        raw_attributes = value["attributes_json"]
+        if not isinstance(raw_attributes, str):
+            raise ValueError("attributes_json 必须是 JSON 字符串")
+        attributes = _loads(raw_attributes, None)
+        if not isinstance(attributes, dict):
+            raise ValueError("attributes_json 必须解析为对象")
+        value["attributes"] = attributes
+    if "reviewer_name" not in value and "reviewer" in value:
+        value["reviewer_name"] = str(value.get("reviewer") or "")
+    return value
+
+
+def _resolve_import_annotation_id(
+    connection: sqlite3.Connection,
+    episode_id: str,
+    source_episode_id: str,
+    annotation_id: str,
+) -> str:
+    candidate_id = (
+        annotation_id
+        if source_episode_id == episode_id
+        else _stable_id("ann", episode_id, annotation_id)
+    )
+    existing = connection.execute(
+        "SELECT episode_id FROM annotation WHERE id = ?",
+        (candidate_id,),
+    ).fetchone()
+    if existing is not None and str(existing["episode_id"]) != episode_id:
+        raise ValueError(f"标注 ID 冲突: {annotation_id}")
+    return candidate_id
+
+
+def _restore_task_annotation(connection: sqlite3.Connection, episode_by_path: dict[str, sqlite3.Row], episode_by_id: dict[str, sqlite3.Row], item: dict[str, object]) -> str:
+    item = _normalize_imported_annotation(item)
+    episode: sqlite3.Row | None = None
+    relative_path = _normalize_relative_episode_path(
+        item.get("relative_episode_path") or item.get("relative_path")
+    )
+    if relative_path is not None:
+        episode = episode_by_path.get(relative_path)
+    if episode is None:
+        episode = episode_by_id.get(str(item.get("episode_id") or ""))
+    if episode is None:
+        raise ValueError(
+            f"未在本任务中匹配到标注关联的 Episode：{item.get('relative_episode_path') or item.get('relative_path') or item.get('episode_id')}"
+        )
+
+    annotation_id = str(item.get("annotation_id") or item.get("id") or "").strip()
+    if not annotation_id:
+        annotation_id = _new_id("ann")
+    annotation_id = _resolve_import_annotation_id(
+        connection,
+        str(episode["id"]),
+        str(item.get("episode_id") or ""),
+        annotation_id,
+    )
+    label_set_id = str(item.get("label_set_id") or item.get("label_set_key") or "").strip()
+    label_schema_version = str(item.get("label_schema_version") or "").strip()
+    label_code = str(item.get("label_code") or "").strip()
+    if not label_set_id or not label_schema_version or not label_code:
+        raise ValueError("标注缺少 label_set_id、label_schema_version 或 label_code")
+    label = connection.execute(
+        """
+        SELECT ld.*
+        FROM label_set ls
+        JOIN label_definition ld ON ld.label_set_id = ls.id
+        WHERE ls.label_set_key = ? AND ls.version = ? AND ld.code = ?
+        """,
+        (label_set_id, label_schema_version, label_code),
+    ).fetchone()
+    if label is None:
+        raise ValueError(f"标签不存在或未激活: {label_code} ({label_set_id}@{label_schema_version})")
+
+    normalized = _validate_annotation_payload(dict(item), episode, label)
+    now = _now()
+    connection.execute(
+        """
+        INSERT INTO annotation(
+            id, episode_id, label_set_key, label_schema_version, label_code, scope,
+            start_offset_ns, end_offset_ns, target_type, target_key, severity, action,
+            comment, attributes_json, source, status, reviewer_name, created_at, updated_at, deleted_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+        ON CONFLICT(id) DO UPDATE SET
+            label_set_key = excluded.label_set_key,
+            label_schema_version = excluded.label_schema_version,
+            label_code = excluded.label_code,
+            scope = excluded.scope,
+            start_offset_ns = excluded.start_offset_ns,
+            end_offset_ns = excluded.end_offset_ns,
+            target_type = excluded.target_type,
+            target_key = excluded.target_key,
+            severity = excluded.severity,
+            action = excluded.action,
+            comment = excluded.comment,
+            attributes_json = excluded.attributes_json,
+            source = excluded.source,
+            status = excluded.status,
+            reviewer_name = excluded.reviewer_name,
+            updated_at = excluded.updated_at,
+            deleted_at = NULL,
+            created_at = annotation.created_at
+        """,
+        (
+            annotation_id,
+            episode["id"],
+            label_set_id,
+            label_schema_version,
+            label_code,
+            normalized["scope"],
+            int(normalized["start_offset_ns"]),
+            int(normalized["end_offset_ns"]),
+            normalized["target_type"],
+            normalized.get("target_key"),
+            normalized.get("severity") or label["default_severity"],
+            normalized.get("action") or label["default_action"],
+            normalized.get("comment", ""),
+            _json(normalized.get("attributes", {})),
+            "imported",
+            normalized.get("status", "confirmed"),
+            str(normalized.get("reviewer_name") or ""),
+            str(item.get("created_at") or now),
+            now,
+        ),
+    )
+    if episode["review_status"] == "unreviewed":
+        connection.execute(
+            "UPDATE episode SET review_status = 'in_progress', updated_at = ? WHERE id = ?",
+            (now, episode["id"]),
+        )
+    _refresh_annotation_count(connection, episode["id"])
+    return str(episode["id"])
+
+
+def _restore_task_annotations(
+    connection: sqlite3.Connection,
+    source_id: str,
+    root_path: Path,
+) -> tuple[int, list[str]]:
+    result_files = _discover_annotation_result_files(root_path)
+    if not result_files:
+        return 0, []
+    episode_rows = connection.execute(
+        "SELECT * FROM episode WHERE data_source_id = ?",
+        (source_id,),
+    ).fetchall()
+    if not episode_rows:
+        return 0, []
+    episode_by_path: dict[str, sqlite3.Row] = {
+        str(row["relative_path"]): row for row in episode_rows if row["relative_path"]
+    }
+    episode_by_id: dict[str, sqlite3.Row] = {str(row["id"]): row for row in episode_rows}
+    restored = 0
+    import_warnings: list[str] = []
+    for path in result_files:
+        try:
+            document = _loads(path.read_text(encoding="utf-8"), None)
+        except (OSError, json.JSONDecodeError) as exc:
+            import_warnings.append(f"{path.name} 读取失败：{exc}")
+            continue
+        annotations = _extract_annotations_for_import(document)
+        if not annotations:
+            continue
+        for index, item in enumerate(annotations, start=1):
+            try:
+                _restore_task_annotation(connection, episode_by_path, episode_by_id, item)
+                restored += 1
+            except Exception as exc:
+                import_warnings.append(
+                    f"{path.name} 标注#{index} 恢复失败：{exc}"
+                )
+    return restored, import_warnings
 
 
 def _episode_file_rank(path: Path) -> tuple[int, str]:

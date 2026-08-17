@@ -4,6 +4,7 @@ import csv
 import io
 import json
 import re
+import shutil
 import sqlite3
 import struct
 from pathlib import Path
@@ -427,6 +428,105 @@ def test_export_writes_exactly_one_result_file_per_data_task(tmp_path: Path):
         assert document["episode_count"] == 1
         assert len(document["episodes"]) == 1
         assert {item["source_root"] for item in document["episodes"]} == set(document["source_directories"])
+
+
+def test_v1_import_restores_existing_annotations_json(tmp_path: Path):
+    source_root = tmp_path / "含 结果文件"
+    _write_sample_episode(source_root / "episode_000001")
+    db_path = tmp_path / "workspace.db"
+    schema_path = _write_label_schema(tmp_path / "labels.yaml")
+    import_label_schema(db_path, schema_path)
+
+    task = scan_data_source(db_path, source_root)
+    episode_id = task["episodes"][0]["id"]
+    annotation = save_annotation(
+        db_path,
+        {
+            "episode_id": episode_id,
+            "label_code": "camera_blur",
+            "scope": "time_range",
+            "start_offset_ns": 500_000_000,
+            "end_offset_ns": 1_500_000_000,
+            "target_type": "camera",
+            "target_key": "/camera/ego_head/image/jpeg",
+            "comment": "导入前标注",
+            "attributes": {"camera_state": "blurred"},
+            "reviewer_name": "质检员甲",
+        },
+    )
+    exported = export_workspace(db_path, tmp_path / "exports", export_format="json")
+    exported_file = Path(exported["output_file"])
+    (source_root / exported_file.name).write_text(exported_file.read_text(encoding="utf-8"), encoding="utf-8")
+
+    restore_db = tmp_path / "restore.db"
+    import_label_schema(restore_db, schema_path)
+    restored = scan_data_source(restore_db, source_root)
+
+    assert restored["restored_annotations"] == 1
+    assert restored["import_warnings"] == []
+    restored_episode_id = restored["episodes"][0]["id"]
+    detail = episode_detail(restore_db, restored_episode_id)
+    assert detail["episode"]["annotation_count"] == 1
+    assert detail["annotations"][0]["label_code"] == annotation["label_code"]
+    assert detail["annotations"][0]["annotation_id"] == annotation["annotation_id"]
+    assert detail["annotations"][0]["attributes"] == {"camera_state": "blurred"}
+    assert detail["annotations"][0]["reviewer_name"] == "质检员甲"
+
+
+def test_v1_import_isolates_duplicate_annotation_ids_between_tasks(tmp_path: Path):
+    source_a = tmp_path / "task_a"
+    _write_sample_episode(source_a / "episode_000001")
+    schema_path = _write_label_schema(tmp_path / "labels.yaml")
+
+    author_db = tmp_path / "author.db"
+    import_label_schema(author_db, schema_path)
+    authored = scan_data_source(author_db, source_a)
+    annotation = save_annotation(
+        author_db,
+        {
+            "episode_id": authored["episodes"][0]["id"],
+            "label_code": "camera_blur",
+            "scope": "time_range",
+            "start_offset_ns": 500_000_000,
+            "end_offset_ns": 1_500_000_000,
+            "target_type": "camera",
+            "target_key": "/camera/ego_head/image/jpeg",
+            "comment": "跨任务 ID 隔离",
+        },
+    )
+    exported = export_workspace(author_db, tmp_path / "exports", export_format="json")
+    exported_file = Path(exported["output_file"])
+    shutil.copy2(exported_file, source_a / exported_file.name)
+    source_b = tmp_path / "task_b"
+    shutil.copytree(source_a, source_b)
+
+    restore_db = tmp_path / "restore.db"
+    import_label_schema(restore_db, schema_path)
+    first = scan_data_source(restore_db, source_a)
+    second = scan_data_source(restore_db, source_b)
+
+    first_episode_id = first["episodes"][0]["id"]
+    second_episode_id = second["episodes"][0]["id"]
+    first_detail = episode_detail(restore_db, first_episode_id)
+    second_detail = episode_detail(restore_db, second_episode_id)
+    assert first["import_warnings"] == []
+    assert second["import_warnings"] == []
+    assert first_detail["episode"]["annotation_count"] == 1
+    assert len(first_detail["annotations"]) == 1
+    assert second_detail["episode"]["annotation_count"] == 1
+    assert len(second_detail["annotations"]) == 1
+    assert first_detail["annotations"][0]["annotation_id"] == annotation["annotation_id"]
+    assert first_detail["annotations"][0]["annotation_id"] != second_detail["annotations"][0]["annotation_id"]
+
+    cleared = clear_local_task_history(restore_db, keep_task_id=second["task_id"])
+    assert cleared["removed_count"] == 1
+    rescanned = scan_data_source(restore_db, source_b)
+    rescanned_detail = episode_detail(restore_db, second_episode_id)
+    assert rescanned["restored_annotations"] == 1
+    assert rescanned["import_warnings"] == []
+    assert rescanned_detail["episode"]["annotation_count"] == 1
+    assert len(rescanned_detail["annotations"]) == 1
+    assert rescanned_detail["annotations"][0]["annotation_id"] == second_detail["annotations"][0]["annotation_id"]
 
 
 def test_qc_tasks_isolate_episode_lists_and_reuse_same_source(tmp_path: Path):

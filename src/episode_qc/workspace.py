@@ -18,7 +18,7 @@ from episode_qc.bvh import read_bvh_header
 from episode_qc.source_paths import resolve_source_directory
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class WorkspaceConflictError(RuntimeError):
@@ -188,6 +188,7 @@ def _initialize_workspace(
                 origin TEXT NOT NULL DEFAULT 'local',
                 flow_job_code TEXT UNIQUE,
                 asset_id TEXT,
+                label_set_id TEXT REFERENCES label_set(id),
                 source_uri TEXT NOT NULL,
                 local_source_path TEXT NOT NULL,
                 source_type TEXT NOT NULL DEFAULT 'server_path',
@@ -350,6 +351,7 @@ def _initialize_workspace(
     )
     _ensure_column(connection, "data_source", "task_id", "TEXT REFERENCES qc_task(id)")
     _ensure_column(connection, "qc_task", "source_type", "TEXT NOT NULL DEFAULT 'server_path'")
+    _ensure_column(connection, "qc_task", "label_set_id", "TEXT REFERENCES label_set(id)")
     row = connection.execute("SELECT * FROM workspace LIMIT 1").fetchone()
     if row is None:
         workspace_id = _new_id("ws")
@@ -544,6 +546,7 @@ def scan_data_source(
     origin: str = "local",
     flow_job_code: str | None = None,
     asset_id: str | None = None,
+    label_set_id: str | None = None,
     source_uri: str | None = None,
     task_metadata: dict[str, object] | None = None,
 ) -> dict[str, object]:
@@ -565,6 +568,19 @@ def scan_data_source(
         profile_changed = bool(existing_source and existing_source["profile_json"] != profile_json)
         task_id = str(existing_source["task_id"]) if existing_source and existing_source["task_id"] else _stable_id("tsk", source_id)
         existing_task = connection.execute("SELECT * FROM qc_task WHERE id = ?", (task_id,)).fetchone()
+        if label_set_id is not None:
+            label_set = connection.execute(
+                "SELECT id FROM label_set WHERE id = ? AND enabled = 1",
+                (label_set_id,),
+            ).fetchone()
+            if label_set is None:
+                raise ValueError(f"QC 任务标签库不存在或已停用: {label_set_id}")
+            if (
+                existing_task is not None
+                and existing_task["label_set_id"]
+                and str(existing_task["label_set_id"]) != str(label_set_id)
+            ):
+                raise ValueError("同一 QC 任务不能改绑到不同标签版本")
         effective_task_code = str(task_code or (existing_task["task_code"] if existing_task else "")).strip()
         if not effective_task_code:
             effective_task_code = f"LOCAL-{now[:10].replace('-', '')}-{task_id[-6:].upper()}"
@@ -582,15 +598,16 @@ def scan_data_source(
             """
             INSERT INTO qc_task(
                 id, workspace_id, task_code, task_name, origin, flow_job_code, asset_id,
-                source_uri, local_source_path, status, import_error, metadata_json,
+                label_set_id, source_uri, local_source_path, status, import_error, metadata_json,
                 last_episode_id, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'importing', NULL, ?, NULL, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'importing', NULL, ?, NULL, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 task_code = excluded.task_code,
                 task_name = excluded.task_name,
                 origin = excluded.origin,
                 flow_job_code = COALESCE(excluded.flow_job_code, qc_task.flow_job_code),
                 asset_id = COALESCE(excluded.asset_id, qc_task.asset_id),
+                label_set_id = COALESCE(excluded.label_set_id, qc_task.label_set_id),
                 source_uri = excluded.source_uri,
                 local_source_path = excluded.local_source_path,
                 status = 'importing',
@@ -606,6 +623,7 @@ def scan_data_source(
                 effective_origin,
                 flow_job_code,
                 asset_id,
+                label_set_id,
                 effective_source_uri,
                 str(root),
                 _json(metadata or {}),
@@ -655,7 +673,11 @@ def scan_data_source(
                     "UPDATE episode SET import_status = 'source_missing', import_error = ?, updated_at = ? WHERE id = ?",
                     ("源文件在本次重扫中未找到", _now(), row["id"]),
                 )
-        restored_annotations, import_warnings = _restore_task_annotations(connection, source_id, root)
+        restored_annotations, restored_episode_states, import_warnings = _restore_task_annotations(
+            connection,
+            source_id,
+            root,
+        )
 
     failures = [item for item in indexed if item["import_status"] != "ready"]
     with connect_workspace(db_path) as connection:
@@ -685,6 +707,7 @@ def scan_data_source(
         "failed": len(failures),
         "unchanged": sum(1 for item in indexed if item.get("unchanged")),
         "restored_annotations": restored_annotations,
+        "restored_episode_states": restored_episode_states,
         "import_warnings": import_warnings,
         "episodes": indexed,
     }
@@ -754,6 +777,15 @@ def _extract_annotations_for_import(document: object) -> list[dict[str, object]]
     return []
 
 
+def _extract_episodes_for_import(document: object) -> list[dict[str, object]]:
+    if not isinstance(document, dict):
+        return []
+    raw_episodes = document.get("episodes")
+    if isinstance(raw_episodes, list):
+        return [item for item in raw_episodes if isinstance(item, dict)]
+    return []
+
+
 def _normalize_imported_annotation(item: dict[str, object]) -> dict[str, object]:
     value = dict(item)
     if "attributes" not in value and "attributes_json" in value:
@@ -767,6 +799,79 @@ def _normalize_imported_annotation(item: dict[str, object]) -> dict[str, object]
     if "reviewer_name" not in value and "reviewer" in value:
         value["reviewer_name"] = str(value.get("reviewer") or "")
     return value
+
+
+def _match_import_episode(
+    episode_by_path: dict[str, sqlite3.Row],
+    episode_by_id: dict[str, sqlite3.Row],
+    item: dict[str, object],
+) -> sqlite3.Row | None:
+    relative_path = _normalize_relative_episode_path(
+        item.get("relative_episode_path") or item.get("relative_path")
+    )
+    if relative_path is not None:
+        episode = episode_by_path.get(relative_path)
+        if episode is not None:
+            return episode
+    return episode_by_id.get(str(item.get("episode_id") or ""))
+
+
+def _restore_task_episode_state(
+    connection: sqlite3.Connection,
+    episode_by_path: dict[str, sqlite3.Row],
+    episode_by_id: dict[str, sqlite3.Row],
+    item: dict[str, object],
+) -> str | None:
+    episode = _match_import_episode(episode_by_path, episode_by_id, item)
+    if episode is None:
+        raise ValueError(
+            f"未在本任务中匹配到状态关联的 Episode：{item.get('relative_episode_path') or item.get('relative_path') or item.get('episode_id')}"
+        )
+
+    review_status = str(item.get("review_status") or "").strip()
+    if not review_status or review_status == "unreviewed":
+        return None
+    if review_status not in VALID_REVIEW_STATUSES:
+        raise ValueError(f"无效质检状态: {review_status}")
+
+    # Restore prior progress into a fresh task without overwriting work that has
+    # already advanced locally after the result file was produced.
+    current_episode = connection.execute(
+        "SELECT review_status FROM episode WHERE id = ?",
+        (episode["id"],),
+    ).fetchone()
+    if current_episode is None or str(current_episode["review_status"]) != "unreviewed":
+        return None
+
+    raw_decision = item.get("quality_decision")
+    quality_decision = str(raw_decision).strip() if raw_decision not in {None, ""} else None
+    if quality_decision is not None and quality_decision not in VALID_QUALITY_DECISIONS:
+        raise ValueError(f"无效质量结论: {quality_decision}")
+
+    reviewer_name = str(item.get("reviewer_name") or item.get("reviewer") or "")
+    imported_reviewed_at = str(item.get("reviewed_at") or "").strip() or None
+    if review_status in {"completed", "reviewed"}:
+        reviewed_at = imported_reviewed_at or _now()
+    else:
+        reviewed_at = imported_reviewed_at
+    now = _now()
+    connection.execute(
+        """
+        UPDATE episode
+        SET review_status = ?, quality_decision = ?, reviewer_name = ?,
+            reviewed_at = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (
+            review_status,
+            quality_decision,
+            reviewer_name,
+            reviewed_at,
+            now,
+            episode["id"],
+        ),
+    )
+    return str(episode["id"])
 
 
 def _resolve_import_annotation_id(
@@ -791,14 +896,7 @@ def _resolve_import_annotation_id(
 
 def _restore_task_annotation(connection: sqlite3.Connection, episode_by_path: dict[str, sqlite3.Row], episode_by_id: dict[str, sqlite3.Row], item: dict[str, object]) -> str:
     item = _normalize_imported_annotation(item)
-    episode: sqlite3.Row | None = None
-    relative_path = _normalize_relative_episode_path(
-        item.get("relative_episode_path") or item.get("relative_path")
-    )
-    if relative_path is not None:
-        episode = episode_by_path.get(relative_path)
-    if episode is None:
-        episode = episode_by_id.get(str(item.get("episode_id") or ""))
+    episode = _match_import_episode(episode_by_path, episode_by_id, item)
     if episode is None:
         raise ValueError(
             f"未在本任务中匹配到标注关联的 Episode：{item.get('relative_episode_path') or item.get('relative_path') or item.get('episode_id')}"
@@ -881,7 +979,11 @@ def _restore_task_annotation(connection: sqlite3.Connection, episode_by_path: di
             now,
         ),
     )
-    if episode["review_status"] == "unreviewed":
+    current_episode = connection.execute(
+        "SELECT review_status FROM episode WHERE id = ?",
+        (episode["id"],),
+    ).fetchone()
+    if current_episode is not None and current_episode["review_status"] == "unreviewed":
         connection.execute(
             "UPDATE episode SET review_status = 'in_progress', updated_at = ? WHERE id = ?",
             (now, episode["id"]),
@@ -894,16 +996,16 @@ def _restore_task_annotations(
     connection: sqlite3.Connection,
     source_id: str,
     root_path: Path,
-) -> tuple[int, list[str]]:
+) -> tuple[int, int, list[str]]:
     result_files = _discover_annotation_result_files(root_path)
     if not result_files:
-        return 0, []
+        return 0, 0, []
     episode_rows = connection.execute(
         "SELECT * FROM episode WHERE data_source_id = ?",
         (source_id,),
     ).fetchall()
     if not episode_rows:
-        return 0, []
+        return 0, 0, []
     episode_by_path: dict[str, sqlite3.Row] = {}
     for row in episode_rows:
         relative_path = _normalize_relative_episode_path(row["relative_path"])
@@ -916,7 +1018,8 @@ def _restore_task_annotations(
         if prefixed_path is not None:
             episode_by_path.setdefault(prefixed_path, row)
     episode_by_id: dict[str, sqlite3.Row] = {str(row["id"]): row for row in episode_rows}
-    restored = 0
+    restored_annotations = 0
+    restored_episode_states = 0
     import_warnings: list[str] = []
     for path in result_files:
         try:
@@ -924,18 +1027,31 @@ def _restore_task_annotations(
         except (OSError, json.JSONDecodeError) as exc:
             import_warnings.append(f"{path.name} 读取失败：{exc}")
             continue
+        episodes = _extract_episodes_for_import(document)
+        for index, item in enumerate(episodes, start=1):
+            try:
+                restored_episode_id = _restore_task_episode_state(
+                    connection,
+                    episode_by_path,
+                    episode_by_id,
+                    item,
+                )
+                if restored_episode_id is not None:
+                    restored_episode_states += 1
+            except Exception as exc:
+                import_warnings.append(
+                    f"{path.name} Episode#{index} 状态恢复失败：{exc}"
+                )
         annotations = _extract_annotations_for_import(document)
-        if not annotations:
-            continue
         for index, item in enumerate(annotations, start=1):
             try:
                 _restore_task_annotation(connection, episode_by_path, episode_by_id, item)
-                restored += 1
+                restored_annotations += 1
             except Exception as exc:
                 import_warnings.append(
                     f"{path.name} 标注#{index} 恢复失败：{exc}"
                 )
-    return restored, import_warnings
+    return restored_annotations, restored_episode_states, import_warnings
 
 
 def _episode_file_rank(path: Path) -> tuple[int, str]:
@@ -1560,6 +1676,7 @@ def rescan_qc_task(
         origin=str(task["origin"]),
         flow_job_code=str(task["flow_job_code"]) if task.get("flow_job_code") else None,
         asset_id=str(task["asset_id"]) if task.get("asset_id") else None,
+        label_set_id=str(task["label_set_id"]) if task.get("label_set_id") else None,
         source_uri=str(task["source_uri"]),
         task_metadata=task.get("metadata") if isinstance(task.get("metadata"), dict) else None,
     )
@@ -1578,7 +1695,7 @@ def workspace_state(db_path: str | Path, *, task_id: str | None = None) -> dict[
             episodes = _episode_rows(connection, "WHERE ds.task_id = ?", (task_id,))
         else:
             episodes = _episode_rows(connection)
-        label_schema = _active_label_schema(connection)
+        label_schema = _label_schema_for_task(connection, task_id)
     return {
         "workspace": workspace,
         "sources": sources,
@@ -1603,7 +1720,7 @@ def episode_detail(db_path: str | Path, episode_id: str) -> dict[str, object]:
             value["metadata"] = _loads(value.pop("metadata_json"), {})
             streams.append(value)
         annotations = _list_annotations(connection, episode_id)
-        schema = _active_label_schema(connection)
+        schema = _label_schema_for_task(connection, str(episode["task_id"]))
     return {"episode": episode, "streams": streams, "annotations": annotations, "label_schema": schema}
 
 
@@ -2013,55 +2130,67 @@ def import_label_schema(db_path: str | Path, schema_path: str | Path) -> dict[st
     schema = preview["schema"]
     header = schema["schema"]
     label_set_id = _stable_id("ls", header["label_set_id"], header["schema_version"])
+    canonical_hash = canonical_json_sha256(schema)
     with connect_workspace(db_path) as connection:
-        connection.execute(
-            """
-            INSERT INTO label_set(id, label_set_key, name, version, language, source_format, source_hash, enabled, raw_schema_json, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
-            ON CONFLICT(label_set_key, version) DO UPDATE SET
-                name = excluded.name, language = excluded.language, source_format = excluded.source_format,
-                source_hash = excluded.source_hash, raw_schema_json = excluded.raw_schema_json, enabled = 1
-            """,
-            (
-                label_set_id,
-                header["label_set_id"],
-                header["label_set_name"],
-                header["schema_version"],
-                header.get("language", "zh-CN"),
-                preview["source_format"],
-                preview["source_hash"],
-                _json(schema),
-                _now(),
-            ),
-        )
-        actual = connection.execute(
-            "SELECT id FROM label_set WHERE label_set_key = ? AND version = ?",
+        existing = connection.execute(
+            "SELECT id, raw_schema_json FROM label_set WHERE label_set_key = ? AND version = ?",
             (header["label_set_id"], header["schema_version"]),
-        ).fetchone()["id"]
-        connection.execute("DELETE FROM label_definition WHERE label_set_id = ?", (actual,))
-        for label in schema["labels"]:
+        ).fetchone()
+        if existing is not None:
+            existing_schema = _loads(existing["raw_schema_json"], {})
+            if canonical_json_sha256(existing_schema) != canonical_hash:
+                raise ValueError(
+                    "同一标签库 ID 和版本已存在不同内容，请提高版本号或更换标签库编码"
+                )
+            actual = str(existing["id"])
+            connection.execute(
+                "UPDATE label_set SET enabled = 1 WHERE id = ?",
+                (actual,),
+            )
+        else:
+            actual = label_set_id
             connection.execute(
                 """
-                INSERT INTO label_definition VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO label_set(
+                    id, label_set_key, name, version, language, source_format,
+                    source_hash, enabled, raw_schema_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
                 """,
                 (
-                    _stable_id("lbl", actual, label["code"]),
                     actual,
-                    label["code"],
-                    label["name"],
-                    label["group"],
-                    label.get("description"),
-                    1 if label.get("enabled", True) else 0,
-                    _json(label["annotation_scopes"]),
-                    _json(label["target_types"]),
-                    label.get("default_severity"),
-                    label.get("default_action"),
-                    label.get("shortcut"),
-                    label.get("color"),
-                    _json(label.get("applicable_profiles", [])),
-                    _json(label.get("fields", [])),
+                    header["label_set_id"],
+                    header["label_set_name"],
+                    header["schema_version"],
+                    header.get("language", "zh-CN"),
+                    preview["source_format"],
+                    preview["source_hash"],
+                    _json(schema),
+                    _now(),
                 ),
             )
+            for label in schema["labels"]:
+                connection.execute(
+                    """
+                    INSERT INTO label_definition VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        _stable_id("lbl", actual, label["code"]),
+                        actual,
+                        label["code"],
+                        label["name"],
+                        label["group"],
+                        label.get("description"),
+                        1 if label.get("enabled", True) else 0,
+                        _json(label["annotation_scopes"]),
+                        _json(label["target_types"]),
+                        label.get("default_severity"),
+                        label.get("default_action"),
+                        label.get("shortcut"),
+                        label.get("color"),
+                        _json(label.get("applicable_profiles", [])),
+                        _json(label.get("fields", [])),
+                    ),
+                )
         connection.execute("UPDATE workspace SET active_label_set_id = ?, updated_at = ?", (actual, _now()))
     return {key: value for key, value in preview.items() if key != "schema"} | {"active": True}
 
@@ -2128,10 +2257,7 @@ def install_flow_label_schema(
         ).fetchone()
         if existing is not None:
             existing_schema = _loads(existing["raw_schema_json"])
-            if (
-                str(existing["source_hash"]) != source_hash
-                or canonical_json_sha256(existing_schema) != source_hash
-            ):
+            if canonical_json_sha256(existing_schema) != source_hash:
                 raise ValueError("同一标签集版本已有不同的本地标签快照")
             actual = str(existing["id"])
             connection.execute("UPDATE label_set SET enabled = 1 WHERE id = ?", (actual,))
@@ -2178,10 +2304,6 @@ def install_flow_label_schema(
                         _json(label.get("fields", [])),
                     ),
                 )
-        connection.execute(
-            "UPDATE workspace SET active_label_set_id = ?, updated_at = ?",
-            (actual, _now()),
-        )
     return {
         "id": actual,
         "label_set_id": label_set_key,
@@ -2201,6 +2323,24 @@ def _active_label_schema(connection: sqlite3.Connection) -> dict[str, object] | 
         """
     ).fetchone()
     return _loads(row["raw_schema_json"], None) if row and row["raw_schema_json"] else None
+
+
+def _label_schema_for_task(
+    connection: sqlite3.Connection, task_id: str | None
+) -> dict[str, object] | None:
+    if task_id:
+        row = connection.execute(
+            """
+            SELECT ls.raw_schema_json
+            FROM qc_task t
+            LEFT JOIN label_set ls ON ls.id = t.label_set_id
+            WHERE t.id = ?
+            """,
+            (task_id,),
+        ).fetchone()
+        if row and row["raw_schema_json"]:
+            return _loads(row["raw_schema_json"], None)
+    return _active_label_schema(connection)
 
 
 def _annotation_row(row: sqlite3.Row) -> dict[str, object]:
@@ -2240,7 +2380,19 @@ def save_annotation(
         if not episode:
             raise KeyError(f"Episode 不存在: {episode_id}")
         workspace = connection.execute("SELECT * FROM workspace LIMIT 1").fetchone()
-        active_id = workspace["active_label_set_id"]
+        task_label = connection.execute(
+            """
+            SELECT COALESCE(t.label_set_id, w.active_label_set_id) AS label_set_id
+            FROM episode e
+            JOIN data_source ds ON ds.id = e.data_source_id
+            JOIN qc_task t ON t.id = ds.task_id
+            CROSS JOIN workspace w
+            WHERE e.id = ?
+            LIMIT 1
+            """,
+            (episode_id,),
+        ).fetchone()
+        active_id = task_label["label_set_id"] if task_label else None
         if not active_id:
             raise ValueError("尚未导入并激活标签库")
         label_set = connection.execute("SELECT * FROM label_set WHERE id = ?", (active_id,)).fetchone()
@@ -2513,7 +2665,7 @@ def export_workspace(
                 ORDER BY e.relative_path, a.start_offset_ns, a.created_at
             """
             annotations = [_export_annotation_row(row) for row in connection.execute(query, selected_ids)]
-        schema = _active_label_schema(connection) or {}
+        schema = _label_schema_for_task(connection, task_id) or {}
 
     if not episodes:
         raise ValueError("当前筛选没有可导出的 Episode")

@@ -18,6 +18,7 @@ from episode_qc.workspace import (
     episode_detail,
     export_workspace,
     import_label_schema,
+    install_flow_label_schema,
     initialize_workspace,
     preview_label_schema,
     redo_annotation_change,
@@ -755,7 +756,9 @@ def _cmd_platform_jobs(args: argparse.Namespace) -> int:
 
 def _cmd_platform_cache(args: argparse.Namespace) -> int:
     client = _platform_client(args)
-    job = _platform_job(client, args.job_code)
+    _platform_job(client, args.job_code)
+    job = client.claim(args.job_code)
+    installed_label_set = install_flow_label_schema(args.workspace_db, job)
     manager = QualityCacheManager(
         args.cache_root,
         reserve_bytes=max(0, int(args.reserve_gb * 1024**3)),
@@ -769,6 +772,11 @@ def _cmd_platform_cache(args: argparse.Namespace) -> int:
         origin="flow",
         flow_job_code=str(job["code"]),
         asset_id=str(job.get("asset_id") or "") or None,
+        label_set_id=(
+            str(installed_label_set["id"])
+            if installed_label_set.get("id")
+            else None
+        ),
         source_uri=str(job.get("source_uri") or job.get("asset_nas_uri") or ""),
         task_metadata={"flow_job": job},
     )

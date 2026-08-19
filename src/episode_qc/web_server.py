@@ -659,6 +659,7 @@ class EpisodeQcWebApplication:
         indexed_task_id = ""
         review_started = False
         job: dict[str, object] = {}
+        bound_label_set_id: str | None = None
 
         def publish_progress(values: dict[str, object]) -> None:
             with self._platform_lock:
@@ -683,6 +684,7 @@ class EpisodeQcWebApplication:
                 origin="flow",
                 flow_job_code=job_code,
                 asset_id=str(job.get("asset_id") or "") or None,
+                label_set_id=bound_label_set_id,
                 source_uri=str(job.get("source_uri") or job.get("asset_nas_uri") or ""),
                 task_metadata={"flow_job": job},
             )
@@ -759,7 +761,19 @@ class EpisodeQcWebApplication:
 
         try:
             job = self._platform_job(client, job_code)
-            install_flow_label_schema(self.paths.db_path, job)
+            if job.get("label_set_id") or job.get("status") not in {
+                "claimed",
+                "caching",
+                "cache_ready",
+                "in_progress",
+            }:
+                job = client.claim(job_code)
+            installed_label_set = install_flow_label_schema(self.paths.db_path, job)
+            bound_label_set_id = (
+                str(installed_label_set["id"])
+                if installed_label_set.get("id")
+                else None
+            )
             cached = manager.cache_job(
                 client,
                 job,

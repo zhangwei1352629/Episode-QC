@@ -25,7 +25,7 @@ const els = {
   labelSetMeta: $("label-set-meta"), targetContext: $("target-context"), labelList: $("label-list"),
   annotationComment: $("annotation-comment"), undo: $("undo"), redo: $("redo"),
   annotationCount: $("annotation-count"), annotationList: $("annotation-list"), decisionGrid: $("decision-grid"), decisionCurrent: $("decision-current"),
-  needsRecheck: $("needs-recheck"), toastStack: $("toast-stack"), annotationEditor: $("annotation-editor"),
+  needsRecheck: $("needs-recheck"), toastStack: $("toast-stack"), taskCenterToastStack: $("task-center-toast-stack"), annotationEditor: $("annotation-editor"),
   editId: $("edit-id"), editStart: $("edit-start"), editEnd: $("edit-end"), editSeverity: $("edit-severity"),
   editAction: $("edit-action"), editComment: $("edit-comment"), deleteAnnotation: $("delete-annotation"),
   saveEdit: $("save-edit"), currentTaskName: $("current-task-name"), currentTaskCode: $("current-task-code"),
@@ -439,11 +439,14 @@ function renderPlatformJobs() {
     const progress = (job.local_caching || job.cache_complete === false || ["claimed", "caching", "cache_ready"].includes(job.status))
       ? ` · ${flowJobProgressLabel(job)}`
       : "";
+    const blockedReason = job.claimable === false && !job.local_task_id
+      ? ` · ${job.claim_blocked_reason || "当前不可领取"}`
+      : "";
     return `
       <div class="flow-task-item">
         <div>
           <strong>${escapeHtml(job.task_name || job.asset_id || job.code)}</strong>
-          <small>${escapeHtml(job.code)} · ${escapeHtml(flowJobStatusName(job.status))}${escapeHtml(progress)}</small>
+          <small>${escapeHtml(job.code)} · ${escapeHtml(flowJobStatusName(job.status))}${escapeHtml(progress)}${escapeHtml(blockedReason)}</small>
           <span>${escapeHtml(job.collector || "未知采集员")} · ${job.required_episode_count || job.episodes?.length || 0} Episode · ${formatBytes(job.asset_size_bytes)}</span>
         </div>
         <button type="button" data-flow-job-code="${escapeHtml(job.code)}" data-flow-action="${action.name}" ${action.disabled ? "disabled" : ""}>${escapeHtml(action.label)}</button>
@@ -470,6 +473,9 @@ function flowJobAction(job) {
   if (job.local_task_id) return { name: "open", label: job.local_task_status === "submitted" ? "已提交" : "打开任务", disabled: false };
   if (job.local_caching) return { name: "none", label: flowJobProgressLabel(job), disabled: true };
   if (["claimed", "caching", "cache_ready"].includes(job.status)) return { name: "claim", label: "继续缓存", disabled: false };
+  if (job.status === "pending" && job.claimable === false) {
+    return { name: "none", label: job.claim_blocked_reason || "暂不可领取", disabled: true };
+  }
   if (job.status === "pending") return { name: "claim", label: "领取并缓存", disabled: false };
   if (job.status === "failed") return { name: "claim", label: "重试缓存", disabled: false };
   if (job.status === "completed") return { name: "none", label: "已完成", disabled: true };
@@ -1866,7 +1872,9 @@ function setCacheStatus(kind, text) { els.cacheStatus.className = `cache-status 
 function setSaveState(kind, text) { els.saveState.className = `save-state ${kind === "saved" ? "" : kind}`; els.saveState.innerHTML = `<span></span>${escapeHtml(text)}`; }
 function setBusyButton(button, busy, text) { button.disabled = busy; button.textContent = text; }
 function toast(message, kind = "", timeout = 3500) {
-  const item = document.createElement("div"); item.className = `toast ${kind}`; item.textContent = message; els.toastStack.appendChild(item);
+  const item = document.createElement("div"); item.className = `toast ${kind}`; item.textContent = message;
+  const stack = els.taskCenter?.open && els.taskCenterToastStack ? els.taskCenterToastStack : els.toastStack;
+  stack.appendChild(item);
   setTimeout(() => item.remove(), timeout);
 }
 function formatClock(ns) {

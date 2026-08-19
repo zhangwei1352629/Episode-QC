@@ -283,7 +283,9 @@ class QualityCacheManager:
         job_code = self._safe_component(job["code"], "质检任务编号")
         claimed = (
             dict(job)
-            if job.get("status") == "in_progress"
+            if job.get("status")
+            in {"claimed", "caching", "cache_ready", "in_progress"}
+            and isinstance(job.get("label_schema"), dict)
             else client.claim(job_code)
         )
         source = resolve_source_directory(str(claimed["source_uri"]))

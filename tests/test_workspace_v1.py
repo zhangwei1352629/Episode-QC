@@ -83,7 +83,7 @@ def test_flow_label_schema_installs_exact_snapshot_and_accepts_its_label(tmp_pat
     root = tmp_path / "dataset"
     _write_sample_episode(root / "episode_000001")
     db_path = tmp_path / "workspace.db"
-    episode_id = scan_data_source(db_path, root)["episodes"][0]["id"]
+    scanned = scan_data_source(db_path, root)
     flow_job = {
         "label_set_id": "task-quality",
         "label_schema_version": "1.0.0",
@@ -92,6 +92,12 @@ def test_flow_label_schema_installs_exact_snapshot_and_accepts_its_label(tmp_pat
     }
 
     installed = install_flow_label_schema(db_path, flow_job)
+    rebound = scan_data_source(
+        db_path,
+        root,
+        label_set_id=str(installed["id"]),
+    )
+    episode_id = rebound["episodes"][0]["id"]
     annotation = save_annotation(
         db_path,
         {
@@ -127,7 +133,7 @@ def test_flow_label_schema_rejects_different_local_schema_at_same_version(tmp_pa
     assert workspace_state(db_path)["label_schema"]["labels"][0]["code"] == "local_sway"
 
 
-def test_flow_label_schema_rejects_matching_content_with_different_stored_source_hash(
+def test_flow_label_schema_accepts_matching_content_with_different_stored_source_hash(
     tmp_path: Path,
 ):
     db_path = tmp_path / "workspace.db"
@@ -146,17 +152,18 @@ def test_flow_label_schema_rejects_matching_content_with_different_stored_source
     assert canonical_json_sha256(json.loads(before["raw_schema_json"])) == flow_job[
         "label_schema_hash"
     ]
-    with pytest.raises(ValueError, match="同一标签集版本"):
-        install_flow_label_schema(db_path, flow_job)
+    installed = install_flow_label_schema(db_path, flow_job)
 
-    assert _label_set_storage_state(db_path) == before
+    assert installed["id"] == before["active_id"]
     assert _label_set_storage_state(db_path)["active_id"] == before["active_id"]
 
 
 def test_flow_label_schema_conflict_rolls_back_workspace_initialization(tmp_path: Path):
     db_path = tmp_path / "workspace.db"
     local_path = tmp_path / "local-labels.yaml"
-    local_path.write_text(yaml.safe_dump(FLOW_SCHEMA, allow_unicode=True), encoding="utf-8")
+    local_schema = json.loads(json.dumps(FLOW_SCHEMA))
+    local_schema["labels"][0]["code"] = "local_sway"
+    local_path.write_text(yaml.safe_dump(local_schema, allow_unicode=True), encoding="utf-8")
     import_label_schema(db_path, local_path)
     with sqlite3.connect(db_path) as connection:
         connection.execute("ALTER TABLE qc_task DROP COLUMN source_type")
@@ -259,6 +266,85 @@ def test_flow_label_schema_content_conflict_leaves_local_storage_unchanged(tmp_p
     assert _label_set_storage_state(db_path) == before
 
 
+def test_local_import_rejects_different_content_at_same_id_and_version(tmp_path: Path):
+    db_path = tmp_path / "workspace.db"
+    original_path = tmp_path / "labels-v1.yaml"
+    original_path.write_text(yaml.safe_dump(FLOW_SCHEMA, allow_unicode=True), encoding="utf-8")
+    import_label_schema(db_path, original_path)
+    before = _label_set_storage_state(db_path)
+
+    conflicting = json.loads(json.dumps(FLOW_SCHEMA))
+    conflicting["labels"][0]["name"] = "被原地修改的名称"
+    conflict_path = tmp_path / "labels-v1-conflict.yaml"
+    conflict_path.write_text(yaml.safe_dump(conflicting, allow_unicode=True), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="提高版本号"):
+        import_label_schema(db_path, conflict_path)
+
+    assert _label_set_storage_state(db_path) == before
+
+
+def test_flow_tasks_keep_their_bound_schema_when_local_active_schema_changes(tmp_path: Path):
+    db_path = tmp_path / "workspace.db"
+    first_root = tmp_path / "first"
+    second_root = tmp_path / "second"
+    local_root = tmp_path / "local"
+    _write_sample_episode(first_root / "episode_000001")
+    _write_sample_episode(second_root / "episode_000001")
+    _write_sample_episode(local_root / "episode_000001")
+
+    first_job = {
+        "label_set_id": "task-quality",
+        "label_schema_version": "1.0.0",
+        "label_schema": FLOW_SCHEMA,
+        "label_schema_hash": canonical_json_sha256(FLOW_SCHEMA),
+    }
+    first_label_set = install_flow_label_schema(db_path, first_job)
+    first = scan_data_source(
+        db_path,
+        first_root,
+        task_code="QCJ-FIRST",
+        origin="flow",
+        flow_job_code="QCJ-FIRST",
+        label_set_id=str(first_label_set["id"]),
+    )
+
+    second_schema = json.loads(json.dumps(FLOW_SCHEMA))
+    second_schema["schema"]["label_set_id"] = "task-quality-second"
+    second_schema["labels"][0]["code"] = "camera_shake"
+    second_schema["labels"][0]["name"] = "相机抖动"
+    second_job = {
+        "label_set_id": "task-quality-second",
+        "label_schema_version": "1.0.0",
+        "label_schema": second_schema,
+        "label_schema_hash": canonical_json_sha256(second_schema),
+    }
+    second_label_set = install_flow_label_schema(db_path, second_job)
+    second = scan_data_source(
+        db_path,
+        second_root,
+        task_code="QCJ-SECOND",
+        origin="flow",
+        flow_job_code="QCJ-SECOND",
+        label_set_id=str(second_label_set["id"]),
+    )
+
+    local_schema = json.loads(json.dumps(FLOW_SCHEMA))
+    local_schema["schema"]["label_set_id"] = "local-quality"
+    local_schema["labels"][0]["code"] = "local_only"
+    local_schema["labels"][0]["name"] = "本地标签"
+    local_path = tmp_path / "local.yaml"
+    local_path.write_text(yaml.safe_dump(local_schema, allow_unicode=True), encoding="utf-8")
+    import_label_schema(db_path, local_path)
+    local = scan_data_source(db_path, local_root, task_code="LOCAL-TASK")
+
+    assert workspace_state(db_path, task_id=first["task_id"])["label_schema"] == FLOW_SCHEMA
+    assert workspace_state(db_path, task_id=second["task_id"])["label_schema"] == second_schema
+    assert workspace_state(db_path, task_id=local["task_id"])["label_schema"] == local_schema
+    assert episode_detail(db_path, first["episodes"][0]["id"])["label_schema"] == FLOW_SCHEMA
+    assert episode_detail(db_path, second["episodes"][0]["id"])["label_schema"] == second_schema
+
+
 def test_v1_import_playback_annotation_and_export_round_trip(tmp_path: Path):
     source_root = tmp_path / "含 空格的数据"
     mcap_path = _write_sample_episode(source_root / "episode_000001")
@@ -269,7 +355,7 @@ def test_v1_import_playback_annotation_and_export_round_trip(tmp_path: Path):
     workspace = initialize_workspace(db_path, reviewer_name="测试员")
     result = scan_data_source(db_path, source_root)
 
-    assert workspace["schema_version"] == 2
+    assert workspace["schema_version"] == 3
     assert result["discovered"] == 1
     assert result["ready"] == 1
     episode_id = result["episodes"][0]["id"]
@@ -454,6 +540,13 @@ def test_v1_import_restores_existing_annotations_json(tmp_path: Path):
             "reviewer_name": "质检员甲",
         },
     )
+    update_episode_review(
+        db_path,
+        episode_id,
+        review_status="completed",
+        quality_decision="pass_with_labels",
+        reviewer_name="质检员甲",
+    )
     exported = export_workspace(db_path, tmp_path / "exports", export_format="json")
     exported_file = Path(exported["output_file"])
     (source_root / exported_file.name).write_text(exported_file.read_text(encoding="utf-8"), encoding="utf-8")
@@ -463,14 +556,49 @@ def test_v1_import_restores_existing_annotations_json(tmp_path: Path):
     restored = scan_data_source(restore_db, source_root)
 
     assert restored["restored_annotations"] == 1
+    assert restored["restored_episode_states"] == 1
     assert restored["import_warnings"] == []
     restored_episode_id = restored["episodes"][0]["id"]
     detail = episode_detail(restore_db, restored_episode_id)
     assert detail["episode"]["annotation_count"] == 1
+    assert detail["episode"]["review_status"] == "completed"
+    assert detail["episode"]["quality_decision"] == "pass_with_labels"
     assert detail["annotations"][0]["label_code"] == annotation["label_code"]
     assert detail["annotations"][0]["annotation_id"] == annotation["annotation_id"]
     assert detail["annotations"][0]["attributes"] == {"camera_state": "blurred"}
     assert detail["annotations"][0]["reviewer_name"] == "质检员甲"
+
+
+def test_v1_import_restores_completed_episode_states_without_annotations(tmp_path: Path):
+    source_root = tmp_path / "已完成无问题标注"
+    _write_sample_episode(source_root / "episode_000001")
+    _write_sample_episode(source_root / "episode_000002")
+
+    author_db = tmp_path / "author.db"
+    authored = scan_data_source(author_db, source_root)
+    for index, episode in enumerate(authored["episodes"], start=1):
+        update_episode_review(
+            author_db,
+            str(episode["id"]),
+            review_status="completed",
+            quality_decision="pass",
+            reviewer_name=f"质检员{index}",
+        )
+    exported = export_workspace(author_db, tmp_path / "exports", export_format="json")
+    exported_file = Path(exported["output_file"])
+    shutil.copy2(exported_file, source_root / exported_file.name)
+
+    restore_db = tmp_path / "restore.db"
+    restored = scan_data_source(restore_db, source_root)
+
+    assert restored["restored_annotations"] == 0
+    assert restored["restored_episode_states"] == 2
+    assert restored["import_warnings"] == []
+    states = workspace_state(restore_db)["episodes"]
+    assert [item["review_status"] for item in states] == ["completed", "completed"]
+    assert [item["quality_decision"] for item in states] == ["pass", "pass"]
+    assert [item["reviewer_name"] for item in states] == ["质检员1", "质检员2"]
+    assert [item["annotation_count"] for item in states] == [0, 0]
 
 
 def test_v1_import_isolates_duplicate_annotation_ids_between_tasks(tmp_path: Path):
@@ -597,7 +725,7 @@ def test_schema_v1_data_source_is_migrated_to_qc_task(tmp_path: Path):
     workspace = initialize_workspace(db_path)
     tasks = list_qc_tasks(db_path)
 
-    assert workspace["schema_version"] == 2
+    assert workspace["schema_version"] == 3
     assert len(tasks) == 1
     assert tasks[0]["task_name"] == "旧资产"
     assert tasks[0]["local_source_path"] == str(source_root)

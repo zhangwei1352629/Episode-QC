@@ -327,6 +327,7 @@ body.episodes-collapsed .episode-sidebar, body.labels-collapsed .label-sidebar {
 }
 
 .toast-stack { position: fixed; z-index: 20; right: 18px; top: 78px; display: grid; gap: 7px; pointer-events: none; }
+.task-center-toast-stack { top: 28px; right: 28px; }
 .toast { max-width: 360px; padding: 10px 13px; border: 1px solid #394148; background: #171c20; box-shadow: 0 12px 35px rgba(0,0,0,.35); border-radius: 8px; font-size: 11px; animation: toast-in .2s ease; }
 .toast.error { border-color: #794246; color: #ffc2c3; }
 .toast.success { border-color: #4a6e54; color: #b8efc7; }
@@ -365,7 +366,7 @@ dialog::backdrop { background: rgba(0,0,0,.66); }
 .flow-task-item strong { font-size: 11px; }
 .flow-task-item small, .flow-task-item span { margin-top: 3px; color: var(--muted); font-size: 9px; }
 .flow-task-item button { min-width: 86px; height: 29px; padding: 0 9px; border: 1px solid var(--accent); border-radius: 6px; background: var(--accent); color: #11140a; font-size: 10px; font-weight: 700; cursor: pointer; }
-.flow-task-item button:disabled { border-color: var(--line); background: #242b31; color: #89949d; }
+.flow-task-item button:disabled { max-width: 150px; height: auto; min-height: 29px; padding-block: 6px; border-color: var(--line); background: #242b31; color: #89949d; }
 .local-task-panel { min-height: 0; display: grid; grid-template-rows: auto auto minmax(0, 1fr); gap: 9px; padding: 12px; border: 1px solid var(--line); border-radius: 9px; background: #10151a; overflow: hidden; }
 .local-task-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .local-task-heading > div { min-width: 0; }

@@ -6,6 +6,7 @@ from http.client import HTTPConnection
 import json
 from pathlib import Path
 import re
+import sqlite3
 import struct
 import threading
 import time
@@ -180,6 +181,9 @@ def test_web_flow_label_schema_is_installed_before_ready_episode_indexing(tmp_pa
         def jobs(self):
             return [dict(job)]
 
+        def claim(self, _job_code):
+            return dict(job) | {"status": "claimed"}
+
         def report_cache(self, _job_code, **values):
             job.update(values)
             return dict(job)
@@ -212,7 +216,13 @@ def test_web_flow_label_schema_is_installed_before_ready_episode_indexing(tmp_pa
             return {"status": "in_progress"}
 
     def scan_after_schema_install(db_path, *_args, **_kwargs):
-        assert workspace_state(db_path)["label_schema"] == schema
+        assert _kwargs["label_set_id"]
+        with sqlite3.connect(db_path) as connection:
+            stored = connection.execute(
+                "SELECT raw_schema_json FROM label_set WHERE id = ?",
+                (_kwargs["label_set_id"],),
+            ).fetchone()
+        assert json.loads(stored[0]) == schema
         indexed.append(True)
         return {
             "task_id": "task_local",

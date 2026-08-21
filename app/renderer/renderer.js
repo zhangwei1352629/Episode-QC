@@ -4,11 +4,13 @@ import {
   resolveSelectedTarget,
   targetTypesDescription,
 } from "./target-selection.mjs";
+import { flowTaskGroupPresentation, groupFlowClaimPoolJobs } from "./flow-task-groups.mjs";
 
 const $ = (id) => document.getElementById(id);
 
 const els = {
   workspaceName: $("workspace-name"), reviewerName: $("reviewer-name"), importLabels: $("import-labels"),
+  nasStatus: $("nas-status"),
   exportFormat: $("export-format"), exportResults: $("export-results"), addSource: $("add-source"), saveState: $("save-state"),
   toggleEpisodes: $("toggle-episodes"), toggleLabels: $("toggle-labels"), toolMenu: $("tool-menu"),
   episodeTotal: $("episode-total"), episodeDone: $("episode-done"), episodeErrors: $("episode-errors"),
@@ -85,7 +87,8 @@ const state = {
   platformReviewers: [],
   labelSets: [],
   pendingFlowJobCode: null,
-  flowPollTimer: null
+  flowPollTimer: null,
+  expandedFlowTaskKeys: new Set()
 };
 
 const g1Viewer = new G1Viewer(els.motionCanvas, (status, error) => {
@@ -108,6 +111,7 @@ async function initialize() {
   syncInteractiveState();
   setSaveState("saving", "打开中…");
   try {
+    await refreshNasStatus();
     const taskPayload = await window.episodeQc.getTasks();
     state.tasks = taskPayload.tasks || [];
     const savedTaskId = window.localStorage.getItem("episodeQcActiveTaskId");
@@ -129,6 +133,19 @@ async function initialize() {
     toast(error.message || String(error), "error", 7000);
   }
   requestAnimationFrame(playbackLoop);
+  window.setInterval(() => { refreshNasStatus(); }, 30000);
+}
+
+async function refreshNasStatus() {
+  try {
+    const health = await window.episodeQc.getHealth();
+    const nas = health.nas || {};
+    const unavailable = nas.configured && nas.available === false;
+    els.nasStatus.hidden = !unavailable;
+    els.nasStatus.textContent = unavailable ? nas.message : "";
+  } catch {
+    // The primary workspace request will surface any server connection failure.
+  }
 }
 
 async function refreshWorkspace({ preserveEpisode = true } = {}) {
@@ -328,7 +345,7 @@ function renderTaskContext() {
   els.currentTaskName.textContent = task?.task_name || "尚未导入任务";
   els.currentTaskCode.textContent = task?.task_code || "—";
   const taskPath = task?.local_source_path || task?.source_uri || "点击“导入新任务”选择数据目录";
-  els.currentTaskPath.textContent = taskPath;
+  els.currentTaskPath.textContent = compactSourcePath(taskPath);
   els.currentTaskPath.title = taskPath;
   els.currentTaskStatus.textContent = task
     ? `${taskStatusName(task.status)} · ${task.completed_count}/${task.episode_count}`
@@ -367,7 +384,7 @@ function renderTaskContext() {
         <span class="task-list-copy">
           <strong>${escapeHtml(item.task_name)}</strong>
           <small>${escapeHtml(item.task_code)} · ${escapeHtml(taskStatusName(item.status))}${escapeHtml(issue)}</small>
-          <span title="${escapeHtml(path)}">${escapeHtml(path)}</span>
+          <span title="${escapeHtml(path)}">${escapeHtml(compactSourcePath(path))}</span>
         </span>
         <span class="task-list-progress"><strong>${item.completed_count}/${item.episode_count}</strong><span>${formatBytes(item.source_size_bytes)} · 异常 ${item.error_count}</span></span>
       </button>`;
@@ -429,29 +446,55 @@ function renderPlatformJobs() {
     }
     return;
   }
-  els.flowTaskStatus.textContent = `${platform.reviewer || platform.username} · ${platform.jobs.length} 个批次`;
-  if (!platform.jobs.length) {
-    els.flowTaskList.innerHTML = '<div class="empty-panel">当前没有可见的 Flow 质检任务</div>';
+  const groups = groupFlowClaimPoolJobs(platform.jobs);
+  const activeGroupKeys = new Set(groups.map((group) => group.key));
+  state.expandedFlowTaskKeys = new Set(
+    [...state.expandedFlowTaskKeys].filter((key) => activeGroupKeys.has(key)),
+  );
+  const claimableBatchCount = groups.reduce((sum, group) => sum + group.claimableBatchCount, 0);
+  const blockedBatchCount = groups.reduce((sum, group) => sum + group.batchCount - group.claimableBatchCount, 0);
+  els.flowTaskStatus.textContent = `${platform.reviewer || platform.username} · ${groups.length} 个任务 · 可领取 ${claimableBatchCount} · 不可领取 ${blockedBatchCount}`;
+  if (!groups.length) {
+    els.flowTaskList.innerHTML = '<div class="empty-panel">当前没有可领取或待排查的 Flow 质检批次</div>';
     return;
   }
-  els.flowTaskList.innerHTML = platform.jobs.map((job) => {
-    const action = flowJobAction(job);
-    const progress = (job.local_caching || job.cache_complete === false || ["claimed", "caching", "cache_ready"].includes(job.status))
-      ? ` · ${flowJobProgressLabel(job)}`
-      : "";
-    const blockedReason = job.claimable === false && !job.local_task_id
-      ? ` · ${job.claim_blocked_reason || "当前不可领取"}`
-      : "";
+  els.flowTaskList.innerHTML = groups.map((group) => {
+    const expanded = state.expandedFlowTaskKeys.has(group.key);
+    const presentation = flowTaskGroupPresentation(group);
     return `
-      <div class="flow-task-item">
-        <div>
-          <strong>${escapeHtml(job.task_name || job.asset_id || job.code)}</strong>
-          <small>${escapeHtml(job.code)} · ${escapeHtml(flowJobStatusName(job.status))}${escapeHtml(progress)}${escapeHtml(blockedReason)}</small>
-          <span>${escapeHtml(job.collector || "未知采集员")} · ${job.required_episode_count || job.episodes?.length || 0} Episode · ${formatBytes(job.asset_size_bytes)}</span>
+      <section class="flow-task-group ${presentation.tone} ${expanded ? "expanded" : ""}">
+        <button class="flow-task-group-toggle" type="button" data-flow-task-key="${escapeHtml(group.key)}" aria-expanded="${expanded}">
+          <span class="flow-task-group-copy">
+            <strong>${escapeHtml(group.taskName)}</strong>
+            <small>${escapeHtml(group.taskCode || "未设置任务编号")} · ${escapeHtml(presentation.availabilityLabel)}</small>
+            <span>${group.episodeCount} Episode · ${formatBytes(group.sizeBytes)}</span>
+          </span>
+          <span class="flow-task-group-meta"><strong>${escapeHtml(presentation.badgeLabel)}</strong><small>${escapeHtml(presentation.totalLabel)}</small><span aria-hidden="true">⌄</span></span>
+        </button>
+        <div class="flow-task-batches" ${expanded ? "" : "hidden"}>
+          ${group.jobs.map(renderFlowJobItem).join("")}
         </div>
-        <button type="button" data-flow-job-code="${escapeHtml(job.code)}" data-flow-action="${action.name}" ${action.disabled ? "disabled" : ""}>${escapeHtml(action.label)}</button>
-      </div>`;
+      </section>`;
   }).join("");
+}
+
+function renderFlowJobItem(job) {
+  const action = flowJobAction(job);
+  const progress = (job.local_caching || job.cache_complete === false || ["claimed", "caching", "cache_ready"].includes(job.status))
+    ? ` · ${flowJobProgressLabel(job)}`
+    : "";
+  const blockedReason = job.claimable === false && !job.local_task_id
+    ? ` · ${job.claim_blocked_reason || "当前不可领取"}`
+    : "";
+  return `
+    <div class="flow-task-item">
+      <div>
+        <strong>${escapeHtml(job.asset_id || job.code)}</strong>
+        <small>${escapeHtml(job.code)} · ${escapeHtml(flowJobStatusName(job.status))}${escapeHtml(progress)}${escapeHtml(blockedReason)}</small>
+        <span>${escapeHtml(job.collector || "未知采集员")} · ${job.required_episode_count || job.episodes?.length || 0} Episode · ${formatBytes(job.asset_size_bytes)}</span>
+      </div>
+      <button type="button" data-flow-job-code="${escapeHtml(job.code)}" data-flow-action="${action.name}" ${action.disabled ? "disabled" : ""}>${escapeHtml(action.label)}</button>
+    </div>`;
 }
 
 function flowJobProgressLabel(job) {
@@ -489,6 +532,7 @@ async function loginPlatform(event) {
   setBusyButton(els.flowLogin, true, "加载中…");
   try {
     const baseUrl = els.flowBaseUrl.value.trim();
+    state.expandedFlowTaskKeys.clear();
     state.platform = await window.episodeQc.loginPlatform({ baseUrl, employeeNo });
     window.localStorage.setItem("episodeQcFlowUrl", baseUrl);
     window.localStorage.setItem("episodeQcFlowReviewer", employeeNo);
@@ -515,7 +559,7 @@ async function loadPlatformReviewers() {
     const saved = window.localStorage.getItem("episodeQcFlowReviewer") || "";
     els.flowReviewerSelect.innerHTML = [
       '<option value="">请选择质检员</option>',
-      ...state.platformReviewers.map((reviewer) => `<option value="${escapeHtml(reviewer.employee_no)}">${escapeHtml(reviewer.display_name)} · ${escapeHtml(reviewer.team_name || reviewer.employee_no)}</option>`),
+      ...state.platformReviewers.map((reviewer) => `<option value="${escapeHtml(reviewer.employee_no)}">${escapeHtml(reviewer.display_name)} · ${escapeHtml(reviewer.employee_no)} · ${escapeHtml(reviewer.team_name || "未分组")}</option>`),
     ].join("");
     if (state.platformReviewers.some((item) => item.employee_no === saved)) {
       els.flowReviewerSelect.value = saved;
@@ -534,6 +578,7 @@ async function loadPlatformReviewers() {
 
 async function logoutPlatform() {
   try {
+    state.expandedFlowTaskKeys.clear();
     state.platform = await window.episodeQc.logoutPlatform();
     renderPlatformJobs();
     toast("已退出 Flow");
@@ -541,6 +586,14 @@ async function logoutPlatform() {
 }
 
 async function handleFlowTaskAction(event) {
+  const groupToggle = event.target.closest("[data-flow-task-key]");
+  if (groupToggle) {
+    const key = groupToggle.dataset.flowTaskKey;
+    if (state.expandedFlowTaskKeys.has(key)) state.expandedFlowTaskKeys.delete(key);
+    else state.expandedFlowTaskKeys.add(key);
+    renderPlatformJobs();
+    return;
+  }
   const button = event.target.closest("[data-flow-job-code]");
   if (!button || button.disabled) return;
   const job = state.platform.jobs.find((item) => item.code === button.dataset.flowJobCode);
@@ -1012,10 +1065,10 @@ function renderMotionAvailability() {
 
 function renderMotionSourceOptions() {
   const sourceNames = {
-    policy: "Policy 实际执行姿态（默认）",
-    policy_target: "PMG 目标姿态",
-    policy_command: "Policy 最终控制目标",
-    soma: "SOMA 重定向动作"
+    policy: "实际执行姿态（Policy，默认）",
+    policy_target: "目标姿态（PMG）",
+    policy_command: "最终控制目标（Policy）",
+    soma: "重定向姿态（SOMA）"
   };
   const sources = state.cache?.robot_actions?.sources || [];
   const available = new Set(sources.filter((item) => item.available).map((item) => item.key));
@@ -1915,6 +1968,15 @@ function flowJobStatusName(status) {
   })[status] || status || "未知状态";
 }
 function formatSkew(ns) { const ms = Number(ns) / 1e6; return `${ms >= 0 ? "+" : ""}${ms.toFixed(1)} ms`; }
+function compactSourcePath(value) {
+  const original = String(value || "");
+  if (!original || !/[\\/]/.test(original)) return original;
+  const normalized = original.replace(/\\/g, "/").replace(/\/+$/, "");
+  const parts = normalized.split("/").filter(Boolean);
+  if (parts.length <= 2) return normalized;
+  return `…/${parts.slice(-2).join("/")}`;
+}
+
 function escapeHtml(value) { return String(value ?? "").replace(/[&<>'"]/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" })[char]); }
 
 initialize();

@@ -65,6 +65,10 @@ WEB_TOKEN_FILE = ".web-token"
 LOCAL_WEB_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 WILDCARD_WEB_HOSTS = frozenset({"0.0.0.0", "::"})
 PLATFORM_CACHE_CLEANUP_INTERVAL_SECONDS = 60 * 60
+NAS_PROBE_PATH_ENV = "EPISODE_QC_NAS_PROBE_PATH"
+NAS_UNAVAILABLE_MESSAGE = (
+    "NAS 当前不可用；可继续查看本机已有任务，依赖 NAS 的领取、缓存、导入和提交操作将在恢复后可用。"
+)
 LOGGER = logging.getLogger(__name__)
 
 
@@ -303,6 +307,23 @@ class EpisodeQcWebApplication:
         self._platform_cache_cleanup.close()
         self._executor.shutdown(wait=False, cancel_futures=True)
         self._platform_executor.shutdown(wait=False, cancel_futures=True)
+
+    def nas_status(self) -> dict[str, object]:
+        probe_path = os.environ.get(NAS_PROBE_PATH_ENV, "").strip()
+        if not probe_path:
+            return {"configured": False, "available": True}
+        try:
+            available = Path(probe_path).is_dir()
+        except OSError:
+            available = False
+        status: dict[str, object] = {
+            "configured": True,
+            "available": available,
+            "path": probe_path,
+        }
+        if not available:
+            status["message"] = NAS_UNAVAILABLE_MESSAGE
+        return status
 
     def get_workspace_state(self, task_id: str | None = None) -> dict[str, object]:
         if task_id is None:
@@ -1083,7 +1104,7 @@ class EpisodeQcRequestHandler(BaseHTTPRequestHandler):
     def _route_api(self, method: str, path: str, query: dict[str, list[str]]) -> None:
         app = self.application
         if method == "GET" and path == "/api/health":
-            self._send_json({"ok": True})
+            self._send_json({"ok": True, "nas": app.nas_status()})
             return
         if method == "GET" and path == "/api/workspace":
             task_id = query.get("task_id", [None])[0]

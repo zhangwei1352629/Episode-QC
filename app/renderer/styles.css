@@ -359,8 +359,29 @@ dialog::backdrop { background: rgba(0,0,0,.66); }
 .flow-task-heading span { color: var(--muted); font-size: 9px; }
 .flow-task-heading button { height: 26px; padding: 0 8px; border: 1px solid var(--line); border-radius: 6px; color: var(--muted); background: #11161b; font-size: 9px; cursor: pointer; }
 .flow-login-form { display: grid; grid-template-columns: minmax(180px, 1.35fr) minmax(150px, 1fr) auto auto; gap: 6px; }
+.nas-status-alert { margin: 8px 16px 0; padding: 9px 12px; border: 1px solid #d89b32; border-radius: 8px; color: #ffe0a3; background: rgba(216, 155, 50, .14); font-size: 12px; line-height: 1.45; }
 .flow-login-form input, .flow-login-form select, .flow-login-form .button { height: 32px; min-width: 0; }
 .flow-task-list { min-height: 0; display: grid; align-content: start; gap: 7px; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
+.flow-task-group { border: 1px solid var(--line); border-radius: 9px; background: #10151a; }
+.flow-task-group.expanded { border-color: #53606b; background: #0d1216; }
+.flow-task-group.claimable { border-color: rgba(215,243,86,.62); background: linear-gradient(90deg, rgba(215,243,86,.12), #10151a 46%); box-shadow: inset 3px 0 0 var(--accent); }
+.flow-task-group.claimable.expanded { border-color: rgba(215,243,86,.72); background: linear-gradient(90deg, rgba(215,243,86,.09), #0d1216 46%); }
+.flow-task-group-toggle { width: 100%; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; align-items: center; padding: 11px; text-align: left; border: 0; color: var(--text); background: transparent; cursor: pointer; }
+.flow-task-group-toggle:hover { background: #151b21; }
+.flow-task-group-copy { min-width: 0; }
+.flow-task-group-copy strong, .flow-task-group-copy small, .flow-task-group-copy > span { display: block; }
+.flow-task-group-copy strong { font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.flow-task-group.claimable .flow-task-group-copy > strong { color: #e9f9ad; }
+.flow-task-group-copy small, .flow-task-group-copy > span { margin-top: 3px; color: var(--muted); font-size: 9px; }
+.flow-task-group-meta { min-width: 88px; display: flex; flex-direction: column; align-items: flex-end; gap: 4px; text-align: right; }
+.flow-task-group-meta strong { padding: 4px 8px; border: 1px solid #414b54; border-radius: 999px; color: #a8b2ba; background: #242b31; font-size: 10px; line-height: 1; }
+.flow-task-group.claimable .flow-task-group-meta strong { border-color: var(--accent); color: #11140a; background: var(--accent); box-shadow: 0 0 14px rgba(215,243,86,.18); }
+.flow-task-group-meta small { color: var(--muted); font-size: 9px; }
+.flow-task-group-meta > span { color: var(--muted); font-size: 15px; line-height: .7; transform-origin: center; transition: transform .16s ease; }
+.flow-task-group.expanded .flow-task-group-meta > span { transform: rotate(180deg); }
+.flow-task-batches { display: grid; gap: 6px; padding: 0 8px 8px 18px; border-top: 1px solid var(--line-soft); }
+.flow-task-batches[hidden] { display: none; }
+.flow-task-batches .flow-task-item { border-color: var(--line-soft); border-radius: 7px; background: #0b1014; }
 .flow-task-item { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 9px 10px; border: 1px solid var(--line); border-radius: 8px; background: #10151a; }
 .flow-task-item strong, .flow-task-item small, .flow-task-item span { display: block; }
 .flow-task-item strong { font-size: 11px; }

@@ -58,11 +58,27 @@ test("Flow 任务中心包含登录、领取、缓存和提交入口", () => {
   assert.match(renderer, /claimPlatformJob/);
   assert.match(renderer, /job\.claimable === false/);
   assert.match(renderer, /claim_blocked_reason/);
+  assert.match(renderer, /groupFlowClaimPoolJobs/);
+  assert.match(renderer, /data-flow-task-key/);
+  assert.match(renderer, /expandedFlowTaskKeys/);
+  assert.match(html, /Flow 任务池/);
   assert.match(html, /id="task-center-toast-stack"/);
   assert.match(renderer, /startPlatformJob/);
   assert.match(webApi, /\/api\/platform\/reviewers/);
   assert.match(webApi, /\/api\/platform\/login/);
   assert.match(webApi, /\/api\/platform\/jobs/);
+});
+
+test("质检界面使用可读中文、完整人员身份和紧凑路径", () => {
+  const html = fs.readFileSync(path.resolve(__dirname, "../renderer/index.html"), "utf8");
+  const renderer = fs.readFileSync(path.resolve(__dirname, "../renderer/renderer.js"), "utf8");
+
+  assert.match(html, /<title>DataOps · Episode 质检<\/title>/);
+  assert.match(html, /实际执行姿态（Policy，默认）/);
+  assert.doesNotMatch(html, />EPISODE QC</);
+  assert.match(renderer, /reviewer\.display_name.*reviewer\.employee_no.*reviewer\.team_name/);
+  assert.match(renderer, /function compactSourcePath/);
+  assert.match(renderer, /compactSourcePath\(taskPath\)/);
 });
 
 test("单机模式隐藏 Flow 并直接导入 QC 服务器目录", () => {

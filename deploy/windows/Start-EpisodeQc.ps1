@@ -45,6 +45,12 @@ function Write-ServiceError([string]$Message) {
 if ($FlowUrl) {
     $env:EPISODE_QC_FLOW_URL = $FlowUrl
 }
+if ($NasProbePath) {
+    $env:EPISODE_QC_NAS_PROBE_PATH = $NasProbePath
+}
+else {
+    Remove-Item Env:EPISODE_QC_NAS_PROBE_PATH -ErrorAction SilentlyContinue
+}
 $env:PYTHONUNBUFFERED = "1"
 
 $arguments = @(
@@ -62,16 +68,6 @@ Push-Location $ProjectRoot
 try {
     while ($true) {
         try {
-            if ($NasProbePath) {
-                $nasAvailable = Test-Path -LiteralPath $NasProbePath -PathType Container `
-                    -ErrorAction Stop
-                if (-not $nasAvailable) {
-                    Write-ServiceError "NAS is not available to the scheduled-task account: $NasProbePath"
-                    Start-Sleep -Seconds $NasRetrySeconds
-                    continue
-                }
-            }
-
             $runId = [guid]::NewGuid().ToString("N")
             $runOutput = Join-Path $logs "episode-qc.$runId.out.tmp.log"
             $runError = Join-Path $logs "episode-qc.$runId.err.tmp.log"

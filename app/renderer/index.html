@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: file: blob:; connect-src 'self'; object-src 'none'; base-uri 'none'" />
-    <title>DataOps · Episode QC</title>
+    <title>DataOps · Episode 质检</title>
     <link rel="icon" href="./favicon.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="./styles.css" />
   </head>
@@ -14,7 +14,7 @@
         <div class="brand">
           <div class="brand-mark">DQ</div>
           <div>
-            <div class="brand-title"><h1>DataOps</h1><span>EPISODE QC</span></div>
+            <div class="brand-title"><h1>DataOps</h1><span>EPISODE 质检</span></div>
             <p id="workspace-name">正在打开工作区…</p>
           </div>
         </div>
@@ -42,6 +42,7 @@
           <div class="save-state" id="save-state" role="status" aria-live="polite"><span></span>已保存</div>
         </div>
       </header>
+      <div class="nas-status-alert" id="nas-status" role="status" aria-live="polite" hidden></div>
 
       <aside class="episode-sidebar">
         <section class="current-task-card">
@@ -114,12 +115,12 @@
             <div class="motion-stage">
               <canvas id="motion-canvas"></canvas>
               <div class="motion-control-panel">
-                <label><span>动作源</span><select id="motion-source" title="选择 G1 动作源" aria-label="选择 G1 动作源"><option value="policy">Policy 实际执行姿态（默认）</option><option value="policy_target">PMG 目标姿态</option><option value="policy_command">Policy 最终控制目标</option><option value="soma">SOMA</option></select></label>
+                <label><span>动作源</span><select id="motion-source" title="选择 G1 动作源" aria-label="选择 G1 动作源"><option value="policy">实际执行姿态（Policy，默认）</option><option value="policy_target">目标姿态（PMG）</option><option value="policy_command">最终控制目标（Policy）</option><option value="soma">重定向姿态（SOMA）</option></select></label>
                 <label><span>标注范围</span><select id="joint-selector" title="选择标注关节" aria-label="选择标注关节"><option value="">全身（默认）</option></select></label>
               </div>
               <div class="joint-label-layer" id="joint-label-layer"></div>
               <div class="viewer-empty" id="motion-empty">选择 Episode 后显示 G1 机器人</div>
-              <div class="motion-hint">G1 关节角直接驱动 · Policy / SOMA 可切换 · 下拉或点击名称选关节 · 拖动旋转 · 滚轮缩放</div>
+              <div class="motion-hint">G1 关节角直接驱动 · 可切换实际执行/目标/重定向姿态 · 下拉或点击名称选关节 · 拖动旋转 · 滚轮缩放</div>
               <div class="selected-joint" id="selected-joint" hidden></div>
             </div>
           </article>
@@ -215,7 +216,7 @@
         <div class="task-center-columns">
           <section class="flow-task-panel" id="flow-task-panel">
             <div class="flow-task-heading">
-              <div><strong>Flow 待领取任务</strong><span id="flow-task-status">尚未选择质检员</span></div>
+              <div><strong>Flow 任务池</strong><span id="flow-task-status">尚未选择质检员</span></div>
               <div>
                 <button id="refresh-flow-jobs" type="button" hidden>刷新任务</button>
                 <button id="flow-logout" type="button" hidden>重新选择</button>

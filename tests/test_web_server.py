@@ -546,7 +546,7 @@ def test_web_api_requires_token_and_serves_workspace(tmp_path: Path):
         with LOCAL_OPENER.open(f"{base_url}/", timeout=5) as response:
             assert response.status == 200
             assert response.geturl() == f"{base_url}/?token={TOKEN}"
-            assert b"Episode QC" in response.read()
+            assert "Episode 质检".encode() in response.read()
 
         with LOCAL_OPENER.open(f"{base_url}/?token=stale-token", timeout=5) as response:
             assert response.status == 200
@@ -609,6 +609,26 @@ def test_explicit_no_token_mode_allows_api_without_token(tmp_path: Path):
         with LOCAL_OPENER.open(f"{base_url}/api/workspace", timeout=5) as response:
             assert response.status == 200
             assert json.loads(response.read())["workspace"]["name"] == "Mocap QC 工作区"
+
+
+def test_health_reports_unavailable_configured_nas_without_blocking_web_startup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A lost NAS share must be visible to QC users, not prevent local QC access."""
+    unavailable_nas = tmp_path / "unavailable-nas"
+    monkeypatch.setenv("EPISODE_QC_NAS_PROBE_PATH", str(unavailable_nas))
+
+    with running_server(tmp_path) as (_server, base_url):
+        status, health = request_json(f"{base_url}/api/health")
+
+    assert status == 200
+    assert health["ok"] is True
+    assert health["nas"] == {
+        "configured": True,
+        "available": False,
+        "path": str(unavailable_nas),
+        "message": "NAS 当前不可用；可继续查看本机已有任务，依赖 NAS 的领取、缓存、导入和提交操作将在恢复后可用。",
+    }
 
 
 def test_only_loopback_clients_may_auto_receive_web_token():

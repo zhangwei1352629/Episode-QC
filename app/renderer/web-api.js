@@ -40,6 +40,7 @@ function installWebApi() {
   }
 
   const api = {
+    getHealth: () => request("/api/health"),
     getWorkspaceState: (taskId) => request(
       `/api/workspace${taskId ? `?task_id=${encodeURIComponent(taskId)}` : ""}`,
     ),

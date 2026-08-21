@@ -5,6 +5,7 @@ import {
   targetTypesDescription,
 } from "./target-selection.mjs";
 import { flowTaskGroupPresentation, groupFlowClaimPoolJobs } from "./flow-task-groups.mjs";
+import { loadInitialTasks } from "./startup.mjs";
 
 const $ = (id) => document.getElementById(id);
 
@@ -111,8 +112,10 @@ async function initialize() {
   syncInteractiveState();
   setSaveState("saving", "打开中…");
   try {
-    await refreshNasStatus();
-    const taskPayload = await window.episodeQc.getTasks();
+    const taskPayload = await loadInitialTasks({
+      getTasks: window.episodeQc.getTasks,
+      refreshNasStatus,
+    });
     state.tasks = taskPayload.tasks || [];
     const savedTaskId = window.localStorage.getItem("episodeQcActiveTaskId");
     state.currentTaskId = state.tasks.some((item) => item.id === savedTaskId)

@@ -631,6 +631,39 @@ def test_health_reports_unavailable_configured_nas_without_blocking_web_startup(
     }
 
 
+def test_health_returns_cached_nas_status_while_slow_probe_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A stalled UNC check must not delay the health response."""
+    unavailable_nas = tmp_path / "slow-unavailable-nas"
+    probe_started = threading.Event()
+    release_probe = threading.Event()
+    original_is_dir = Path.is_dir
+
+    def slow_is_dir(path: Path) -> bool:
+        if path == unavailable_nas:
+            probe_started.set()
+            release_probe.wait(timeout=1)
+            return False
+        return original_is_dir(path)
+
+    monkeypatch.setattr(Path, "is_dir", slow_is_dir)
+    monkeypatch.setenv("EPISODE_QC_NAS_PROBE_PATH", str(unavailable_nas))
+
+    try:
+        with running_server(tmp_path) as (_server, base_url):
+            assert probe_started.wait(timeout=0.25)
+            started_at = time.monotonic()
+            status, health = request_json(f"{base_url}/api/health")
+            elapsed = time.monotonic() - started_at
+    finally:
+        release_probe.set()
+
+    assert status == 200
+    assert elapsed < 0.25
+    assert health["nas"]["available"] is False
+
+
 def test_only_loopback_clients_may_auto_receive_web_token():
     handler = object.__new__(EpisodeQcRequestHandler)
     handler.client_address = ("127.0.0.1", 12345)

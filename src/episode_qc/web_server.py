@@ -82,6 +82,63 @@ class WebPaths:
     default_label_schema: Path
 
 
+class NasStatusMonitor:
+    """Probe a potentially slow network path without blocking HTTP requests."""
+
+    def __init__(self, probe_path: str) -> None:
+        self._probe_path = probe_path.strip()
+        self._lock = threading.Lock()
+        self._probe_in_progress = False
+        self._closed = False
+        if self._probe_path:
+            self._status: dict[str, object] = {
+                "configured": True,
+                "available": False,
+                "path": self._probe_path,
+                "message": NAS_UNAVAILABLE_MESSAGE,
+            }
+            self.refresh()
+        else:
+            self._status = {"configured": False, "available": True}
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+
+    def status(self) -> dict[str, object]:
+        self.refresh()
+        with self._lock:
+            return dict(self._status)
+
+    def refresh(self) -> None:
+        with self._lock:
+            if self._closed or not self._probe_path or self._probe_in_progress:
+                return
+            self._probe_in_progress = True
+        threading.Thread(
+            target=self._probe_once,
+            name="episode-qc-nas-probe",
+            daemon=True,
+        ).start()
+
+    def _probe_once(self) -> None:
+        try:
+            available = Path(self._probe_path).is_dir()
+        except OSError:
+            available = False
+        status: dict[str, object] = {
+            "configured": True,
+            "available": available,
+            "path": self._probe_path,
+        }
+        if not available:
+            status["message"] = NAS_UNAVAILABLE_MESSAGE
+        with self._lock:
+            if not self._closed:
+                self._status = status
+            self._probe_in_progress = False
+
+
 def default_web_paths(workspace_root: str | Path | None = None) -> WebPaths:
     project_root = Path(__file__).resolve().parents[2]
     package_root = Path(__file__).resolve().parent
@@ -296,6 +353,9 @@ class EpisodeQcWebApplication:
         self.session_id = f"web-{self.token[:12]}"
         paths.root.mkdir(parents=True, exist_ok=True)
         initialize_workspace(paths.db_path)
+        self._nas_status_monitor = NasStatusMonitor(
+            os.environ.get(NAS_PROBE_PATH_ENV, "")
+        )
         self._platform_cache_cleanup = PlatformCacheCleanup(
             self._quality_cache_manager,
             interval_seconds=PLATFORM_CACHE_CLEANUP_INTERVAL_SECONDS,
@@ -304,26 +364,13 @@ class EpisodeQcWebApplication:
         self._connect_platform_from_environment()
 
     def close(self) -> None:
+        self._nas_status_monitor.close()
         self._platform_cache_cleanup.close()
         self._executor.shutdown(wait=False, cancel_futures=True)
         self._platform_executor.shutdown(wait=False, cancel_futures=True)
 
     def nas_status(self) -> dict[str, object]:
-        probe_path = os.environ.get(NAS_PROBE_PATH_ENV, "").strip()
-        if not probe_path:
-            return {"configured": False, "available": True}
-        try:
-            available = Path(probe_path).is_dir()
-        except OSError:
-            available = False
-        status: dict[str, object] = {
-            "configured": True,
-            "available": available,
-            "path": probe_path,
-        }
-        if not available:
-            status["message"] = NAS_UNAVAILABLE_MESSAGE
-        return status
+        return self._nas_status_monitor.status()
 
     def get_workspace_state(self, task_id: str | None = None) -> dict[str, object]:
         if task_id is None:

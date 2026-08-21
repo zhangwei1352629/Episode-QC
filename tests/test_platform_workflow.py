@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 from datetime import datetime, timezone
 from io import BytesIO
 import json
 from pathlib import Path
+import threading
 from unittest.mock import Mock
 import urllib.error
 
@@ -105,6 +107,77 @@ def test_existing_published_result_is_rehashed_before_idempotent_reuse(tmp_path:
 
     with pytest.raises(QualityCacheError, match="SHA-256"):
         QualityCacheManager._verify_published_result(destination, manifest)
+
+
+def test_latest_result_copy_uses_the_actual_source_uri_when_asset_alias_differs(
+    tmp_path: Path,
+):
+    """Catches the latest result being written beside an unreviewed asset alias."""
+    source_root = tmp_path / "reviewed-source"
+    alias_root = tmp_path / "asset-alias"
+    source_root.mkdir()
+    alias_root.mkdir()
+    local_result = tmp_path / "qc_result.json"
+    local_result.write_text('{"result_id": "QCR-SOURCE"}\n', encoding="utf-8")
+    result_sha256 = hashlib.sha256(local_result.read_bytes()).hexdigest()
+
+    published = QualityCacheManager._publish_latest_result_copy(
+        {
+            "source_uri": str(source_root),
+            "asset_nas_uri": str(alias_root),
+        },
+        local_result,
+        result_sha256=result_sha256,
+    )
+
+    assert published == str(source_root / "qc_result.json")
+    assert (source_root / "qc_result.json").read_bytes() == local_result.read_bytes()
+    assert not (alias_root / "qc_result.json").exists()
+
+
+def test_concurrent_latest_result_copies_use_independent_partial_files(
+    tmp_path: Path, monkeypatch
+):
+    """Catches parallel QC jobs corrupting or deleting each other's partial copy."""
+    asset_root = tmp_path / "asset"
+    asset_root.mkdir()
+    first_result = tmp_path / "first.json"
+    second_result = tmp_path / "second.json"
+    first_result.write_bytes(b'{"result_id":"QCR-FIRST"}\n')
+    second_result.write_bytes(b'{"result_id":"QCR-SECOND"}\n')
+    expected_payloads = {first_result.read_bytes(), second_result.read_bytes()}
+    first_replaced = threading.Event()
+    second_replaced = threading.Event()
+    real_replace = platform_workflow.os.replace
+
+    def ordered_replace(source, destination, *args, **kwargs):
+        payload = Path(source).read_bytes()
+        if payload == first_result.read_bytes():
+            replaced = real_replace(source, destination, *args, **kwargs)
+            first_replaced.set()
+            assert second_replaced.wait(timeout=5)
+            return replaced
+        assert first_replaced.wait(timeout=5)
+        replaced = real_replace(source, destination, *args, **kwargs)
+        second_replaced.set()
+        return replaced
+
+    monkeypatch.setattr(platform_workflow.os, "replace", ordered_replace)
+    job = {"source_uri": str(asset_root)}
+
+    def publish(local_result: Path) -> str:
+        return QualityCacheManager._publish_latest_result_copy(
+            job,
+            local_result,
+            result_sha256=hashlib.sha256(local_result.read_bytes()).hexdigest(),
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(publish, (first_result, second_result)))
+
+    assert results == [str(asset_root / "qc_result.json")] * 2
+    assert (asset_root / "qc_result.json").read_bytes() in expected_payloads
+    assert list(asset_root.glob("*.partial")) == []
 
 
 def publish_asset_manifest(asset_root: Path, job: dict, relative_files: list[str]) -> dict:
@@ -803,6 +876,7 @@ def test_structured_label_flow_job_is_fully_cached_verified_submitted_and_safely
     assert client.work_reports == [{"action": "start", "workstation": "QC-WS-TEST"}]
     with pytest.raises(QualityCacheError, match="尚未同步"):
         cache.evict(job["code"])
+    (asset_root / "qc_result.json").write_text('{"stale": true}\n', encoding="utf-8")
 
     submitted = cache.submit_result(
         client,
@@ -849,6 +923,9 @@ def test_structured_label_flow_job_is_fully_cached_verified_submitted_and_safely
         / "qc_result.json"
     )
     result = json.loads(result_path.read_text(encoding="utf-8"))
+    mirrored_result_path = asset_root / "qc_result.json"
+    assert json.loads(mirrored_result_path.read_text(encoding="utf-8")) == result
+    assert list(asset_root.glob("*.partial")) == []
     assert [item["decision"] for item in result["episode_results"]] == [
         "pass_with_labels",
         "discard",
@@ -891,6 +968,71 @@ def test_structured_label_flow_job_is_fully_cached_verified_submitted_and_safely
 
     cache.evict(job["code"])
     assert not (tmp_path / "qc-cache" / "ready" / job["code"]).exists()
+
+
+def test_result_copy_failure_keeps_pending_result_and_does_not_complete_flow(
+    tmp_path: Path, monkeypatch
+):
+    """Catches an unwritable asset mirror being mistaken for a completed QC job."""
+    asset_root = tmp_path / "nas" / "AST-MIRROR-FAILURE"
+    asset_root.mkdir(parents=True)
+    job = {
+        "code": "QCJ-MIRROR-FAILURE",
+        "asset_id": "AST-MIRROR-FAILURE",
+        "asset_nas_uri": str(asset_root),
+        "source_uri": str(asset_root),
+        "episodes": [{"episode_id": "AST-MIRROR-FAILURE-EP0001"}],
+    }
+    cache_root = tmp_path / "qc-cache"
+    cache = QualityCacheManager(cache_root, reserve_bytes=0)
+    state_path = cache_root / "ready" / job["code"] / ".qc-cache.json"
+    QualityCacheManager._write_json_atomic(
+        state_path,
+        {
+            "schema_version": 3,
+            "job_code": job["code"],
+            "asset_id": job["asset_id"],
+            "cache_complete": True,
+            "episodes": [
+                {
+                    "episode_id": "AST-MIRROR-FAILURE-EP0001",
+                    "status": "ready",
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        cache,
+        "_publish_result",
+        lambda *args: "/nas/qc-results/AST-MIRROR-FAILURE/QCJ-MIRROR-FAILURE/attempt-0001/qc_result.json",
+    )
+
+    def fail_copy(source, destination, *args, **kwargs):
+        Path(destination).write_bytes(b"partial result")
+        raise OSError("read-only asset directory")
+
+    monkeypatch.setattr(platform_workflow.shutil, "copy2", fail_copy)
+    client = FakeFlowClient(job)
+
+    with pytest.raises(QualityCacheError, match="无法在原始数据目录保存最新质检结果副本"):
+        cache.submit_result(
+            client,
+            job,
+            episode_results=[
+                {
+                    "episode_id": "AST-MIRROR-FAILURE-EP0001",
+                    "decision": "pass",
+                    "annotation_count": 0,
+                }
+            ],
+        )
+
+    assert client.results == []
+    assert (cache_root / "results-pending" / job["code"] / "qc_result.json").is_file()
+    assert list(asset_root.glob("*.partial")) == []
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["pending_result"]["result_id"].startswith("QCR-")
+    assert state.get("result_synced") is not True
 
 
 def test_legacy_annotations_are_rejected_before_result_publication(tmp_path: Path):

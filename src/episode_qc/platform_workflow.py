@@ -775,6 +775,11 @@ class QualityCacheManager:
             local_result,
             result_manifest,
         )
+        self._publish_latest_result_copy(
+            job,
+            local_result,
+            result_sha256=result_sha256,
+        )
         if hasattr(client, "report_work"):
             client.report_work(job_code, action="heartbeat")
         response = client.submit_result(
@@ -1061,6 +1066,36 @@ class QualityCacheManager:
                 raise QualityCacheError(f"无法原子发布质检结果：{exc}") from exc
         self._verify_published_result(destination, result_manifest)
         return f"{upload_uri}/{attempt_name}/qc_result.json"
+
+    @staticmethod
+    def _publish_latest_result_copy(
+        job: dict,
+        local_result: Path,
+        *,
+        result_sha256: str,
+    ) -> str:
+        asset_uri = str(job.get("source_uri") or job.get("asset_nas_uri") or "").strip()
+        if not asset_uri:
+            raise QualityCacheError("Flow 没有返回原始数据目录，无法保存最新质检结果副本")
+        temporary: Path | None = None
+        try:
+            asset_root = resolve_source_directory(asset_uri)
+            destination = asset_root / "qc_result.json"
+            temporary = asset_root / f".qc_result.{uuid.uuid4().hex}.partial"
+            shutil.copy2(local_result, temporary)
+            if sha256_file(temporary) != result_sha256:
+                raise QualityCacheError("数据目录质检结果副本 SHA-256 校验失败")
+            os.replace(temporary, destination)
+        except (OSError, ValueError, QualityCacheError) as exc:
+            if temporary is not None:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            if isinstance(exc, QualityCacheError):
+                raise
+            raise QualityCacheError(f"无法在原始数据目录保存最新质检结果副本：{exc}") from exc
+        return str(destination)
 
     @staticmethod
     def _normalized_uri(value: str) -> str:

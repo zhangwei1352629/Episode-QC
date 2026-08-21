@@ -525,6 +525,100 @@ def test_web_flow_label_schema_submit_uses_direct_annotations(tmp_path: Path, mo
         "reviewer_name": "Web 质检员",
     }
 
+
+@pytest.mark.parametrize("initially_visible", [False, True])
+def test_submit_platform_job_reclaims_expired_job_before_upload(
+    tmp_path: Path, monkeypatch, initially_visible: bool
+):
+    """Catches a completed local task becoming unsubmittable after its Flow lease expires."""
+    job = {
+        "code": "QCJ-WEB-EXPIRED",
+        "status": "in_progress",
+        "asset_id": "AST-WEB-EXPIRED",
+        "episodes": [{"episode_id": "AST-WEB-EXPIRED-EP0001"}],
+        "reviewer_name": "Previous Reviewer",
+        "lease_expired": True,
+    }
+    calls = []
+
+    class FakeFlowClient:
+        def __init__(self):
+            self.visible = initially_visible
+
+        def jobs(self):
+            return [dict(job)] if self.visible else []
+
+        def claim(self, job_code):
+            assert job_code == job["code"]
+            calls.append("claim")
+            self.visible = True
+            return {**job, "status": "claimed"}
+
+        def report_work(self, job_code, *, action, **_values):
+            assert job_code == job["code"]
+            assert action == "start"
+            calls.append("start")
+            return {**job, "status": "in_progress", "action": action}
+
+    class FakeCache:
+        def local_episode_mappings(self, _job_code):
+            return [
+                {
+                    "episode_id": "AST-WEB-EXPIRED-EP0001",
+                    "local_episode_id": "ep_local",
+                }
+            ]
+
+        def start_review(self, client, job_code):
+            return client.report_work(job_code, action="start")
+
+        def submit_result(self, _client, current_job, *, episode_results, result):
+            assert current_job["status"] == "in_progress"
+            assert [item["episode_id"] for item in episode_results] == [
+                "AST-WEB-EXPIRED-EP0001"
+            ]
+            assert result == {"episode_count": 1}
+            calls.append("submit")
+            return {**current_job, "status": "completed"}
+
+    local_task = {
+        "id": "task_local",
+        "status": "completed",
+        "metadata": {"flow_job": dict(job)},
+    }
+    monkeypatch.setattr(
+        web_server,
+        "episode_detail",
+        lambda *_args: {
+            "episode": {
+                "quality_decision": "pass",
+                "review_status": "completed",
+                "reviewer_name": "Web 质检员",
+                "annotation_count": 0,
+            },
+            "annotations": [],
+        },
+    )
+    monkeypatch.setattr(
+        web_server.EpisodeQcWebApplication,
+        "_local_task_for_job",
+        lambda *_args: local_task,
+    )
+    monkeypatch.setattr(
+        web_server,
+        "mark_qc_task_submitted",
+        lambda *_args: {**local_task, "status": "submitted"},
+    )
+
+    with running_server(tmp_path) as (server, _base_url):
+        server.application._flow_client = FakeFlowClient()
+        server.application._quality_cache_manager = lambda: FakeCache()
+        response = server.application.submit_platform_job(job["code"])
+
+    assert calls == ["claim", "start", "submit"]
+    assert response["job"]["status"] == "completed"
+    assert response["local_task"]["status"] == "submitted"
+
 def request_json(url: str, *, method: str = "GET", payload: dict[str, object] | None = None):
     body = None if payload is None else json.dumps(payload).encode("utf-8")
     request = Request(

@@ -574,10 +574,22 @@ class EpisodeQcWebApplication:
     def submit_platform_job(self, job_code: str) -> dict[str, object]:
         self._assert_flow_enabled()
         client = self._require_flow_client()
-        job = self._platform_job(client, job_code)
         task = self._local_task_for_job(job_code)
         if task is None:
             raise ValueError("质检任务尚未领取并缓存到本地")
+        try:
+            job = self._platform_job(client, job_code)
+            status = job.get("status")
+            reactivate_before_submit = status != "completed" and (
+                status != "in_progress" or bool(job.get("lease_expired"))
+            )
+        except ValueError:
+            metadata = task.get("metadata")
+            cached_job = metadata.get("flow_job") if isinstance(metadata, dict) else None
+            if not isinstance(cached_job, dict) or cached_job.get("code") != job_code:
+                raise
+            job = dict(cached_job)
+            reactivate_before_submit = True
         manager = self._quality_cache_manager()
         mappings = manager.local_episode_mappings(job_code)
         if not mappings:
@@ -602,6 +614,10 @@ class EpisodeQcWebApplication:
                     },
                 }
             )
+        if reactivate_before_submit:
+            client.claim(job_code)
+            manager.start_review(client, job_code)
+            job = self._platform_job(client, job_code)
         response = manager.submit_result(
             client,
             job,

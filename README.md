@@ -132,6 +132,8 @@ Windows 生产工作站推荐让 Flow 返回统一的 `smb://服务器/共享/..
 
 仓库提供 `deploy/windows/Start-EpisodeQc.ps1` 和 `Install-EpisodeQcTask.ps1`。先在专用账号下配置 `EPISODE_QC_PUBLIC_HOST`、`EPISODE_QC_FLOW_URL`、`EPISODE_QC_NAS_PROBE_PATH` 以及 SMB 凭据，再由管理员安装计划任务。启动脚本不保存 NAS 密码；NAS 探针不可访问时会退出，由计划任务按一分钟间隔重试，避免产生假健康服务。
 
+生产更新必须遵守 [Windows 生产部署要求](deploy/windows/DEPLOYMENT_REQUIREMENTS.md)。只把新文件同步到 `src/episode_qc` 不算完成部署：计划任务运行的是 `.venv` 中已安装的 `episode_qc`，每次代码修改后都必须重新构建并安装制品，核对运行时实际导入路径和 SHA-256，再在没有在途质检任务且已获得重启确认后切换服务。
+
 ### QC 任务与数据导入
 
 QC 页面按“一个数据资产目录对应一个 QC 任务”组织数据。左侧“当前 QC 任务”卡片始终显示任务名称、任务编号、本地目录、状态和完成进度；Episode 列表、状态统计、上一条/下一条和结果导出都只作用于当前任务。

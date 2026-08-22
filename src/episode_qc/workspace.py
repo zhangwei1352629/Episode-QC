@@ -26,6 +26,7 @@ class WorkspaceConflictError(RuntimeError):
 
 
 APP_VERSION = "1.0.0"
+WORKSPACE_BUSY_TIMEOUT_MS = 30_000
 VALID_SCOPES = {"episode", "time_range", "time_point"}
 VALID_TARGETS = {"global", "mocap", "joint", "camera", "stream", "retarget", "robot", "hand"}
 VALID_REVIEW_STATUSES = {"unreviewed", "in_progress", "completed", "needs_recheck", "reviewed"}
@@ -138,12 +139,35 @@ def _loads(value: str | None, default: Any = None) -> Any:
 def connect_workspace(db_path: str | Path) -> sqlite3.Connection:
     path = Path(db_path).expanduser().resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(path)
+    connection = sqlite3.connect(
+        path,
+        timeout=WORKSPACE_BUSY_TIMEOUT_MS / 1000,
+    )
     connection.row_factory = sqlite3.Row
+    connection.execute(f"PRAGMA busy_timeout = {WORKSPACE_BUSY_TIMEOUT_MS}")
     connection.execute("PRAGMA foreign_keys = ON")
     connection.execute("PRAGMA journal_mode = WAL")
-    connection.execute("PRAGMA busy_timeout = 5000")
     return connection
+
+
+def backup_workspace_database(
+    db_path: str | Path,
+    backup_dir: str | Path,
+    *,
+    reason: str = "manual",
+) -> Path:
+    """Create a transactionally consistent SQLite backup of the QC workspace."""
+    source_path = Path(db_path).expanduser().resolve()
+    initialize_workspace(source_path)
+    destination_dir = Path(backup_dir).expanduser().resolve()
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    safe_reason = re.sub(r"[^A-Za-z0-9._-]+", "-", str(reason)).strip("-._") or "manual"
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    destination = destination_dir / f"workspace-{timestamp}-{safe_reason}.db"
+    with connect_workspace(source_path) as source, sqlite3.connect(destination) as target:
+        source.backup(target)
+    destination.chmod(0o600)
+    return destination
 
 
 def initialize_workspace(

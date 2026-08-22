@@ -24,8 +24,10 @@ from episode_qc.playback import (
 )
 from episode_qc.workspace import (
     activate_label_set,
+    backup_workspace_database,
     canonical_json_sha256,
     clear_local_task_history,
+    connect_workspace,
     delete_label_set,
     delete_annotation,
     episode_detail,
@@ -77,6 +79,54 @@ FLOW_SCHEMA = {
         }
     ],
 }
+
+
+def test_workspace_connection_waits_for_long_running_transient_writer(tmp_path: Path):
+    db_path = tmp_path / "workspace.db"
+    initialize_workspace(db_path)
+
+    connection = connect_workspace(db_path)
+    try:
+        busy_timeout_ms = connection.execute("PRAGMA busy_timeout").fetchone()[0]
+    finally:
+        connection.close()
+
+    assert busy_timeout_ms == 30_000
+
+
+def test_workspace_backup_preserves_completed_qc_results(tmp_path: Path):
+    source_root = tmp_path / "dataset"
+    _write_sample_episode(source_root / "episode_000001")
+    db_path = tmp_path / "workspace.db"
+    scanned = scan_data_source(db_path, source_root)
+    episode_id = str(scanned["episodes"][0]["id"])
+    update_episode_review(
+        db_path,
+        episode_id,
+        review_status="completed",
+        quality_decision="pass",
+        reviewer_name="质检员甲",
+    )
+
+    backup_path = backup_workspace_database(
+        db_path,
+        tmp_path / "backups",
+        reason="cache-recovery-QCJ-00006",
+    )
+    (source_root / "episode_000001" / "episode.mcap").touch()
+    scan_data_source(db_path, source_root)
+    rescanned = workspace_state(db_path)
+    assert rescanned["tasks"][0]["completed_count"] == 1
+    assert rescanned["episodes"][0]["quality_decision"] == "pass"
+    update_episode_review(db_path, episode_id, quality_decision="recollect")
+
+    snapshot = workspace_state(backup_path)
+    assert backup_path.parent == tmp_path / "backups"
+    assert "cache-recovery-QCJ-00006" in backup_path.name
+    assert snapshot["tasks"][0]["completed_count"] == 1
+    assert snapshot["episodes"][0]["review_status"] == "completed"
+    assert snapshot["episodes"][0]["quality_decision"] == "pass"
+    assert snapshot["episodes"][0]["reviewer_name"] == "质检员甲"
 
 
 def test_flow_label_schema_installs_exact_snapshot_and_accepts_its_label(tmp_path: Path):

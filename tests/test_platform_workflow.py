@@ -63,6 +63,18 @@ def test_flow_client_preserves_drf_list_error_message():
         client.request("POST", "/api/v1/qc/jobs/QCJ-001/work", {})
 
 
+def test_flow_client_renews_claim_without_creating_work_heartbeat():
+    client = FlowClient("http://flow.test")
+    client.request = Mock(return_value={"code": "QCJ-HEARTBEAT", "status": "in_progress"})
+
+    response = client.heartbeat("QCJ-HEARTBEAT")
+
+    assert response == {"code": "QCJ-HEARTBEAT", "status": "in_progress"}
+    client.request.assert_called_once_with(
+        "POST", "/api/v1/qc/jobs/QCJ-HEARTBEAT/heartbeat", {}
+    )
+
+
 def test_atomic_json_writer_uses_platform_independent_lf(tmp_path: Path):
     target = tmp_path / "result.json"
     QualityCacheManager._write_json_atomic(target, {"name": "测试"})
@@ -1033,6 +1045,60 @@ def test_result_copy_failure_keeps_pending_result_and_does_not_complete_flow(
     state = json.loads(state_path.read_text(encoding="utf-8"))
     assert state["pending_result"]["result_id"].startswith("QCR-")
     assert state.get("result_synced") is not True
+
+
+def test_completed_job_idempotent_retry_skips_work_heartbeat(tmp_path: Path):
+    asset_root = tmp_path / "nas" / "AST-COMPLETED-RETRY"
+    asset_root.mkdir(parents=True)
+    job = {
+        "code": "QCJ-COMPLETED-RETRY",
+        "status": "completed",
+        "asset_id": "AST-COMPLETED-RETRY",
+        "source_uri": str(asset_root),
+        "result_upload_uri": str(
+            tmp_path / "qc-results" / "AST-COMPLETED-RETRY" / "QCJ-COMPLETED-RETRY"
+        ),
+        "result_staging_uri": str(
+            tmp_path / "incoming" / "AST-COMPLETED-RETRY" / "QCJ-COMPLETED-RETRY"
+        ),
+        "next_attempt": 1,
+        "episodes": [{"episode_id": "AST-COMPLETED-RETRY-EP0001"}],
+    }
+    cache_root = tmp_path / "qc-cache"
+    cache = QualityCacheManager(cache_root, reserve_bytes=0)
+    QualityCacheManager._write_json_atomic(
+        cache_root / "ready" / job["code"] / ".qc-cache.json",
+        {
+            "schema_version": 3,
+            "job_code": job["code"],
+            "asset_id": job["asset_id"],
+            "cache_complete": True,
+            "episodes": [
+                {
+                    "episode_id": "AST-COMPLETED-RETRY-EP0001",
+                    "status": "ready",
+                }
+            ],
+        },
+    )
+    client = FakeFlowClient(job)
+
+    submitted = cache.submit_result(
+        client,
+        job,
+        episode_results=[
+            {
+                "episode_id": "AST-COMPLETED-RETRY-EP0001",
+                "decision": "pass",
+                "annotation_count": 0,
+            }
+        ],
+    )
+
+    assert submitted["status"] == "completed"
+    assert client.work_reports == []
+    assert len(client.results) == 1
+    assert (asset_root / "qc_result.json").is_file()
 
 
 def test_legacy_annotations_are_rejected_before_result_publication(tmp_path: Path):

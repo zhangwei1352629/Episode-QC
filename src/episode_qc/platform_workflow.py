@@ -37,7 +37,9 @@ DECISION_MAP = {
 
 
 class FlowClientError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class QualityCacheError(RuntimeError):
@@ -150,7 +152,10 @@ class FlowClient:
                 message = _api_error_message(json.loads(message))
             except json.JSONDecodeError:
                 pass
-            raise FlowClientError(f"Flow 请求失败（HTTP {error.code}）：{message}") from error
+            raise FlowClientError(
+                f"Flow 请求失败（HTTP {error.code}）：{message}",
+                status_code=error.code,
+            ) from error
         except (urllib.error.URLError, TimeoutError, OSError) as error:
             raise FlowClientError(f"无法连接 Flow：{error}") from error
 
@@ -177,6 +182,9 @@ class FlowClient:
 
     def claim(self, job_code: str) -> dict:
         return self.request("POST", f"/api/v1/qc/jobs/{job_code}/claim", {})
+
+    def heartbeat(self, job_code: str) -> dict:
+        return self.request("POST", f"/api/v1/qc/jobs/{job_code}/heartbeat", {})
 
     def release(self, job_code: str) -> dict:
         return self.request("POST", f"/api/v1/qc/jobs/{job_code}/release", {})
@@ -780,7 +788,7 @@ class QualityCacheManager:
             local_result,
             result_sha256=result_sha256,
         )
-        if hasattr(client, "report_work"):
+        if hasattr(client, "report_work") and job.get("status") != "completed":
             client.report_work(job_code, action="heartbeat")
         response = client.submit_result(
             job_code,

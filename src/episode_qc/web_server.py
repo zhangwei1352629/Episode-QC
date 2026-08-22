@@ -34,6 +34,7 @@ from episode_qc.playback import (
     public_cache_manifest,
 )
 from episode_qc.workspace import (
+    backup_workspace_database,
     delete_annotation,
     episode_detail,
     export_workspace,
@@ -65,6 +66,7 @@ WEB_TOKEN_FILE = ".web-token"
 LOCAL_WEB_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 WILDCARD_WEB_HOSTS = frozenset({"0.0.0.0", "::"})
 PLATFORM_CACHE_CLEANUP_INTERVAL_SECONDS = 60 * 60
+PLATFORM_CLAIM_HEARTBEAT_INTERVAL_SECONDS = 30
 NAS_PROBE_PATH_ENV = "EPISODE_QC_NAS_PROBE_PATH"
 NAS_UNAVAILABLE_MESSAGE = (
     "NAS 当前不可用；可继续查看本机已有任务，依赖 NAS 的领取、缓存、导入和提交操作将在恢复后可用。"
@@ -342,6 +344,8 @@ class EpisodeQcWebApplication:
         self._jobs: set[str] = set()
         self._jobs_lock = threading.Lock()
         self._platform_jobs: set[str] = set()
+        self._platform_owned_jobs: set[str] = set()
+        self._platform_ownership_errors: dict[str, str] = {}
         self._platform_progress: dict[str, dict[str, object]] = {}
         self._platform_lock = threading.RLock()
         self._flow_client_factory = FlowClient
@@ -362,10 +366,19 @@ class EpisodeQcWebApplication:
         )
         self._platform_cache_cleanup.start()
         self._connect_platform_from_environment()
+        self._platform_heartbeat_stop = threading.Event()
+        self._platform_heartbeat_thread = threading.Thread(
+            target=self._run_platform_claim_heartbeats,
+            name="episode-qc-platform-claim-heartbeat",
+            daemon=True,
+        )
+        self._platform_heartbeat_thread.start()
 
     def close(self) -> None:
         self._nas_status_monitor.close()
         self._platform_cache_cleanup.close()
+        self._platform_heartbeat_stop.set()
+        self._platform_heartbeat_thread.join(timeout=5)
         self._executor.shutdown(wait=False, cancel_futures=True)
         self._platform_executor.shutdown(wait=False, cancel_futures=True)
 
@@ -457,6 +470,7 @@ class EpisodeQcWebApplication:
                 "reviewer": str(response.get("reviewer") or reviewer_name),
             }
             self._flow_error = ""
+        self._refresh_platform_owned_jobs(response)
         self._resume_incomplete_platform_caches(client, response)
         return self._platform_payload(response)
 
@@ -468,6 +482,8 @@ class EpisodeQcWebApplication:
             self._flow_client = None
             self._flow_connection = {}
             self._flow_error = ""
+            self._platform_owned_jobs.clear()
+            self._platform_ownership_errors.clear()
         return {"connected": False, "jobs": []}
 
     def get_platform_jobs(self) -> dict[str, object]:
@@ -485,7 +501,53 @@ class EpisodeQcWebApplication:
                 ),
                 "default_username": os.environ.get("EPISODE_QC_FLOW_USERNAME", ""),
             }
-        return self._platform_payload(client.jobs_response())
+        response = client.jobs_response()
+        self._refresh_platform_owned_jobs(response)
+        return self._platform_payload(response)
+
+    def _refresh_platform_owned_jobs(self, response: dict[str, object]) -> None:
+        reviewer = str(response.get("reviewer") or "")
+        if not reviewer:
+            return
+        owned = {
+            str(item.get("code"))
+            for item in response.get("jobs", [])
+            if isinstance(item, dict)
+            and item.get("code")
+            and item.get("reviewer_name") == reviewer
+            and item.get("status") not in {"completed", "waiting_data"}
+        }
+        with self._platform_lock:
+            self._platform_owned_jobs = owned
+            self._platform_ownership_errors = {
+                code: message
+                for code, message in self._platform_ownership_errors.items()
+                if code in owned
+            }
+
+    def _heartbeat_platform_claims_once(self) -> None:
+        with self._platform_lock:
+            client = self._flow_client
+            job_codes = sorted(self._platform_owned_jobs)
+        if client is None:
+            return
+        for job_code in job_codes:
+            try:
+                client.heartbeat(job_code)
+            except FlowClientError as exc:
+                with self._platform_lock:
+                    self._platform_ownership_errors[job_code] = str(exc)
+                    if exc.status_code in {403, 409}:
+                        self._platform_owned_jobs.discard(job_code)
+                continue
+            with self._platform_lock:
+                self._platform_ownership_errors.pop(job_code, None)
+
+    def _run_platform_claim_heartbeats(self) -> None:
+        while not self._platform_heartbeat_stop.wait(
+            PLATFORM_CLAIM_HEARTBEAT_INTERVAL_SECONDS
+        ):
+            self._heartbeat_platform_claims_once()
 
     def _resume_incomplete_platform_caches(self, client, response: dict[str, object]) -> None:
         """Continue durable Episode queues once a reviewer reconnects to Flow."""
@@ -524,12 +586,16 @@ class EpisodeQcWebApplication:
         if job.get("status") == "completed":
             raise ValueError("质检任务已经完成")
         local_task = self._local_task_for_job(job_code)
+        manager = self._quality_cache_manager()
         summary = None
         if local_task and local_task.get("status") != "failed":
-            summary = self._quality_cache_manager().cache_summary(job_code)
-            if summary and summary.get("cache_complete"):
+            summary = manager.cache_summary(job_code)
+            if (
+                summary
+                and summary.get("cache_complete")
+                and job.get("status") != "pending"
+            ):
                 return {"accepted": False, "job": job, "local_task": local_task}
-        manager = self._quality_cache_manager()
         pre_cache_failure = manager.has_pre_cache_failure(job_code)
         if summary and not summary.get("cache_complete"):
             # The job is already owned locally.  Resuming its durable queue
@@ -540,7 +606,18 @@ class EpisodeQcWebApplication:
                 self._platform_jobs.add(job_code)
             self._platform_executor.submit(self._cache_platform_job, client, job_code)
             return {"accepted": True, "job": job, "caching": True}
+        cache_recovery = bool(local_task and summary is None)
+        workspace_backup = None
+        if cache_recovery:
+            workspace_backup = backup_workspace_database(
+                self.paths.db_path,
+                self.paths.root / "backups",
+                reason=f"cache-recovery-{job_code}",
+            )
         claimed = client.claim(job_code)
+        with self._platform_lock:
+            self._platform_owned_jobs.add(job_code)
+            self._platform_ownership_errors.pop(job_code, None)
         if pre_cache_failure:
             # Clear only after Flow has accepted the explicit retry. A failed
             # claim must leave the durable failure/error available to retry.
@@ -550,7 +627,13 @@ class EpisodeQcWebApplication:
                 return {"accepted": False, "job": claimed, "caching": True}
             self._platform_jobs.add(job_code)
         self._platform_executor.submit(self._cache_platform_job, client, job_code)
-        return {"accepted": True, "job": claimed, "caching": True}
+        response = {"accepted": True, "job": claimed, "caching": True}
+        if cache_recovery and workspace_backup is not None:
+            response.update(
+                cache_recovery=True,
+                workspace_backup=workspace_backup.name,
+            )
+        return response
 
     def start_platform_job(self, job_code: str) -> dict[str, object]:
         self._assert_flow_enabled()
@@ -559,10 +642,12 @@ class EpisodeQcWebApplication:
         task = self._local_task_for_job(job_code)
         if task is None:
             raise ValueError("质检任务尚未完整缓存到本地")
-        if task.get("status") in {"completed", "submitted", "archived"}:
+        if task.get("status") in {"submitted", "archived"}:
             return {"job": job, "local_task": task, "started": False}
         if job.get("status") == "in_progress":
             return {"job": job, "local_task": task, "started": False}
+        if job.get("status") == "pending":
+            raise ValueError("质检任务领取已失效，请先重新领取")
         manager = self._quality_cache_manager()
         manager.start_review(client, job_code)
         return {
@@ -574,10 +659,24 @@ class EpisodeQcWebApplication:
     def submit_platform_job(self, job_code: str) -> dict[str, object]:
         self._assert_flow_enabled()
         client = self._require_flow_client()
-        job = self._platform_job(client, job_code)
         task = self._local_task_for_job(job_code)
         if task is None:
             raise ValueError("质检任务尚未领取并缓存到本地")
+        try:
+            job = self._platform_job(client, job_code)
+            status = job.get("status")
+            ensure_work_session_before_submit = status != "completed"
+            reclaim_before_submit = ensure_work_session_before_submit and (
+                status != "in_progress" or bool(job.get("lease_expired"))
+            )
+        except ValueError:
+            metadata = task.get("metadata")
+            cached_job = metadata.get("flow_job") if isinstance(metadata, dict) else None
+            if not isinstance(cached_job, dict) or cached_job.get("code") != job_code:
+                raise
+            job = dict(cached_job)
+            ensure_work_session_before_submit = True
+            reclaim_before_submit = True
         manager = self._quality_cache_manager()
         mappings = manager.local_episode_mappings(job_code)
         if not mappings:
@@ -602,6 +701,11 @@ class EpisodeQcWebApplication:
                     },
                 }
             )
+        if ensure_work_session_before_submit:
+            if reclaim_before_submit:
+                client.claim(job_code)
+            manager.start_review(client, job_code)
+            job = self._platform_job(client, job_code)
         response = manager.submit_result(
             client,
             job,
@@ -609,6 +713,9 @@ class EpisodeQcWebApplication:
             result={"episode_count": len(episode_results)},
         )
         local_task = mark_qc_task_submitted(self.paths.db_path, job_code)
+        with self._platform_lock:
+            self._platform_owned_jobs.discard(job_code)
+            self._platform_ownership_errors.pop(job_code, None)
         return {"job": response, "local_task": local_task}
 
     def _connect_platform_from_environment(self) -> None:
@@ -646,14 +753,19 @@ class EpisodeQcWebApplication:
             if task.get("flow_job_code")
         }
         cache_by_job = {}
+        missing_cache_state_jobs = set()
+        cache_errors_by_job = {}
         manager = self._quality_cache_manager()
         for job_code in local_by_job:
             try:
                 summary = manager.cache_summary(job_code)
-            except QualityCacheError:
-                summary = None
-            if summary is not None:
-                cache_by_job[job_code] = summary
+            except QualityCacheError as exc:
+                cache_errors_by_job[job_code] = str(exc)
+            else:
+                if summary is None:
+                    missing_cache_state_jobs.add(job_code)
+                else:
+                    cache_by_job[job_code] = summary
         with self._platform_lock:
             caching = set(self._platform_jobs)
             progress_by_job = {
@@ -663,6 +775,7 @@ class EpisodeQcWebApplication:
             if response.get("reviewer"):
                 self._flow_connection["reviewer"] = str(response["reviewer"])
             connection = dict(self._flow_connection)
+            ownership_errors = dict(self._platform_ownership_errors)
         jobs = []
         for item in response.get("jobs", []):
             if not isinstance(item, dict):
@@ -670,11 +783,19 @@ class EpisodeQcWebApplication:
             code = str(item.get("code") or "")
             local_task = local_by_job.get(code)
             cache_summary = cache_by_job.get(code)
-            if cache_summary is None and code:
+            if cache_summary is None and code and code not in local_by_job:
                 try:
                     cache_summary = manager.cache_summary(code)
                 except QualityCacheError:
                     cache_summary = None
+            cache_state_missing = bool(
+                local_task and code in missing_cache_state_jobs
+            )
+            cache_recovery_available = bool(
+                cache_state_missing
+                and local_task.get("status") not in {"submitted", "archived"}
+                and item.get("status") not in {"completed", "waiting_data"}
+            )
             cache_summary = cache_summary or {}
             jobs.append(
                 {
@@ -682,10 +803,22 @@ class EpisodeQcWebApplication:
                     "local_task_id": local_task.get("id") if local_task else None,
                     "local_task_status": local_task.get("status") if local_task else None,
                     "local_caching": code in caching,
+                    "cache_state_missing": cache_state_missing,
+                    "cache_recovery_available": cache_recovery_available,
+                    **(
+                        {"cache_state_error": cache_errors_by_job[code]}
+                        if code in cache_errors_by_job
+                        else {}
+                    ),
                     **cache_summary,
                     **(
                         {"local_progress": progress_by_job[code]}
                         if code in caching and code in progress_by_job
+                        else {}
+                    ),
+                    **(
+                        {"ownership_error": ownership_errors[code]}
+                        if code in ownership_errors
                         else {}
                     ),
                 }

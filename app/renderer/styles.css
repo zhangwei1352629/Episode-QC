@@ -366,16 +366,20 @@ dialog::backdrop { background: rgba(0,0,0,.66); }
 .flow-task-group.expanded { border-color: #53606b; background: #0d1216; }
 .flow-task-group.claimable { border-color: rgba(215,243,86,.62); background: linear-gradient(90deg, rgba(215,243,86,.12), #10151a 46%); box-shadow: inset 3px 0 0 var(--accent); }
 .flow-task-group.claimable.expanded { border-color: rgba(215,243,86,.72); background: linear-gradient(90deg, rgba(215,243,86,.09), #0d1216 46%); }
+.flow-task-group.recoverable { border-color: rgba(243,189,85,.62); background: linear-gradient(90deg, rgba(243,189,85,.12), #10151a 46%); box-shadow: inset 3px 0 0 var(--warning); }
+.flow-task-group.recoverable.expanded { border-color: rgba(243,189,85,.72); background: linear-gradient(90deg, rgba(243,189,85,.09), #0d1216 46%); }
 .flow-task-group-toggle { width: 100%; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; align-items: center; padding: 11px; text-align: left; border: 0; color: var(--text); background: transparent; cursor: pointer; }
 .flow-task-group-toggle:hover { background: #151b21; }
 .flow-task-group-copy { min-width: 0; }
 .flow-task-group-copy strong, .flow-task-group-copy small, .flow-task-group-copy > span { display: block; }
 .flow-task-group-copy strong { font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .flow-task-group.claimable .flow-task-group-copy > strong { color: #e9f9ad; }
+.flow-task-group.recoverable .flow-task-group-copy > strong { color: #ffe0a3; }
 .flow-task-group-copy small, .flow-task-group-copy > span { margin-top: 3px; color: var(--muted); font-size: 9px; }
 .flow-task-group-meta { min-width: 88px; display: flex; flex-direction: column; align-items: flex-end; gap: 4px; text-align: right; }
 .flow-task-group-meta strong { padding: 4px 8px; border: 1px solid #414b54; border-radius: 999px; color: #a8b2ba; background: #242b31; font-size: 10px; line-height: 1; }
 .flow-task-group.claimable .flow-task-group-meta strong { border-color: var(--accent); color: #11140a; background: var(--accent); box-shadow: 0 0 14px rgba(215,243,86,.18); }
+.flow-task-group.recoverable .flow-task-group-meta strong { border-color: var(--warning); color: #1b1204; background: var(--warning); box-shadow: 0 0 14px rgba(243,189,85,.18); }
 .flow-task-group-meta small { color: var(--muted); font-size: 9px; }
 .flow-task-group-meta > span { color: var(--muted); font-size: 15px; line-height: .7; transform-origin: center; transition: transform .16s ease; }
 .flow-task-group.expanded .flow-task-group-meta > span { transform: rotate(180deg); }

@@ -160,6 +160,45 @@ def test_web_application_starts_and_closes_platform_cache_cleanup(tmp_path: Path
     assert events == [("created", 3600), "started", "closed"]
 
 
+def test_web_application_renews_only_owned_unfinished_platform_jobs(tmp_path: Path):
+    class FakeFlowClient:
+        def __init__(self):
+            self.heartbeats = []
+
+        def heartbeat(self, job_code):
+            self.heartbeats.append(job_code)
+            return {"code": job_code}
+
+    with running_server(tmp_path) as (server, _base_url):
+        client = FakeFlowClient()
+        server.application._flow_client = client
+        server.application._platform_owned_jobs.update(
+            {"QCJ-OWNED-002", "QCJ-OWNED-001"}
+        )
+
+        server.application._heartbeat_platform_claims_once()
+
+        assert client.heartbeats == ["QCJ-OWNED-001", "QCJ-OWNED-002"]
+        assert server.application._platform_ownership_errors == {}
+
+
+def test_web_application_stops_heartbeats_after_flow_reports_lost_ownership(tmp_path: Path):
+    class FakeFlowClient:
+        def heartbeat(self, _job_code):
+            raise FlowClientError("任务已经由其他质检员接管", status_code=409)
+
+    with running_server(tmp_path) as (server, _base_url):
+        server.application._flow_client = FakeFlowClient()
+        server.application._platform_owned_jobs.add("QCJ-LOST")
+
+        server.application._heartbeat_platform_claims_once()
+
+        assert "QCJ-LOST" not in server.application._platform_owned_jobs
+        assert server.application._platform_ownership_errors == {
+            "QCJ-LOST": "任务已经由其他质检员接管"
+        }
+
+
 def test_cleanup_failure_does_not_stop_the_web_server(tmp_path: Path, monkeypatch, caplog):
     def fail_cleanup(_manager):
         raise RuntimeError("cleanup disk error")
@@ -477,6 +516,302 @@ def test_web_failed_claim_keeps_pre_cache_failure_journal_and_does_not_start_cac
         assert scheduled == []
 
 
+def test_web_reclaims_pending_flow_job_when_local_cache_is_complete(tmp_path: Path, monkeypatch):
+    job = {
+        "code": "QCJ-WEB-RECLAIM-COMPLETE",
+        "status": "pending",
+        "lease_expired": True,
+    }
+    claimed_job = {**job, "status": "claimed", "lease_expired": False}
+
+    class FakeFlowClient:
+        def __init__(self):
+            self.claimed = []
+
+        def jobs(self):
+            return [dict(job)]
+
+        def claim(self, job_code):
+            self.claimed.append(job_code)
+            return dict(claimed_job)
+
+    class FakeCache:
+        def cache_summary(self, _job_code):
+            return {"cache_complete": True}
+
+        def has_pre_cache_failure(self, _job_code):
+            return False
+
+    with running_server(tmp_path) as (server, _base_url):
+        client = FakeFlowClient()
+        scheduled = []
+        server.application._flow_client = client
+        monkeypatch.setattr(
+            server.application,
+            "_local_task_for_job",
+            lambda _job_code: {"status": "completed"},
+        )
+        monkeypatch.setattr(server.application, "_quality_cache_manager", FakeCache)
+        monkeypatch.setattr(
+            server.application._platform_executor,
+            "submit",
+            lambda *args: scheduled.append(args),
+        )
+
+        response = server.application.claim_platform_job(job["code"])
+
+        assert response == {"accepted": True, "job": claimed_job, "caching": True}
+        assert client.claimed == [job["code"]]
+        assert len(scheduled) == 1
+        assert scheduled[0][1:] == (client, job["code"])
+
+
+def test_web_exposes_missing_cache_state_and_backs_up_before_recovery(
+    tmp_path: Path,
+    monkeypatch,
+):
+    job = {
+        "code": "QCJ-WEB-RECOVER-MISSING-CACHE",
+        "status": "pending",
+        "claimable": True,
+    }
+    events = []
+
+    class FakeFlowClient:
+        def jobs_response(self):
+            return {"reviewer": "Web 质检员", "jobs": [dict(job)]}
+
+        def jobs(self):
+            return [dict(job)]
+
+        def claim(self, job_code):
+            events.append(("claim", job_code))
+            return {**job, "status": "claimed"}
+
+    class FakeCache:
+        def cache_summary(self, _job_code):
+            return None
+
+        def has_pre_cache_failure(self, _job_code):
+            return False
+
+    backup_path = tmp_path / "workspace-backups" / "recovery.db"
+    monkeypatch.setattr(
+        web_server,
+        "backup_workspace_database",
+        lambda *_args, **_kwargs: events.append(("backup", job["code"])) or backup_path,
+        raising=False,
+    )
+    with running_server(tmp_path) as (server, _base_url):
+        client = FakeFlowClient()
+        cache = FakeCache()
+        local_task = {
+            "id": "task-local",
+            "status": "completed",
+            "completed_count": 2,
+            "flow_job_code": job["code"],
+        }
+        server.application._flow_client = client
+        monkeypatch.setattr(web_server, "list_qc_tasks", lambda *_args: [local_task])
+        monkeypatch.setattr(
+            server.application,
+            "_local_task_for_job",
+            lambda _job_code: local_task,
+        )
+        monkeypatch.setattr(server.application, "_quality_cache_manager", lambda: cache)
+        monkeypatch.setattr(
+            server.application._platform_executor,
+            "submit",
+            lambda *args: events.append(("submit", args[2])),
+        )
+
+        payload = server.application.get_platform_jobs()
+        assert payload["jobs"][0]["cache_state_missing"] is True
+        assert payload["jobs"][0]["cache_recovery_available"] is True
+
+        response = server.application.claim_platform_job(job["code"])
+
+        assert events == [
+            ("backup", job["code"]),
+            ("claim", job["code"]),
+            ("submit", job["code"]),
+        ]
+        assert response == {
+            "accepted": True,
+            "job": {**job, "status": "claimed"},
+            "caching": True,
+            "cache_recovery": True,
+            "workspace_backup": backup_path.name,
+        }
+
+
+def test_web_starts_completed_local_task_when_flow_needs_review_session(tmp_path: Path, monkeypatch):
+    job = {"code": "QCJ-WEB-RESTART-REVIEW", "status": "cache_ready"}
+
+    class FakeFlowClient:
+        def jobs(self):
+            return [dict(job)]
+
+    class FakeCache:
+        def __init__(self):
+            self.started = []
+
+        def start_review(self, _client, job_code):
+            self.started.append(job_code)
+            job["status"] = "in_progress"
+            return dict(job)
+
+    with running_server(tmp_path) as (server, _base_url):
+        cache = FakeCache()
+        server.application._flow_client = FakeFlowClient()
+        monkeypatch.setattr(
+            server.application,
+            "_local_task_for_job",
+            lambda _job_code: {"status": "completed"},
+        )
+        monkeypatch.setattr(server.application, "_quality_cache_manager", lambda: cache)
+
+        response = server.application.start_platform_job(job["code"])
+
+        assert response["started"] is True
+        assert response["job"]["status"] == "in_progress"
+        assert cache.started == [job["code"]]
+
+
+def test_web_submit_reactivates_expired_flow_job_before_upload(tmp_path: Path, monkeypatch):
+    job = {
+        "code": "QCJ-WEB-REACTIVATE-SUBMIT",
+        "status": "pending",
+        "lease_expired": True,
+    }
+    calls = []
+
+    class FakeFlowClient:
+        def jobs(self):
+            return [dict(job)]
+
+        def claim(self, job_code):
+            calls.append(("claim", job_code))
+            job.update(status="claimed", lease_expired=False)
+            return dict(job)
+
+    class FakeCache:
+        def local_episode_mappings(self, _job_code):
+            return [{"episode_id": "FLOW-EP-1", "local_episode_id": "ep_local"}]
+
+        def start_review(self, _client, job_code):
+            calls.append(("start", job_code))
+            job["status"] = "in_progress"
+            return dict(job)
+
+        def submit_result(self, _client, submitted_job, *, episode_results, result):
+            calls.append(("submit", submitted_job["status"]))
+            return {"status": "completed"}
+
+    monkeypatch.setattr(
+        web_server,
+        "episode_detail",
+        lambda *_args: {
+            "episode": {
+                "quality_decision": "pass",
+                "review_status": "completed",
+                "reviewer_name": "Web 质检员",
+                "annotation_count": 0,
+            },
+            "annotations": [],
+        },
+    )
+    with running_server(tmp_path) as (server, _base_url):
+        server.application._flow_client = FakeFlowClient()
+        server.application._quality_cache_manager = lambda: FakeCache()
+        monkeypatch.setattr(
+            web_server.EpisodeQcWebApplication,
+            "_local_task_for_job",
+            lambda *_args: {"id": "task_local", "status": "completed"},
+        )
+        monkeypatch.setattr(
+            web_server,
+            "mark_qc_task_submitted",
+            lambda *_args: {"status": "submitted"},
+        )
+
+        response = server.application.submit_platform_job(job["code"])
+
+    assert response["job"]["status"] == "completed"
+    assert calls == [
+        ("claim", job["code"]),
+        ("start", job["code"]),
+        ("submit", "in_progress"),
+    ]
+
+
+def test_web_submit_resumes_paused_work_session_for_in_progress_job(
+    tmp_path: Path,
+    monkeypatch,
+):
+    job = {
+        "code": "QCJ-WEB-RESUME-SUBMIT",
+        "status": "in_progress",
+        "lease_expired": False,
+    }
+    calls = []
+
+    class FakeFlowClient:
+        def jobs(self):
+            return [dict(job)]
+
+        def claim(self, job_code):
+            calls.append(("claim", job_code))
+            return dict(job)
+
+    class FakeCache:
+        def local_episode_mappings(self, _job_code):
+            return [{"episode_id": "FLOW-EP-1", "local_episode_id": "ep_local"}]
+
+        def start_review(self, _client, job_code):
+            calls.append(("start", job_code))
+            return dict(job)
+
+        def submit_result(self, _client, submitted_job, *, episode_results, result):
+            calls.append(("submit", submitted_job["status"]))
+            return {"status": "completed"}
+
+    monkeypatch.setattr(
+        web_server,
+        "episode_detail",
+        lambda *_args: {
+            "episode": {
+                "quality_decision": "pass",
+                "review_status": "completed",
+                "reviewer_name": "Web 质检员",
+                "annotation_count": 0,
+            },
+            "annotations": [],
+        },
+    )
+    with running_server(tmp_path) as (server, _base_url):
+        server.application._flow_client = FakeFlowClient()
+        server.application._quality_cache_manager = lambda: FakeCache()
+        monkeypatch.setattr(
+            web_server.EpisodeQcWebApplication,
+            "_local_task_for_job",
+            lambda *_args: {"id": "task_local", "status": "completed"},
+        )
+        monkeypatch.setattr(
+            web_server,
+            "mark_qc_task_submitted",
+            lambda *_args: {"status": "submitted"},
+        )
+
+        response = server.application.submit_platform_job(job["code"])
+
+    assert response["job"]["status"] == "completed"
+    assert calls == [
+        ("start", job["code"]),
+        ("submit", "in_progress"),
+    ]
+
+
 def test_web_flow_label_schema_submit_uses_direct_annotations(tmp_path: Path, monkeypatch):
     job = {"code": "QCJ-WEB-LABEL-SUBMIT", "status": "in_progress"}
     annotation = {"annotation_id": "ann_" + "c" * 24, "label_code": "body_sway"}
@@ -489,6 +824,9 @@ def test_web_flow_label_schema_submit_uses_direct_annotations(tmp_path: Path, mo
     class FakeCache:
         def local_episode_mappings(self, _job_code):
             return [{"episode_id": "FLOW-EP-1", "local_episode_id": "ep_local"}]
+
+        def start_review(self, _client, _job_code):
+            return dict(job)
 
         def submit_result(self, _client, _job, *, episode_results, result):
             submitted["episode_results"] = episode_results

@@ -4,7 +4,12 @@ import {
   resolveSelectedTarget,
   targetTypesDescription,
 } from "./target-selection.mjs";
-import { flowTaskGroupPresentation, groupFlowClaimPoolJobs } from "./flow-task-groups.mjs";
+import {
+  flowJobNeedsCacheRecovery,
+  flowJobOwnershipLabel,
+  flowTaskGroupPresentation,
+  groupFlowClaimPoolJobs,
+} from "./flow-task-groups.mjs";
 import { loadInitialTasks } from "./startup.mjs";
 
 const $ = (id) => document.getElementById(id);
@@ -455,8 +460,12 @@ function renderPlatformJobs() {
     [...state.expandedFlowTaskKeys].filter((key) => activeGroupKeys.has(key)),
   );
   const claimableBatchCount = groups.reduce((sum, group) => sum + group.claimableBatchCount, 0);
-  const blockedBatchCount = groups.reduce((sum, group) => sum + group.batchCount - group.claimableBatchCount, 0);
-  els.flowTaskStatus.textContent = `${platform.reviewer || platform.username} · ${groups.length} 个任务 · 可领取 ${claimableBatchCount} · 不可领取 ${blockedBatchCount}`;
+  const recoverableBatchCount = groups.reduce((sum, group) => sum + group.recoverableBatchCount, 0);
+  const blockedBatchCount = groups.reduce(
+    (sum, group) => sum + group.batchCount - group.claimableBatchCount - group.recoverableBatchCount,
+    0,
+  );
+  els.flowTaskStatus.textContent = `${platform.reviewer || platform.username} · ${groups.length} 个任务 · 可领取 ${claimableBatchCount} · 可恢复 ${recoverableBatchCount} · 不可领取 ${blockedBatchCount}`;
   if (!groups.length) {
     els.flowTaskList.innerHTML = '<div class="empty-panel">当前没有可领取或待排查的 Flow 质检批次</div>';
     return;
@@ -489,11 +498,13 @@ function renderFlowJobItem(job) {
   const blockedReason = job.claimable === false && !job.local_task_id
     ? ` · ${job.claim_blocked_reason || "当前不可领取"}`
     : "";
+  const ownership = flowJobOwnershipLabel(job);
+  const ownershipLabel = ownership ? ` · ${ownership}` : "";
   return `
     <div class="flow-task-item">
       <div>
         <strong>${escapeHtml(job.asset_id || job.code)}</strong>
-        <small>${escapeHtml(job.code)} · ${escapeHtml(flowJobStatusName(job.status))}${escapeHtml(progress)}${escapeHtml(blockedReason)}</small>
+        <small>${escapeHtml(job.code)} · ${escapeHtml(flowJobStatusName(job.status))}${escapeHtml(progress)}${escapeHtml(blockedReason)}${escapeHtml(ownershipLabel)}</small>
         <span>${escapeHtml(job.collector || "未知采集员")} · ${job.required_episode_count || job.episodes?.length || 0} Episode · ${formatBytes(job.asset_size_bytes)}</span>
       </div>
       <button type="button" data-flow-job-code="${escapeHtml(job.code)}" data-flow-action="${action.name}" ${action.disabled ? "disabled" : ""}>${escapeHtml(action.label)}</button>
@@ -513,6 +524,10 @@ function flowJobProgressLabel(job) {
 }
 
 function flowJobAction(job) {
+  if (flowJobNeedsCacheRecovery(job)) {
+    if (job.local_caching) return { name: "none", label: flowJobProgressLabel(job), disabled: true };
+    return { name: "claim", label: "恢复缓存", disabled: false };
+  }
   if (job.local_task_id && job.cache_complete === false && !job.local_caching) {
     return { name: "claim", label: "继续缓存", disabled: false };
   }
@@ -614,11 +629,17 @@ async function handleFlowTaskAction(event) {
     return;
   }
   if (button.dataset.flowAction !== "claim") return;
-  setBusyButton(button, true, "领取中…");
+  const recoveringCache = flowJobNeedsCacheRecovery(job);
+  setBusyButton(button, true, recoveringCache ? "恢复中…" : "领取中…");
   try {
     const result = await window.episodeQc.claimPlatformJob(job.code);
     state.pendingFlowJobCode = job.code;
-    toast(result.accepted ? `已领取 ${job.code}，正在后台完整缓存` : `${job.code} 已在本机处理`, "success", 5500);
+    const message = result.cache_recovery
+      ? `已备份质检记录，正在从 NAS 恢复 ${job.code} 的缓存`
+      : result.accepted
+        ? `已领取 ${job.code}，正在后台完整缓存`
+        : `${job.code} 已在本机处理`;
+    toast(message, "success", 5500);
     startFlowPolling();
     await refreshPlatformJobs({ quiet: true });
   } catch (error) {

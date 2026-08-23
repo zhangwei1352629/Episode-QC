@@ -341,6 +341,9 @@ class EpisodeQcWebApplication:
         self._platform_executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="episode-qc-platform"
         )
+        self._platform_progress_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="episode-qc-progress"
+        )
         self._jobs: set[str] = set()
         self._jobs_lock = threading.Lock()
         self._platform_jobs: set[str] = set()
@@ -381,6 +384,7 @@ class EpisodeQcWebApplication:
         self._platform_heartbeat_thread.join(timeout=5)
         self._executor.shutdown(wait=False, cancel_futures=True)
         self._platform_executor.shutdown(wait=False, cancel_futures=True)
+        self._platform_progress_executor.shutdown(wait=False, cancel_futures=True)
 
     def nas_status(self) -> dict[str, object]:
         return self._nas_status_monitor.status()
@@ -549,6 +553,85 @@ class EpisodeQcWebApplication:
         ):
             self._heartbeat_platform_claims_once()
 
+    def _sync_platform_review_progress(self, job_code: str) -> dict[str, object] | None:
+        with self._platform_lock:
+            client = self._flow_client
+        if client is None or not hasattr(client, "report_review_progress"):
+            return None
+        task = next(
+            (
+                item
+                for item in list_qc_tasks(self.paths.db_path)
+                if item.get("flow_job_code") == job_code
+            ),
+            None,
+        )
+        if not task or not task.get("review_started_at"):
+            return None
+        manager = self._quality_cache_manager()
+        mappings = manager.local_episode_mappings(job_code)
+        completed_episodes = []
+        for mapping in mappings:
+            episode = episode_detail(
+                self.paths.db_path, mapping["local_episode_id"]
+            )["episode"]
+            if episode.get("review_status") not in {"completed", "reviewed"}:
+                continue
+            completed_episodes.append(
+                {
+                    "episode_id": mapping["episode_id"],
+                    "completed_at": episode.get("reviewed_at") or episode["updated_at"],
+                }
+            )
+        metadata = task.get("metadata")
+        job = metadata.get("flow_job") if isinstance(metadata, dict) else None
+        expected_ids = {
+            item.get("episode_id")
+            for item in (job or {}).get("episodes", [])
+            if item.get("episode_id")
+        }
+        completed_ids = {item["episode_id"] for item in completed_episodes}
+        review_completed_at = (
+            task.get("review_completed_at")
+            if expected_ids and completed_ids == expected_ids
+            else None
+        )
+        return client.report_review_progress(
+            job_code,
+            review_started_at=str(task["review_started_at"]),
+            review_completed_at=(
+                str(review_completed_at) if review_completed_at else None
+            ),
+            completed_episodes=completed_episodes,
+        )
+
+    def _schedule_platform_review_progress(self, episode_id: str) -> None:
+        try:
+            task_id = episode_detail(self.paths.db_path, episode_id)["episode"].get(
+                "task_id"
+            )
+            task = next(
+                (
+                    item
+                    for item in list_qc_tasks(self.paths.db_path)
+                    if item["id"] == task_id
+                ),
+                None,
+            )
+        except (KeyError, OSError):
+            return
+        job_code = str((task or {}).get("flow_job_code") or "")
+        if not job_code:
+            return
+
+        def sync() -> None:
+            try:
+                self._sync_platform_review_progress(job_code)
+            except Exception as exc:
+                LOGGER.warning("Flow QC progress sync failed for %s: %s", job_code, exc)
+
+        self._platform_progress_executor.submit(sync)
+
     def _resume_incomplete_platform_caches(self, client, response: dict[str, object]) -> None:
         """Continue durable Episode queues once a reviewer reconnects to Flow."""
         manager = self._quality_cache_manager()
@@ -694,6 +777,7 @@ class EpisodeQcWebApplication:
                     "decision": decision,
                     "annotation_count": int(episode.get("annotation_count") or 0),
                     "annotations": detail["annotations"],
+                    "completed_at": episode.get("reviewed_at"),
                     "result": {
                         "local_episode_id": mapping["local_episode_id"],
                         "review_status": episode.get("review_status"),
@@ -701,17 +785,23 @@ class EpisodeQcWebApplication:
                     },
                 }
             )
+        self._sync_platform_review_progress(job_code)
+        task = self._local_task_for_job(job_code) or task
         if ensure_work_session_before_submit:
             if reclaim_before_submit:
                 client.claim(job_code)
             manager.start_review(client, job_code)
             job = self._platform_job(client, job_code)
-        response = manager.submit_result(
-            client,
-            job,
-            episode_results=episode_results,
-            result={"episode_count": len(episode_results)},
-        )
+        submit_values = {
+            "episode_results": episode_results,
+            "result": {"episode_count": len(episode_results)},
+        }
+        if task.get("review_started_at") and task.get("review_completed_at"):
+            submit_values.update(
+                review_started_at=task["review_started_at"],
+                review_completed_at=task["review_completed_at"],
+            )
+        response = manager.submit_result(client, job, **submit_values)
         local_task = mark_qc_task_submitted(self.paths.db_path, job_code)
         with self._platform_lock:
             self._platform_owned_jobs.discard(job_code)
@@ -1093,7 +1183,7 @@ class EpisodeQcWebApplication:
 
     def update_review(self, episode_id: str, request: dict[str, object]) -> dict[str, object]:
         playhead = request.get("playheadNs")
-        return update_episode_review(
+        updated = update_episode_review(
             self.paths.db_path,
             episode_id,
             review_status=request.get("status") if isinstance(request.get("status"), str) else None,
@@ -1101,6 +1191,9 @@ class EpisodeQcWebApplication:
             reviewer_name=request.get("reviewer") if isinstance(request.get("reviewer"), str) else None,
             last_playhead_ns=round(float(playhead)) if isinstance(playhead, (int, float)) else None,
         )
+        if isinstance(request.get("status"), str) or isinstance(request.get("decision"), str):
+            self._schedule_platform_review_progress(episode_id)
+        return updated
 
     def export(self, request: dict[str, object]) -> dict[str, object]:
         output_parent = request.get("outputParent") or os.environ.get("EPISODE_QC_EXPORT_ROOT")

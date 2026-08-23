@@ -1422,6 +1422,9 @@ Frame Time: 0.010000
     job["next_attempt"] = 1
 
     class FakeWebFlowClient:
+        def __init__(self):
+            self.progress_reports = []
+
         def jobs_response(self):
             return {"reviewer": "Web 质检员", "jobs": [dict(job)]}
 
@@ -1448,6 +1451,11 @@ Frame Time: 0.010000
             assert job_code == job["code"]
             job.update(status="in_progress", **values)
             return {**job, "action": action}
+
+        def report_review_progress(self, job_code, **values):
+            assert job_code == job["code"]
+            self.progress_reports.append(values)
+            return {"job_code": job_code, **values}
 
         def submit_result(self, job_code, **values):
             assert job_code == job["code"]
@@ -1521,6 +1529,20 @@ Frame Time: 0.010000
         )
         assert status == 200
         assert reviewed["review_status"] == "completed"
+        for _ in range(200):
+            if fake_client.progress_reports:
+                break
+            time.sleep(0.01)
+        assert len(fake_client.progress_reports) == 1
+        progress = fake_client.progress_reports[0]
+        assert progress["review_started_at"]
+        assert progress["review_completed_at"]
+        assert progress["completed_episodes"] == [
+            {
+                "episode_id": job["episodes"][0]["episode_id"],
+                "completed_at": reviewed["reviewed_at"],
+            }
+        ]
 
         status, submitted = request_json(
             f"{base_url}/api/platform/jobs/{job['code']}/submit",
@@ -1529,6 +1551,8 @@ Frame Time: 0.010000
         assert status == 200
         assert submitted["job"]["status"] == "completed"
         assert submitted["local_task"]["status"] == "submitted"
+        assert job["submitted"]["review_started_at"] == progress["review_started_at"]
+        assert job["submitted"]["review_completed_at"] == progress["review_completed_at"]
         assert (
             Path(job["result_upload_uri"])
             / "attempt-0001"

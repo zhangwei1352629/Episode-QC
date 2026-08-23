@@ -20,6 +20,7 @@ from episode_qc.workspace import (
     import_label_schema,
     install_flow_label_schema,
     initialize_workspace,
+    list_qc_tasks,
     preview_label_schema,
     redo_annotation_change,
     save_annotation,
@@ -868,17 +869,31 @@ def _cmd_platform_submit(args: argparse.Namespace) -> int:
                 "reviewer_name": local_episode.get("reviewer_name"),
             },
         }
+        if local_episode.get("reviewed_at"):
+            episode_result["completed_at"] = local_episode["reviewed_at"]
         if detail["annotations"]:
             episode_result["annotations"] = detail["annotations"]
         if args.quality_grade:
             episode_result["quality_grade"] = args.quality_grade
         episode_results.append(episode_result)
-    response = manager.submit_result(
-        client,
-        job,
-        episode_results=episode_results,
-        result={"episode_count": len(episode_results)},
+    submit_values = {
+        "episode_results": episode_results,
+        "result": {"episode_count": len(episode_results)},
+    }
+    task = next(
+        (
+            item
+            for item in list_qc_tasks(args.workspace_db)
+            if item.get("flow_job_code") == args.job_code
+        ),
+        None,
     )
+    if task and task.get("review_started_at") and task.get("review_completed_at"):
+        submit_values.update(
+            review_started_at=task["review_started_at"],
+            review_completed_at=task["review_completed_at"],
+        )
+    response = manager.submit_result(client, job, **submit_values)
     return _print_json(response)
 
 

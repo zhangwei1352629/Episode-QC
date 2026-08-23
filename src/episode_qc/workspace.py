@@ -18,7 +18,7 @@ from episode_qc.bvh import read_bvh_header
 from episode_qc.source_paths import resolve_source_directory
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 class WorkspaceConflictError(RuntimeError):
@@ -220,6 +220,8 @@ def _initialize_workspace(
                 import_error TEXT,
                 metadata_json TEXT NOT NULL DEFAULT '{}',
                 last_episode_id TEXT,
+                review_started_at TEXT,
+                review_completed_at TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -376,6 +378,8 @@ def _initialize_workspace(
     _ensure_column(connection, "data_source", "task_id", "TEXT REFERENCES qc_task(id)")
     _ensure_column(connection, "qc_task", "source_type", "TEXT NOT NULL DEFAULT 'server_path'")
     _ensure_column(connection, "qc_task", "label_set_id", "TEXT REFERENCES label_set(id)")
+    _ensure_column(connection, "qc_task", "review_started_at", "TEXT")
+    _ensure_column(connection, "qc_task", "review_completed_at", "TEXT")
     row = connection.execute("SELECT * FROM workspace LIMIT 1").fetchone()
     if row is None:
         workspace_id = _new_id("ws")
@@ -1456,7 +1460,47 @@ def _task_row(connection: sqlite3.Connection, task_id: str) -> dict[str, object]
     return rows[0]
 
 
-def _refresh_task_status(connection: sqlite3.Connection, task_id: str) -> None:
+def _task_id_for_episode(connection: sqlite3.Connection, episode_id: str) -> str | None:
+    row = connection.execute(
+        """
+        SELECT ds.task_id
+        FROM episode e
+        JOIN data_source ds ON ds.id = e.data_source_id
+        WHERE e.id = ?
+        """,
+        (episode_id,),
+    ).fetchone()
+    return str(row["task_id"]) if row and row["task_id"] else None
+
+
+def _mark_task_review_write(
+    connection: sqlite3.Connection,
+    episode_id: str,
+    *,
+    now: str | None = None,
+) -> None:
+    task_id = _task_id_for_episode(connection, episode_id)
+    if not task_id:
+        return
+    now = now or _now()
+    connection.execute(
+        """
+        UPDATE qc_task
+        SET review_started_at = COALESCE(review_started_at, ?),
+            review_completed_at = CASE WHEN status = 'completed' THEN ? ELSE NULL END,
+            updated_at = ?
+        WHERE id = ?
+        """,
+        (now, now, now, task_id),
+    )
+
+
+def _refresh_task_status(
+    connection: sqlite3.Connection,
+    task_id: str,
+    *,
+    now: str | None = None,
+) -> None:
     task = connection.execute("SELECT status FROM qc_task WHERE id = ?", (task_id,)).fetchone()
     if task is None or task["status"] in {"submitted", "archived"}:
         return
@@ -1486,9 +1530,20 @@ def _refresh_task_status(connection: sqlite3.Connection, task_id: str) -> None:
         status = "in_progress"
     else:
         status = "ready"
+    now = now or _now()
     connection.execute(
-        "UPDATE qc_task SET status = ?, updated_at = ? WHERE id = ?",
-        (status, _now(), task_id),
+        """
+        UPDATE qc_task
+        SET status = ?,
+            review_completed_at = CASE
+                WHEN ? = 'completed' AND review_started_at IS NOT NULL
+                    THEN COALESCE(review_completed_at, ?)
+                ELSE NULL
+            END,
+            updated_at = ?
+        WHERE id = ?
+        """,
+        (status, status, now, now, task_id),
     )
 
 
@@ -2479,6 +2534,10 @@ def save_annotation(
         _record_change(connection, actual_id, "update" if old_row else "create", before, saved, session_id)
         if episode["review_status"] == "unreviewed":
             connection.execute("UPDATE episode SET review_status = 'in_progress', updated_at = ? WHERE id = ?", (now, episode_id))
+        _mark_task_review_write(connection, episode_id, now=now)
+        task_id = _task_id_for_episode(connection, episode_id)
+        if task_id:
+            _refresh_task_status(connection, task_id, now=now)
         return saved
 
 
@@ -2522,6 +2581,7 @@ def delete_annotation(db_path: str | Path, annotation_id: str, *, session_id: st
         now = _now()
         connection.execute("UPDATE annotation SET deleted_at = ?, updated_at = ? WHERE id = ?", (now, now, annotation_id))
         _refresh_annotation_count(connection, row["episode_id"])
+        _mark_task_review_write(connection, str(row["episode_id"]), now=now)
         _record_change(connection, annotation_id, "delete", before, None, session_id)
         return before
 
@@ -2589,6 +2649,7 @@ def _restore_annotation_snapshot(connection: sqlite3.Connection, annotation_id: 
         )
     if episode_id:
         _refresh_annotation_count(connection, str(episode_id))
+        _mark_task_review_write(connection, str(episode_id))
 
 
 def _refresh_annotation_count(connection: sqlite3.Connection, episode_id: str) -> None:
@@ -2615,23 +2676,31 @@ def update_episode_review(
         row = connection.execute("SELECT * FROM episode WHERE id = ?", (episode_id,)).fetchone()
         if not row:
             raise KeyError(f"Episode 不存在: {episode_id}")
+        now = _now()
         status = review_status if review_status is not None else row["review_status"]
         decision = quality_decision if quality_decision is not None else row["quality_decision"]
         reviewer = reviewer_name if reviewer_name is not None else row["reviewer_name"]
         playhead = int(last_playhead_ns if last_playhead_ns is not None else row["last_playhead_ns"])
         duration = int(row["duration_ns"] or 0)
         playhead = max(0, min(playhead, duration))
-        reviewed_at = _now() if status in {"completed", "reviewed"} else row["reviewed_at"]
+        review_write = review_status is not None or quality_decision is not None
+        reviewed_at = (
+            now
+            if review_write and status in {"completed", "reviewed"}
+            else row["reviewed_at"]
+        )
         connection.execute(
             "UPDATE episode SET review_status=?, quality_decision=?, reviewer_name=?, last_playhead_ns=?, reviewed_at=?, updated_at=? WHERE id=?",
-            (status, decision, reviewer, playhead, reviewed_at, _now(), episode_id),
+            (status, decision, reviewer, playhead, reviewed_at, now, episode_id),
         )
+        if review_write:
+            _mark_task_review_write(connection, episode_id, now=now)
         task = connection.execute(
             "SELECT ds.task_id FROM data_source ds WHERE ds.id = ?",
             (row["data_source_id"],),
         ).fetchone()
         if task and task["task_id"]:
-            _refresh_task_status(connection, str(task["task_id"]))
+            _refresh_task_status(connection, str(task["task_id"]), now=now)
     return episode_detail(db_path, episode_id)["episode"]
 
 

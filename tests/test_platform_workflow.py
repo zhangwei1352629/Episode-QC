@@ -922,9 +922,12 @@ def test_structured_label_flow_job_is_fully_cached_verified_submitted_and_safely
                 "decision": "reject",
                 "quality_grade": "invalid",
                 "annotation_count": 0,
+                "completed_at": "2026-08-10T09:12:00+00:00",
             },
         ],
         result={"reviewed_episode_count": 2},
+        review_started_at="2026-08-10T09:00:00+00:00",
+        review_completed_at="2026-08-10T09:12:00+00:00",
     )
 
     assert submitted["status"] == "completed"
@@ -942,8 +945,19 @@ def test_structured_label_flow_job_is_fully_cached_verified_submitted_and_safely
         "pass_with_labels",
         "discard",
     ]
+    assert result["review_timing"] == {
+        "source": "qc_database",
+        "started_at": "2026-08-10T09:00:00+00:00",
+        "completed_at": "2026-08-10T09:12:00+00:00",
+        "duration_seconds": 720.0,
+    }
     assert client.results[0]["result_nas_path"] == str(result_path)
     assert client.results[0]["result_id"].startswith("QCR-")
+    assert client.results[0]["review_started_at"] == "2026-08-10T09:00:00+00:00"
+    assert client.results[0]["review_completed_at"] == "2026-08-10T09:12:00+00:00"
+    assert client.results[0]["episode_results"][1]["completed_at"] == (
+        "2026-08-10T09:12:00+00:00"
+    )
     assert client.results[0]["result_manifest"]["result_sha256"] == client.results[0][
         "result_sha256"
     ]

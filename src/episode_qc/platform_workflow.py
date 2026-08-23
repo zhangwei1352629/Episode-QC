@@ -199,6 +199,24 @@ class FlowClient:
             {"action": action, **values},
         )
 
+    def report_review_progress(
+        self,
+        job_code: str,
+        *,
+        review_started_at: str,
+        review_completed_at: str | None,
+        completed_episodes: list[dict],
+    ) -> dict:
+        return self.request(
+            "POST",
+            f"/api/v1/qc/jobs/{job_code}/progress",
+            {
+                "review_started_at": review_started_at,
+                "review_completed_at": review_completed_at,
+                "completed_episodes": completed_episodes,
+            },
+        )
+
     def submit_result(
         self,
         job_code: str,
@@ -210,6 +228,8 @@ class FlowClient:
         result_id: str = "",
         result_sha256: str = "",
         result_manifest: dict | None = None,
+        review_started_at: str | None = None,
+        review_completed_at: str | None = None,
     ) -> dict:
         normalized_results = []
         for episode_result in episode_results:
@@ -230,6 +250,8 @@ class FlowClient:
                 normalized["annotations"] = _flow_annotations(
                     episode_result["annotations"]
                 )
+            if episode_result.get("completed_at"):
+                normalized["completed_at"] = episode_result["completed_at"]
             normalized_results.append(normalized)
         payload = {
             "episode_results": normalized_results,
@@ -239,6 +261,11 @@ class FlowClient:
             "result_sha256": result_sha256,
             "result_manifest": result_manifest or {},
         }
+        if review_started_at and review_completed_at:
+            payload.update(
+                review_started_at=review_started_at,
+                review_completed_at=review_completed_at,
+            )
         if label_set is not None:
             payload["label_set"] = label_set
         return self.request("POST", f"/api/v1/qc/jobs/{job_code}/result", payload)
@@ -665,6 +692,8 @@ class QualityCacheManager:
         *,
         episode_results: list[dict],
         result: dict | None = None,
+        review_started_at: str | None = None,
+        review_completed_at: str | None = None,
     ) -> dict:
         job_code = self._safe_component(job["code"], "质检任务编号")
         ready_root = self.cache_root / "ready" / job_code
@@ -730,6 +759,27 @@ class QualityCacheManager:
             pending_result.get("created_at")
             or datetime.now(timezone.utc).isoformat()
         )
+        review_timing = None
+        if review_started_at or review_completed_at:
+            if not (review_started_at and review_completed_at):
+                raise QualityCacheError("质检结果开始和结束时间必须同时提供")
+            try:
+                timing_start = datetime.fromisoformat(
+                    review_started_at.replace("Z", "+00:00")
+                )
+                timing_end = datetime.fromisoformat(
+                    review_completed_at.replace("Z", "+00:00")
+                )
+            except ValueError as exc:
+                raise QualityCacheError("质检结果时间格式无效") from exc
+            if timing_end < timing_start:
+                raise QualityCacheError("质检结果结束时间不能早于开始时间")
+            review_timing = {
+                "source": "qc_database",
+                "started_at": review_started_at,
+                "completed_at": review_completed_at,
+                "duration_seconds": round((timing_end - timing_start).total_seconds(), 3),
+            }
         result_document = {
             "schema_version": 2,
             "result_id": result_id,
@@ -739,6 +789,7 @@ class QualityCacheManager:
             "source_manifest_sha256": state.get("asset_manifest_sha256", ""),
             "episode_results": normalized_results,
             "result": result or {},
+            **({"review_timing": review_timing} if review_timing else {}),
         }
         local_results = self.cache_root / "results-pending" / job_code
         local_results.mkdir(parents=True, exist_ok=True)
@@ -799,6 +850,8 @@ class QualityCacheManager:
             result_id=result_id,
             result_sha256=result_sha256,
             result_manifest=result_manifest,
+            review_started_at=review_started_at,
+            review_completed_at=review_completed_at,
         )
         state["result_synced"] = True
         state["result_synced_at"] = datetime.now(timezone.utc).isoformat()

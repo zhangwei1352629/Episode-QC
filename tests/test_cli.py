@@ -32,13 +32,24 @@ def test_platform_submit_moves_workspace_annotations_to_direct_facts(
                 {"episode_id": "FLOW-EP-2", "local_episode_id": "local-ep-2"},
             ]
 
-        def submit_result(self, client, job, *, episode_results, result):
+        def submit_result(
+            self,
+            client,
+            job,
+            *,
+            episode_results,
+            result,
+            review_started_at,
+            review_completed_at,
+        ):
             submitted.append(
                 {
                     "client": client,
                     "job": job,
                     "episode_results": episode_results,
                     "result": result,
+                    "review_started_at": review_started_at,
+                    "review_completed_at": review_completed_at,
                 }
             )
             return {"status": "completed"}
@@ -51,6 +62,17 @@ def test_platform_submit_moves_workspace_annotations_to_direct_facts(
     monkeypatch.setattr(cli, "_platform_job", lambda current_client, job_code: job)
     monkeypatch.setattr(
         cli,
+        "list_qc_tasks",
+        lambda _db_path: [
+            {
+                "flow_job_code": job["code"],
+                "review_started_at": "2026-08-10T09:00:00+00:00",
+                "review_completed_at": "2026-08-10T09:12:00+00:00",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        cli,
         "episode_detail",
         lambda db_path, episode_id: (
             {
@@ -59,6 +81,7 @@ def test_platform_submit_moves_workspace_annotations_to_direct_facts(
                     "annotation_count": 1,
                     "review_status": "completed",
                     "reviewer_name": "Reviewer",
+                    "reviewed_at": "2026-08-10T09:05:00+00:00",
                 },
                 "annotations": [annotation],
             }
@@ -69,6 +92,7 @@ def test_platform_submit_moves_workspace_annotations_to_direct_facts(
                     "annotation_count": 0,
                     "review_status": "completed",
                     "reviewer_name": "Reviewer",
+                    "reviewed_at": "2026-08-10T09:12:00+00:00",
                 },
                 "annotations": [],
             }
@@ -100,6 +124,7 @@ def test_platform_submit_moves_workspace_annotations_to_direct_facts(
                     "episode_id": "FLOW-EP-1",
                     "decision": "pass_with_labels",
                     "annotation_count": 1,
+                    "completed_at": "2026-08-10T09:05:00+00:00",
                     "annotations": [annotation],
                     "result": {
                         "local_episode_id": "local-ep-1",
@@ -111,6 +136,7 @@ def test_platform_submit_moves_workspace_annotations_to_direct_facts(
                     "episode_id": "FLOW-EP-2",
                     "decision": "pass",
                     "annotation_count": 0,
+                    "completed_at": "2026-08-10T09:12:00+00:00",
                     "result": {
                         "local_episode_id": "local-ep-2",
                         "review_status": "completed",
@@ -119,6 +145,8 @@ def test_platform_submit_moves_workspace_annotations_to_direct_facts(
                 }
             ],
             "result": {"episode_count": 2},
+            "review_started_at": "2026-08-10T09:00:00+00:00",
+            "review_completed_at": "2026-08-10T09:12:00+00:00",
         }
     ]
     assert '"status": "completed"' in capsys.readouterr().out

@@ -405,7 +405,7 @@ def test_v1_import_playback_annotation_and_export_round_trip(tmp_path: Path):
     workspace = initialize_workspace(db_path, reviewer_name="测试员")
     result = scan_data_source(db_path, source_root)
 
-    assert workspace["schema_version"] == 3
+    assert workspace["schema_version"] == 4
     assert result["discovered"] == 1
     assert result["ready"] == 1
     episode_id = result["episodes"][0]["id"]
@@ -473,6 +473,9 @@ def test_v1_import_playback_annotation_and_export_round_trip(tmp_path: Path):
         },
         session_id="test",
     )
+    started_task = list_qc_tasks(db_path)[0]
+    assert started_task["review_started_at"]
+    assert started_task["review_completed_at"] is None
     with pytest.raises(WorkspaceConflictError, match="另一个页面"):
         save_annotation(
             db_path,
@@ -489,6 +492,16 @@ def test_v1_import_playback_annotation_and_export_round_trip(tmp_path: Path):
     assert len(episode_detail(db_path, episode_id)["annotations"]) == 1
 
     update_episode_review(db_path, episode_id, review_status="completed", quality_decision="pass_with_labels", last_playhead_ns=1_100_000_000)
+    completed_task = list_qc_tasks(db_path)[0]
+    assert completed_task["review_started_at"] == started_task["review_started_at"]
+    assert completed_task["review_completed_at"]
+    assert completed_task["review_completed_at"] >= completed_task["review_started_at"]
+    completed_reviewed_at = episode_detail(db_path, episode_id)["episode"]["reviewed_at"]
+    update_episode_review(db_path, episode_id, last_playhead_ns=1_200_000_000)
+    after_playhead_task = list_qc_tasks(db_path)[0]
+    assert episode_detail(db_path, episode_id)["episode"]["reviewed_at"] == completed_reviewed_at
+    assert after_playhead_task["review_started_at"] == completed_task["review_started_at"]
+    assert after_playhead_task["review_completed_at"] == completed_task["review_completed_at"]
     json_export_root = tmp_path / "exports-json"
     exported = export_workspace(
         db_path,
@@ -775,12 +788,15 @@ def test_schema_v1_data_source_is_migrated_to_qc_task(tmp_path: Path):
     workspace = initialize_workspace(db_path)
     tasks = list_qc_tasks(db_path)
 
-    assert workspace["schema_version"] == 3
+    assert workspace["schema_version"] == 4
     assert len(tasks) == 1
     assert tasks[0]["task_name"] == "旧资产"
     assert tasks[0]["local_source_path"] == str(source_root)
     with sqlite3.connect(db_path) as connection:
         assert connection.execute("SELECT task_id FROM data_source").fetchone()[0] == tasks[0]["id"]
+    assert {"review_started_at", "review_completed_at"}.issubset(
+        _table_columns(db_path, "qc_task")
+    )
 
 
 def test_v1_bad_episode_does_not_block_valid_episode(tmp_path: Path):

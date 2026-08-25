@@ -274,6 +274,79 @@ def test_existing_cached_job_refreshes_previous_review_from_flow_detail(
     assert synced == [(server.application.paths.db_path, job, mappings)]
 
 
+def test_existing_cached_job_rebuilds_previous_review_mapping_when_cache_state_is_missing(
+    tmp_path: Path, monkeypatch
+):
+    job = {
+        "code": "QCJ-HISTORY-LEGACY-CACHE",
+        "episodes": [
+            {
+                "episode_id": "AST-HISTORY-EP0001",
+                "relative_path": "episodes/episode_000001",
+                "previous_review": {
+                    "decision": "pass_with_labels",
+                    "annotations": [{"label_code": "legacy-label"}],
+                },
+            }
+        ],
+    }
+
+    class FakeClient:
+        def job(self, job_code):
+            assert job_code == job["code"]
+            return job
+
+    class MissingCacheState:
+        def local_episode_mappings(self, job_code):
+            assert job_code == job["code"]
+            raise QualityCacheError("cache state is missing")
+
+    monkeypatch.setattr(
+        web_server,
+        "workspace_state",
+        lambda _db_path, *, task_id: {
+            "episodes": [
+                {
+                    "id": "ep_local",
+                    "relative_path": "episodes\\episode_000001",
+                }
+            ]
+            if task_id == "task-local"
+            else [],
+        },
+    )
+    synced = []
+    monkeypatch.setattr(
+        web_server,
+        "sync_flow_previous_reviews",
+        lambda db_path, payload, local_mappings: synced.append(
+            (db_path, payload, local_mappings)
+        ),
+    )
+    with running_server(tmp_path) as (server, _base_url):
+        server.application._local_task_for_job = lambda _code: {
+            "id": "task-local",
+            "flow_job_code": job["code"],
+        }
+        server.application._quality_cache_manager = lambda: MissingCacheState()
+
+        assert server.application._platform_job(FakeClient(), job["code"]) == job
+
+    assert synced == [
+        (
+            server.application.paths.db_path,
+            job,
+            [
+                {
+                    "episode_id": "AST-HISTORY-EP0001",
+                    "local_episode_id": "ep_local",
+                    "relative_path": "episodes/episode_000001",
+                }
+            ],
+        )
+    ]
+
+
 def test_web_flow_label_schema_is_installed_before_ready_episode_indexing(tmp_path: Path, monkeypatch):
     schema = flow_label_schema()
     job = flow_label_job(code="QCJ-WEB-LABEL-SCHEMA", schema=schema)

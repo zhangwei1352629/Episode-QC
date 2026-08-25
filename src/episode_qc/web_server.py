@@ -926,6 +926,76 @@ class EpisodeQcWebApplication:
             None,
         )
 
+    def _workspace_episode_mappings(
+        self,
+        job: dict[str, object],
+        local_task: dict[str, object],
+    ) -> list[dict[str, object]]:
+        """Rebuild safe Flow mappings for legacy tasks without cache state."""
+
+        task_id = str(local_task.get("id") or "").strip()
+        platform_episodes = job.get("episodes")
+        if not task_id or not isinstance(platform_episodes, list):
+            return []
+        try:
+            local_episodes = workspace_state(
+                self.paths.db_path,
+                task_id=task_id,
+            ).get("episodes", [])
+        except (KeyError, OSError, ValueError):
+            return []
+        if not isinstance(local_episodes, list):
+            return []
+
+        def normalized_relative_path(value: object) -> str:
+            parts = [
+                part
+                for part in str(value or "").replace("\\", "/").split("/")
+                if part not in {"", "."}
+            ]
+            if not parts or ".." in parts:
+                return ""
+            return "/".join(parts)
+
+        local_by_path: dict[str, str] = {}
+        for item in local_episodes:
+            if not isinstance(item, dict):
+                return []
+            relative_path = normalized_relative_path(item.get("relative_path"))
+            local_episode_id = str(item.get("id") or "").strip()
+            if (
+                not relative_path
+                or not local_episode_id
+                or relative_path in local_by_path
+            ):
+                return []
+            local_by_path[relative_path] = local_episode_id
+
+        mappings: list[dict[str, object]] = []
+        seen_platform_paths: set[str] = set()
+        for item in platform_episodes:
+            if not isinstance(item, dict):
+                return []
+            relative_path = normalized_relative_path(item.get("relative_path"))
+            platform_episode_id = str(item.get("episode_id") or "").strip()
+            if (
+                not relative_path
+                or not platform_episode_id
+                or relative_path in seen_platform_paths
+            ):
+                return []
+            seen_platform_paths.add(relative_path)
+            local_episode_id = local_by_path.get(relative_path)
+            if local_episode_id:
+                mappings.append(
+                    {
+                        "episode_id": platform_episode_id,
+                        "local_episode_id": local_episode_id,
+                        "relative_path": relative_path,
+                    }
+                )
+        return mappings if len(mappings) == len(local_by_path) else []
+
     def _platform_job(self, client, job_code: str) -> dict[str, object]:
         if hasattr(client, "job"):
             job = client.job(job_code)
@@ -949,6 +1019,8 @@ class EpisodeQcWebApplication:
                 mappings = mapping_reader(job_code) if mapping_reader else []
             except (OSError, QualityCacheError):
                 mappings = []
+            if not mappings:
+                mappings = self._workspace_episode_mappings(job, local_task)
             if mappings:
                 sync_flow_previous_reviews(self.paths.db_path, job, mappings)
         return job

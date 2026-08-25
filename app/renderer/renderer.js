@@ -27,7 +27,7 @@ const els = {
   motionCard: $("motion-card"), motionCanvas: $("motion-canvas"), motionEmpty: $("motion-empty"), jointLabelLayer: $("joint-label-layer"),
   motionSource: $("motion-source"), jointSelector: $("joint-selector"), jointLabels: $("joint-labels"), resetView: $("reset-view"), selectedJoint: $("selected-joint"),
   cameraGrid: $("camera-grid"), selectionLabel: $("selection-label"), markIn: $("mark-in"), markOut: $("mark-out"),
-  loopSelection: $("loop-selection"), coverageTracks: $("coverage-tracks"), annotationTrack: $("annotation-track"),
+  loopSelection: $("loop-selection"), coverageTracks: $("coverage-tracks"), previousAnnotationTrack: $("previous-annotation-track"), annotationTrack: $("annotation-track"),
   timelineRange: $("timeline-range"), timelineEnd: $("timeline-end"), scopeTabs: $("scope-tabs"),
   labelSearch: $("label-search"), labelGroupFilter: $("label-group-filter"), labelCount: $("label-count"),
   labelSetMeta: $("label-set-meta"), targetContext: $("target-context"), labelList: $("label-list"),
@@ -251,6 +251,8 @@ function bindEvents() {
     const item = event.target.closest("[data-annotation-id]");
     if (item) openAnnotationEditor(item.dataset.annotationId);
   });
+  els.previousReviewList.addEventListener("click", seekPreviousReview);
+  els.previousAnnotationTrack.addEventListener("click", seekPreviousReview);
   els.annotationTrack.addEventListener("click", (event) => {
     const item = event.target.closest("[data-annotation-id]");
     if (item) openAnnotationEditor(item.dataset.annotationId);
@@ -896,16 +898,23 @@ function renderEpisodeList() {
     syncInteractiveState();
     return;
   }
-  els.episodeList.innerHTML = state.filteredEpisodes.map((episode) => `
-    <button class="episode-item ${episode.id === state.currentEpisodeId ? "active" : ""}" data-episode-id="${escapeHtml(episode.id)}" data-status="${escapeHtml(episode.review_status)}" type="button">
-      <span class="review-dot"></span>
-      <span class="episode-copy">
-        <strong>${escapeHtml(episode.episode_name)}</strong>
-        <span title="${escapeHtml(episode.relative_path)}">${escapeHtml(episode.relative_path)}</span>
-        <span class="episode-badges"><em class="status-badge">${escapeHtml(reviewStatusName(episode.review_status))}</em>${episode.quality_decision ? `<em class="decision-badge">${escapeHtml(decisionName(episode.quality_decision))}</em>` : ""}<em>${episode.camera_count} CAM</em><em>${episode.mocap_available ? "MOCAP" : "无 MOCAP"}</em><em>${episode.annotation_count} 标签</em></span>
-      </span>
-      <time>${formatDuration(episode.duration_sec || 0)}</time>
-    </button>`).join("");
+  els.episodeList.innerHTML = state.filteredEpisodes.map((episode) => {
+    const previous = episode.previous_review;
+    const previousAnnotations = Array.isArray(previous?.annotations) ? previous.annotations : [];
+    const previousBadge = previous
+      ? `<em class="history-label-badge" title="上一轮质检">${previousAnnotations.length ? `历史 ${previousAnnotations.length}` : "历史结论"}</em>`
+      : "";
+    return `
+      <button class="episode-item ${episode.id === state.currentEpisodeId ? "active" : ""}" data-episode-id="${escapeHtml(episode.id)}" data-status="${escapeHtml(episode.review_status)}" type="button">
+        <span class="review-dot"></span>
+        <span class="episode-copy">
+          <strong>${escapeHtml(episode.episode_name)}</strong>
+          <span title="${escapeHtml(episode.relative_path)}">${escapeHtml(episode.relative_path)}</span>
+          <span class="episode-badges"><em class="status-badge">${escapeHtml(reviewStatusName(episode.review_status))}</em>${episode.quality_decision ? `<em class="decision-badge">${escapeHtml(decisionName(episode.quality_decision))}</em>` : ""}<em>${episode.camera_count} CAM</em><em>${episode.mocap_available ? "MOCAP" : "无 MOCAP"}</em><em>${episode.annotation_count} 本轮</em>${previousBadge}</span>
+        </span>
+        <time>${formatDuration(episode.duration_sec || 0)}</time>
+      </button>`;
+  }).join("");
   syncInteractiveState();
 }
 
@@ -1003,6 +1012,7 @@ function clearEpisodeView() {
   els.motionEmpty.hidden = false;
   els.motionEmpty.textContent = "选择 Episode 后显示 G1 29DOF 机器人";
   els.coverageTracks.innerHTML = "";
+  els.previousAnnotationTrack.innerHTML = "";
   els.annotationTrack.innerHTML = "";
   els.annotationList.innerHTML = '<div class="empty-panel">暂无标注</div>';
   els.annotationCount.textContent = "0";
@@ -1451,6 +1461,7 @@ function renderPreviousReview() {
     els.previousReviewSummary.innerHTML = "";
     els.previousReviewSource.textContent = "";
     els.previousReviewList.innerHTML = "";
+    els.previousAnnotationTrack.innerHTML = "";
     return;
   }
   const annotations = Array.isArray(previous.annotations) ? previous.annotations : [];
@@ -1474,15 +1485,42 @@ function renderPreviousReview() {
   els.previousReviewList.innerHTML = annotations.length
     ? annotations.map((annotation) => {
         const color = /^#[0-9A-Fa-f]{6}$/.test(String(annotation.label_color || "")) ? annotation.label_color : "#8c959f";
-        const timing = annotation.scope === "episode"
-          ? "整条"
-          : annotation.scope === "time_point"
-            ? formatClock(annotation.start_offset_ns)
-            : `${formatClock(annotation.start_offset_ns)}–${formatClock(annotation.end_offset_ns)}`;
-        const note = [annotation.severity || "未分级", annotation.comment || ""].filter(Boolean).join(" · ");
-        return `<div class="previous-review-item"><i style="background:${color}"></i><span><strong>${escapeHtml(annotation.label_name || annotation.label_code || "历史标签")}</strong><small>${escapeHtml(note)}</small></span><time>${escapeHtml(timing)}</time></div>`;
+        const timing = previousAnnotationTiming(annotation);
+        const target = annotationTargetName(annotation);
+        const note = [annotation.severity || "未分级", target, annotation.comment || ""].filter(Boolean).join(" · ");
+        return `<button type="button" class="previous-review-item" data-previous-start-ns="${safePreviousOffset(annotation.start_offset_ns)}" title="跳转到 ${escapeHtml(timing)}"><i style="background:${color}"></i><span><strong>${escapeHtml(annotation.label_name || annotation.label_code || "历史标签")}</strong><small>${escapeHtml(note)}</small></span><time>${escapeHtml(timing)}</time></button>`;
       }).join("")
-    : '<div class="previous-review-empty">上一轮无标签标注</div>';
+    : '<div class="previous-review-empty">上一轮已完成，未记录问题标签</div>';
+  els.previousAnnotationTrack.innerHTML = annotations.map((annotation) => {
+    const color = /^#[0-9A-Fa-f]{6}$/.test(String(annotation.label_color || "")) ? annotation.label_color : "#8c959f";
+    const startNs = annotation.scope === "episode" ? 0 : safePreviousOffset(annotation.start_offset_ns);
+    const endNs = annotation.scope === "episode" ? state.durationNs : safePreviousOffset(annotation.end_offset_ns);
+    const left = state.durationNs ? Math.max(0, Math.min(100, (startNs / state.durationNs) * 100)) : 0;
+    const width = annotation.scope === "time_point"
+      ? .35
+      : state.durationNs
+        ? Math.max(.35, Math.min(100 - left, ((Math.max(startNs, endNs) - startNs) / state.durationNs) * 100))
+        : .35;
+    const name = annotation.label_name || annotation.label_code || "历史标签";
+    const timing = previousAnnotationTiming(annotation);
+    return `<button type="button" class="history-annotation-block" data-previous-start-ns="${startNs}" aria-label="上一轮：${escapeHtml(name)}，${escapeHtml(timing)}" title="${escapeHtml(name)} · ${escapeHtml(timing)}" style="left:${left}%;width:${width}%;background:${color};border-color:${color}"></button>`;
+  }).join("");
+}
+
+function safePreviousOffset(value) {
+  return Math.max(0, Number(value) || 0);
+}
+
+function previousAnnotationTiming(annotation) {
+  if (annotation.scope === "episode") return "整条";
+  if (annotation.scope === "time_point") return formatClock(annotation.start_offset_ns);
+  return `${formatClock(annotation.start_offset_ns)}–${formatClock(annotation.end_offset_ns)}`;
+}
+
+function seekPreviousReview(event) {
+  const item = event.target.closest("[data-previous-start-ns]");
+  if (!item) return;
+  seekTo(Number(item.dataset.previousStartNs));
 }
 
 function openAnnotationEditor(annotationId) {

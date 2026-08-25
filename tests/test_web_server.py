@@ -215,14 +215,25 @@ def test_renderer_separates_previous_review_from_editable_annotations():
     renderer_root = Path(__file__).resolve().parents[1] / "app" / "renderer"
     html = (renderer_root / "index.html").read_text(encoding="utf-8")
     script = (renderer_root / "renderer.js").read_text(encoding="utf-8")
+    styles = (renderer_root / "styles.css").read_text(encoding="utf-8")
 
     assert 'id="previous-review-section"' in html
+    assert 'id="previous-annotation-track"' in html
+    assert 'data-track-label="历史"' in html
+    assert 'data-track-label="本轮"' in html
     assert "上一轮质检" in html
     assert "只读对照" in html
     assert "function renderPreviousReview()" in script
     assert "state.detail?.episode?.previous_review" in script
     assert "来源：Flow 历史质检事实" in script
     assert 'class="previous-review-item"' in script
+    assert 'class="history-annotation-block"' in script
+    assert "data-previous-start-ns" in script
+    assert "seekTo(Number(item.dataset.previousStartNs))" in script
+    assert "历史 ${previousAnnotations.length}" in script
+    assert "历史结论" in script
+    assert ".history-annotation-block" in styles
+    assert ".history-label-badge" in styles
     assert 'data-annotation-id=' not in script.split(
         "function renderPreviousReview()", 1
     )[1].split("function openAnnotationEditor", 1)[0]

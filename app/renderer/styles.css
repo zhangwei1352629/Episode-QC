@@ -153,6 +153,7 @@ body.episodes-collapsed .episode-sidebar, body.labels-collapsed .label-sidebar {
 .episode-item[data-status="completed"] .status-badge, .episode-item[data-status="reviewed"] .status-badge { color: #9ce9b9; background: rgba(112,212,154,.12); }
 .episode-item[data-status="needs_recheck"] .status-badge { color: #d1b8f5; background: rgba(180,140,240,.13); }
 .episode-badges .decision-badge { color: #e1f99b; background: var(--accent-soft); }
+.episode-badges .history-label-badge { color: #b8d7e8; border: 1px solid rgba(112,166,197,.3); background: rgba(86,137,166,.16); }
 .episode-item time { font-size: 9px; color: var(--muted); }
 
 .review-workspace { min-width: 0; min-height: 0; display: grid; grid-template-rows: 58px minmax(250px, 1fr) 190px; }
@@ -226,8 +227,12 @@ body.episodes-collapsed .episode-sidebar, body.labels-collapsed .label-sidebar {
 .coverage-bar i { display: block; width: 100%; height: 100%; background: #4b5860; }
 .coverage-row.camera .coverage-bar i { background: #586b8c; }
 .coverage-row.mocap .coverage-bar i { background: #84943c; }
-.annotation-track { height: 24px; margin: 7px 0 1px 90px; position: relative; border-radius: 4px; background: #171c21; }
+.annotation-track { height: 24px; margin: 5px 0 1px 90px; position: relative; border-radius: 4px; background: #171c21; }
+.annotation-track::before { content: attr(data-track-label); position: absolute; right: calc(100% + 8px); top: 50%; width: 82px; color: #77858f; font-size: 9px; text-align: right; transform: translateY(-50%); }
 .annotation-block { position: absolute; top: 3px; height: 18px; min-width: 3px; border-radius: 3px; opacity: .86; cursor: pointer; }
+.history-annotation-track { height: 20px; background: repeating-linear-gradient(135deg, #151b20, #151b20 6px, #182027 6px, #182027 12px); }
+.history-annotation-block { position: absolute; top: 3px; height: 14px; min-width: 3px; padding: 0; border: 1px dashed currentColor; border-radius: 3px; opacity: .48; cursor: pointer; transition: opacity .12s ease, transform .12s ease; }
+.history-annotation-block:hover, .history-annotation-block:focus-visible { opacity: .9; transform: translateY(-1px); outline: 1px solid #d9e5eb; outline-offset: 1px; }
 .timeline-range { width: calc(100% - 90px); margin-left: 90px; padding: 0; height: 15px; accent-color: var(--accent); }
 .timeline-ticks { margin-left: 90px; display: flex; justify-content: space-between; color: #697680; font-size: 9px; }
 
@@ -290,7 +295,8 @@ body.episodes-collapsed .episode-sidebar, body.labels-collapsed .label-sidebar {
 .previous-review-summary small { margin-top: 1px; color: var(--muted); font-size: 8px; }
 .previous-review-source { color: #91a3ae; font-size: 8px; line-height: 1.35; overflow-wrap: anywhere; }
 .previous-review-list { min-height: 0; display: grid; gap: 4px; overflow-y: auto; }
-.previous-review-item { display: grid; grid-template-columns: 4px minmax(0, 1fr) auto; align-items: center; gap: 6px; padding: 5px 6px; border: 1px solid #2f3b44; border-radius: 6px; background: #10171d; }
+.previous-review-item { width: 100%; display: grid; grid-template-columns: 4px minmax(0, 1fr) auto; align-items: center; gap: 6px; padding: 5px 6px; border: 1px solid #2f3b44; border-radius: 6px; color: inherit; text-align: left; background: #10171d; cursor: pointer; }
+.previous-review-item:hover, .previous-review-item:focus-visible { border-color: #617889; background: #14202a; outline: none; }
 .previous-review-item i { width: 4px; height: 24px; border-radius: 3px; }
 .previous-review-item span { min-width: 0; }
 .previous-review-item strong, .previous-review-item small { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }

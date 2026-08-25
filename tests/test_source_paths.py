@@ -7,6 +7,7 @@ import pytest
 from episode_qc.source_paths import (
     SmbLocation,
     _windows_unc_root,
+    map_flow_nas_path,
     resolve_source_directory,
     resolve_target_directory,
 )
@@ -118,3 +119,41 @@ def test_windows_native_smb_candidate_is_share_root_only():
     )
 
     assert _windows_unc_root(location) == r"\\10.1.10.10\datasets"
+
+
+def test_maps_flow_posix_nas_view_to_configured_qc_mount(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    mounted_root = tmp_path / "qc-nas"
+    source = mounted_root / "assets" / "AST-001"
+    source.mkdir(parents=True)
+    monkeypatch.setenv("EPISODE_QC_FLOW_NAS_ROOT", "/nas/data_collection")
+    monkeypatch.setenv("EPISODE_QC_NAS_MOUNT_ROOT", str(mounted_root))
+
+    assert resolve_source_directory(
+        "/nas/data_collection/assets/AST-001"
+    ) == source.resolve()
+    assert resolve_target_directory(
+        "/nas/data_collection/qc-results/AST-001/QCJ-001"
+    ) == (mounted_root / "qc-results" / "AST-001" / "QCJ-001").resolve()
+
+
+def test_flow_nas_mapping_requires_both_roots(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("EPISODE_QC_FLOW_NAS_ROOT", "/nas/data_collection")
+    monkeypatch.delenv("EPISODE_QC_NAS_MOUNT_ROOT", raising=False)
+
+    with pytest.raises(ValueError, match="必须同时配置"):
+        resolve_target_directory("/nas/data_collection/qc-results/AST-001")
+
+
+def test_maps_flow_nas_view_to_windows_unc(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("EPISODE_QC_FLOW_NAS_ROOT", "/nas/data_collection")
+    monkeypatch.setenv(
+        "EPISODE_QC_NAS_MOUNT_ROOT",
+        r"\\delta-ai-nas.local\datasets\Delta_teleop",
+    )
+
+    assert map_flow_nas_path(
+        "/nas/data_collection/robot/task/AST-001"
+    ) == r"\\delta-ai-nas.local\datasets\Delta_teleop\robot\task\AST-001"

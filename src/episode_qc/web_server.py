@@ -68,6 +68,7 @@ LOCAL_WEB_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 WILDCARD_WEB_HOSTS = frozenset({"0.0.0.0", "::"})
 PLATFORM_CACHE_CLEANUP_INTERVAL_SECONDS = 60 * 60
 PLATFORM_CLAIM_HEARTBEAT_INTERVAL_SECONDS = 30
+PLATFORM_RESULT_RECONCILE_INTERVAL_SECONDS = 5 * 60
 NAS_PROBE_PATH_ENV = "EPISODE_QC_NAS_PROBE_PATH"
 NAS_UNAVAILABLE_MESSAGE = (
     "NAS 当前不可用；可继续查看本机已有任务，依赖 NAS 的领取、缓存、导入和提交操作将在恢复后可用。"
@@ -351,6 +352,7 @@ class EpisodeQcWebApplication:
         self._platform_owned_jobs: set[str] = set()
         self._platform_ownership_errors: dict[str, str] = {}
         self._platform_progress: dict[str, dict[str, object]] = {}
+        self._platform_result_jobs: set[str] = set()
         self._platform_lock = threading.RLock()
         self._flow_client_factory = FlowClient
         self._flow_client: FlowClient | None = None
@@ -369,6 +371,7 @@ class EpisodeQcWebApplication:
             interval_seconds=PLATFORM_CACHE_CLEANUP_INTERVAL_SECONDS,
         )
         self._platform_cache_cleanup.start()
+        self._platform_result_reconcile_stop = threading.Event()
         self._connect_platform_from_environment()
         self._platform_heartbeat_stop = threading.Event()
         self._platform_heartbeat_thread = threading.Thread(
@@ -377,12 +380,20 @@ class EpisodeQcWebApplication:
             daemon=True,
         )
         self._platform_heartbeat_thread.start()
+        self._platform_result_reconcile_thread = threading.Thread(
+            target=self._run_platform_result_reconciliation,
+            name="episode-qc-platform-result-reconcile",
+            daemon=True,
+        )
+        self._platform_result_reconcile_thread.start()
 
     def close(self) -> None:
         self._nas_status_monitor.close()
         self._platform_cache_cleanup.close()
         self._platform_heartbeat_stop.set()
         self._platform_heartbeat_thread.join(timeout=5)
+        self._platform_result_reconcile_stop.set()
+        self._platform_result_reconcile_thread.join(timeout=5)
         self._executor.shutdown(wait=False, cancel_futures=True)
         self._platform_executor.shutdown(wait=False, cancel_futures=True)
         self._platform_progress_executor.shutdown(wait=False, cancel_futures=True)
@@ -477,13 +488,18 @@ class EpisodeQcWebApplication:
             self._flow_error = ""
         self._refresh_platform_owned_jobs(response)
         self._resume_incomplete_platform_caches(client, response)
+        self._schedule_platform_result_reconciliation(
+            client,
+            response,
+            source="connect",
+        )
         return self._platform_payload(response)
 
     def disconnect_platform(self) -> dict[str, object]:
         self._assert_flow_enabled()
         with self._platform_lock:
-            if self._platform_jobs:
-                raise ValueError("仍有质检任务正在缓存，暂时不能退出 Flow")
+            if self._platform_jobs or self._platform_result_jobs:
+                raise ValueError("仍有质检任务正在缓存或同步结果，暂时不能退出 Flow")
             self._flow_client = None
             self._flow_connection = {}
             self._flow_error = ""
@@ -553,6 +569,120 @@ class EpisodeQcWebApplication:
             PLATFORM_CLAIM_HEARTBEAT_INTERVAL_SECONDS
         ):
             self._heartbeat_platform_claims_once()
+
+    def _result_reconcile_interval_seconds(self) -> float:
+        try:
+            configured = float(
+                os.environ.get(
+                    "EPISODE_QC_RESULT_RECONCILE_INTERVAL_SECONDS",
+                    str(PLATFORM_RESULT_RECONCILE_INTERVAL_SECONDS),
+                )
+            )
+        except ValueError:
+            configured = PLATFORM_RESULT_RECONCILE_INTERVAL_SECONDS
+        return max(30.0, configured)
+
+    def _run_platform_result_reconciliation(self) -> None:
+        while not self._platform_result_reconcile_stop.wait(
+            self._result_reconcile_interval_seconds()
+        ):
+            self._reconcile_platform_results_once("periodic")
+
+    def _reconcile_platform_results_once(self, source: str) -> None:
+        with self._platform_lock:
+            client = self._flow_client
+        if client is None:
+            return
+        try:
+            response = client.jobs_response()
+        except Exception as exc:
+            LOGGER.warning("Flow QC result patrol failed source=%s: %s", source, exc)
+            return
+        self._refresh_platform_owned_jobs(response)
+        self._schedule_platform_result_reconciliation(
+            client,
+            response,
+            source=source,
+        )
+
+    def _schedule_platform_result_reconciliation(
+        self,
+        client,
+        response: dict[str, object],
+        *,
+        source: str,
+    ) -> None:
+        """Schedule idempotent submission for complete local unsynced work."""
+
+        with self._platform_lock:
+            if client is not self._flow_client:
+                return
+        visible_jobs = {
+            str(item.get("code")): item
+            for item in response.get("jobs", [])
+            if isinstance(item, dict) and item.get("code")
+        }
+        manager = self._quality_cache_manager()
+        for task in list_qc_tasks(self.paths.db_path):
+            job_code = str(task.get("flow_job_code") or "")
+            if not job_code or task.get("status") != "completed":
+                continue
+            job = visible_jobs.get(job_code)
+            if job is None or job.get("status") == "waiting_data":
+                continue
+            try:
+                summary = manager.cache_summary(job_code)
+            except QualityCacheError as exc:
+                LOGGER.warning("QC result patrol skipped %s: %s", job_code, exc)
+                continue
+            if (
+                not summary
+                or not summary.get("cache_complete")
+                or summary.get("result_synced") is True
+            ):
+                continue
+            # A completed Flow job with a pending local result is the narrow
+            # crash window after Flow accepted the idempotent submission but
+            # before the QC state file was marked synced. Replaying it is safe.
+            if job.get("status") == "completed" and not summary.get("pending_result"):
+                continue
+            with self._platform_lock:
+                if job_code in self._platform_result_jobs:
+                    continue
+                self._platform_result_jobs.add(job_code)
+            self._platform_executor.submit(
+                self._reconcile_platform_result,
+                job_code,
+                source,
+            )
+
+    def _reconcile_platform_result(self, job_code: str, source: str) -> None:
+        try:
+            result = self._submit_platform_job_once(job_code)
+        except Exception as exc:
+            try:
+                self._quality_cache_manager().record_result_sync_error(
+                    job_code,
+                    str(exc),
+                )
+            except Exception:
+                LOGGER.exception("failed to record QC result patrol error job=%s", job_code)
+            LOGGER.warning(
+                "QC result patrol failed source=%s job=%s: %s",
+                source,
+                job_code,
+                exc,
+            )
+        else:
+            LOGGER.info(
+                "QC result patrol synced source=%s job=%s flow_status=%s",
+                source,
+                job_code,
+                (result.get("job") or {}).get("status"),
+            )
+        finally:
+            with self._platform_lock:
+                self._platform_result_jobs.discard(job_code)
 
     def _sync_platform_review_progress(self, job_code: str) -> dict[str, object] | None:
         with self._platform_lock:
@@ -741,6 +871,17 @@ class EpisodeQcWebApplication:
         }
 
     def submit_platform_job(self, job_code: str) -> dict[str, object]:
+        with self._platform_lock:
+            if job_code in self._platform_result_jobs:
+                raise ValueError("质检结果正在自动同步，请稍后刷新")
+            self._platform_result_jobs.add(job_code)
+        try:
+            return self._submit_platform_job_once(job_code)
+        finally:
+            with self._platform_lock:
+                self._platform_result_jobs.discard(job_code)
+
+    def _submit_platform_job_once(self, job_code: str) -> dict[str, object]:
         self._assert_flow_enabled()
         client = self._require_flow_client()
         task = self._local_task_for_job(job_code)

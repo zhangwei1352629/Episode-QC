@@ -128,9 +128,9 @@ uv run episode-qc web \
 
 单机模式不会连接 Flow，任务中心会隐藏 Flow 区域。点击“导入新任务”后直接输入 QC 工作站可访问的绝对路径或已挂载 NAS 目录。原始数据仍以只读方式访问；任务索引、播放缓存和标注结果保存在独立工作区。
 
-Windows 生产工作站推荐让 Flow 返回统一的 `smb://服务器/共享/...` URI，并在运行 QC 的同一专用 Windows 账号下预先配置 SMB 凭据。不要依赖交互式 SSH 会话建立的 `net use`，也不要把 NAS 密码明文写入启动脚本。计划任务应使用同一服务账号，并在启动 QC 前验证共享可读、正式结果目录可写且暂存目录与正式目录位于同一 SMB 共享。
+Windows 生产工作站推荐让 Flow 返回统一的 `smb://服务器/共享/...` URI，并在运行 QC 的同一专用 Windows 账号下预先配置 SMB 凭据。若 Flow 为兼容 Linux 服务仍返回 `/nas/...`，必须成对配置 `EPISODE_QC_FLOW_NAS_ROOT` 与 `EPISODE_QC_NAS_MOUNT_ROOT`，例如把 Flow 与结果目录的共同根 `/nas` 映射到 QC 服务账号可访问的 `\\delta-ai-nas.local\datasets`；该根下的数据目录、`qc-results` 和暂存目录必须与 UNC 中保持同名相对结构。映射只作用于完整前缀，不会重定向其他本地路径。不要依赖交互式 SSH 会话建立的 `net use`，也不要把 NAS 密码明文写入启动脚本。计划任务应使用同一服务账号，并在启动 QC 前验证共享可读、正式结果目录可写且暂存目录与正式目录位于同一 SMB 共享。
 
-仓库提供 `deploy/windows/Start-EpisodeQc.ps1` 和 `Install-EpisodeQcTask.ps1`。先在专用账号下配置 `EPISODE_QC_PUBLIC_HOST`、`EPISODE_QC_FLOW_URL`、`EPISODE_QC_NAS_PROBE_PATH` 以及 SMB 凭据，再由管理员安装计划任务。启动脚本不保存 NAS 密码；NAS 探针不可访问时会退出，由计划任务按一分钟间隔重试，避免产生假健康服务。
+仓库提供 `deploy/windows/Start-EpisodeQc.ps1` 和 `Install-EpisodeQcTask.ps1`。先在专用账号下配置 `EPISODE_QC_PUBLIC_HOST`、`EPISODE_QC_FLOW_URL`、`EPISODE_QC_NAS_PROBE_PATH`、成对的 NAS 根映射（需要时）以及 SMB 凭据，再由管理员安装计划任务。启动脚本不保存 NAS 密码；NAS 探针不可访问时会退出，由计划任务按一分钟间隔重试，避免产生假健康服务。
 
 生产更新必须遵守 [Windows 生产部署要求](deploy/windows/DEPLOYMENT_REQUIREMENTS.md)。只把新文件同步到 `src/episode_qc` 不算完成部署：计划任务运行的是 `.venv` 中已安装的 `episode_qc`，每次代码修改后都必须重新构建并安装制品，核对运行时实际导入路径和 SHA-256，再在没有在途质检任务且已获得重启确认后切换服务。
 
@@ -379,7 +379,9 @@ uv run episode-qc workspace-export /path/to/workspace.db /path/to/results --form
 2. 服务先在 Flow 原子领取任务，再把资产中的全部 Episode 从 NAS 复制到工作区的 `platform-cache/`；
 3. 只复制 `asset_manifest.json` 明确列出的文件，使用 `.partial` 断点续传；主文件、元数据和配置快照全部通过 SHA-256 后才进入本地任务；
 4. 页面自动切换到已缓存任务，逐个回放、标注并选择结论；
-5. 全部 Episode 完成后，左侧任务卡出现“提交到 Flow”；确认后先把结果原子发布到独立 `qc-results/<asset>/<job>/attempt-XXXX/`，再使用结果 ID 和 SHA-256 幂等回写 Flow。
+5. 全部 Episode 完成后，左侧任务卡出现“提交到 Flow”；确认后先把结果原子发布到独立 `qc-results/<asset>/<job>/attempt-XXXX/`，再使用结果 ID 和 SHA-256 幂等回写 Flow；Flow 返回 `completed` 后会从 NAS 正式目录及资产内版本化历史目录再次回读并校验 SHA-256，全部一致后才把本地 `result_synced` 标记为 `true`。
+
+QC Web 在连接 Flow 时立即巡检一次，之后默认每 5 分钟巡检：仅对“本地任务全部 Episode 已完成、缓存完整、`result_synced=false`”且当前账号可见的 Flow 任务执行幂等补提。Flow 尚未完成时重新领取/开启工作时段后补提；若 Flow 已完成但本地仍保留同一份 `pending_result`，则只通过同一结果 ID 和摘要做崩溃窗口恢复。失败原因持久化到缓存状态，NAS 或 Flow 恢复后会再次尝试，不删除本地结果。可用 `EPISODE_QC_RESULT_RECONCILE_INTERVAL_SECONDS` 调整周期，最短 30 秒。
 
 对于约 100GB 的资产，领取前会检查磁盘空间。由于 Web 回放还要生成派生缓存，默认要求可用空间至少为“源数据大小的 2 倍 + 10GB”，即 100GB 任务至少预留约 210GB。可用 `EPISODE_QC_CACHE_RESERVE_GB` 调整额外预留空间。
 

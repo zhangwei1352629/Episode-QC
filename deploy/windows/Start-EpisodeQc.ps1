@@ -5,6 +5,8 @@ param(
     [int]$Port = 8765,
     [string]$FlowUrl = $env:EPISODE_QC_FLOW_URL,
     [string]$NasProbePath = $env:EPISODE_QC_NAS_PROBE_PATH,
+    [string]$FlowNasRoot = $env:EPISODE_QC_FLOW_NAS_ROOT,
+    [string]$NasMountRoot = $env:EPISODE_QC_NAS_MOUNT_ROOT,
     [ValidateRange(1, 3600)]
     [int]$RestartDelaySeconds = 10,
     [ValidateRange(1, 3600)]
@@ -50,6 +52,17 @@ if ($NasProbePath) {
 }
 else {
     Remove-Item Env:EPISODE_QC_NAS_PROBE_PATH -ErrorAction SilentlyContinue
+}
+if ([bool]$FlowNasRoot -ne [bool]$NasMountRoot) {
+    throw "EPISODE_QC_FLOW_NAS_ROOT and EPISODE_QC_NAS_MOUNT_ROOT must be configured together."
+}
+if ($FlowNasRoot) {
+    $env:EPISODE_QC_FLOW_NAS_ROOT = $FlowNasRoot
+    $env:EPISODE_QC_NAS_MOUNT_ROOT = $NasMountRoot
+}
+else {
+    Remove-Item Env:EPISODE_QC_FLOW_NAS_ROOT -ErrorAction SilentlyContinue
+    Remove-Item Env:EPISODE_QC_NAS_MOUNT_ROOT -ErrorAction SilentlyContinue
 }
 $env:PYTHONUNBUFFERED = "1"
 

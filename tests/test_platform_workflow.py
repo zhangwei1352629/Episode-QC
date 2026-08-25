@@ -1328,6 +1328,7 @@ def test_structured_label_flow_job_is_fully_cached_verified_submitted_and_safely
     )
     assert state["result_synced"] is True
     assert datetime.fromisoformat(state["result_synced_at"]).tzinfo is not None
+    assert state["result_readback_verified_at"] == state["result_synced_at"]
 
     cache.evict(job["code"])
     assert not (tmp_path / "qc-cache" / "ready" / job["code"]).exists()
@@ -1397,6 +1398,119 @@ def test_result_copy_failure_keeps_pending_result_and_does_not_complete_flow(
     state = json.loads(state_path.read_text(encoding="utf-8"))
     assert state["pending_result"]["result_id"].startswith("QCR-")
     assert state.get("result_synced") is not True
+
+
+def test_submit_requires_completed_flow_response_and_post_submit_nas_readback(
+    tmp_path: Path,
+):
+    asset_root = tmp_path / "nas" / "AST-READBACK"
+    asset_root.mkdir(parents=True)
+    job = {
+        "code": "QCJ-READBACK",
+        "status": "in_progress",
+        "asset_id": "AST-READBACK",
+        "source_uri": str(asset_root),
+        "result_upload_uri": str(
+            tmp_path / "qc-results" / "AST-READBACK" / "QCJ-READBACK"
+        ),
+        "next_attempt": 1,
+        "episodes": [{"episode_id": "AST-READBACK-EP0001"}],
+    }
+    cache_root = tmp_path / "qc-cache"
+    cache = QualityCacheManager(cache_root, reserve_bytes=0)
+    state_path = cache_root / "ready" / job["code"] / ".qc-cache.json"
+    QualityCacheManager._write_json_atomic(
+        state_path,
+        {
+            "schema_version": 3,
+            "job_code": job["code"],
+            "asset_id": job["asset_id"],
+            "cache_complete": True,
+            "episodes": [
+                {"episode_id": "AST-READBACK-EP0001", "status": "ready"}
+            ],
+        },
+    )
+
+    class CorruptingClient:
+        def report_work(self, *_args, **_kwargs):
+            return None
+
+        def submit_result(self, _job_code, **values):
+            published = Path(values["result_nas_path"])
+            published.write_text('{"corrupted": true}\n', encoding="utf-8")
+            return {"status": "completed"}
+
+    with pytest.raises(QualityCacheError, match="提交后 NAS 回读校验失败"):
+        cache.submit_result(
+            CorruptingClient(),
+            job,
+            episode_results=[
+                {
+                    "episode_id": "AST-READBACK-EP0001",
+                    "decision": "pass",
+                    "annotation_count": 0,
+                }
+            ],
+        )
+
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state.get("result_synced") is not True
+    assert state["pending_result"]["result_id"].startswith("QCR-")
+    assert (cache_root / "results-pending" / job["code"] / "qc_result.json").is_file()
+
+
+def test_submit_does_not_mark_synced_when_flow_response_is_not_completed(tmp_path: Path):
+    asset_root = tmp_path / "nas" / "AST-NOT-COMPLETED"
+    asset_root.mkdir(parents=True)
+    job = {
+        "code": "QCJ-NOT-COMPLETED",
+        "status": "in_progress",
+        "asset_id": "AST-NOT-COMPLETED",
+        "source_uri": str(asset_root),
+        "result_upload_uri": str(
+            tmp_path / "qc-results" / "AST-NOT-COMPLETED" / "QCJ-NOT-COMPLETED"
+        ),
+        "next_attempt": 1,
+        "episodes": [{"episode_id": "AST-NOT-COMPLETED-EP0001"}],
+    }
+    cache_root = tmp_path / "qc-cache"
+    cache = QualityCacheManager(cache_root, reserve_bytes=0)
+    state_path = cache_root / "ready" / job["code"] / ".qc-cache.json"
+    QualityCacheManager._write_json_atomic(
+        state_path,
+        {
+            "schema_version": 3,
+            "job_code": job["code"],
+            "asset_id": job["asset_id"],
+            "cache_complete": True,
+            "episodes": [
+                {"episode_id": "AST-NOT-COMPLETED-EP0001", "status": "ready"}
+            ],
+        },
+    )
+
+    class IncompleteClient:
+        def report_work(self, *_args, **_kwargs):
+            return None
+
+        def submit_result(self, _job_code, **_values):
+            return {"status": "in_progress"}
+
+    with pytest.raises(QualityCacheError, match="未进入 completed"):
+        cache.submit_result(
+            IncompleteClient(),
+            job,
+            episode_results=[
+                {
+                    "episode_id": "AST-NOT-COMPLETED-EP0001",
+                    "decision": "pass",
+                    "annotation_count": 0,
+                }
+            ],
+        )
+
+    assert json.loads(state_path.read_text(encoding="utf-8")).get("result_synced") is not True
 
 
 def test_completed_job_idempotent_retry_skips_work_heartbeat(tmp_path: Path):

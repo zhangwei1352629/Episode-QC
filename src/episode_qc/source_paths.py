@@ -9,6 +9,10 @@ from typing import Iterable
 from urllib.parse import unquote, urlsplit
 
 
+FLOW_NAS_ROOT_ENV = "EPISODE_QC_FLOW_NAS_ROOT"
+QC_NAS_MOUNT_ROOT_ENV = "EPISODE_QC_NAS_MOUNT_ROOT"
+
+
 @dataclass(frozen=True)
 class SmbLocation:
     server: str
@@ -35,7 +39,7 @@ def resolve_source_directory(
     ``/proc/self/mountinfo`` as well.
     """
 
-    raw = os.fspath(value).strip()
+    raw = map_flow_nas_path(os.fspath(value).strip())
     if not raw:
         raise ValueError("请输入数据源目录")
 
@@ -78,7 +82,7 @@ def resolve_target_directory(
 ) -> Path:
     """Resolve a writable target path whose final directories may not exist yet."""
 
-    raw = os.fspath(value).strip()
+    raw = map_flow_nas_path(os.fspath(value).strip())
     if not raw:
         raise ValueError("请输入结果目标目录")
     if raw.lower().startswith("file:"):
@@ -105,6 +109,45 @@ def resolve_target_directory(
             f"smb://{location.server}/{location.share}"
         )
     return _join_within_mount(candidates[0], location.relative_parts)
+
+
+def map_flow_nas_path(value: str) -> str:
+    """Map Flow's POSIX NAS namespace to this QC client's mount view.
+
+    Flow intentionally persists one platform path (normally below ``/nas``),
+    while Windows QC clients access the same storage through a UNC root.  The
+    mapping is explicit and prefix-boundary checked so an unrelated local path
+    can never be redirected accidentally.
+    """
+
+    raw = str(value).strip()
+    flow_root = os.environ.get(FLOW_NAS_ROOT_ENV, "").strip()
+    mount_root = os.environ.get(QC_NAS_MOUNT_ROOT_ENV, "").strip()
+    if bool(flow_root) != bool(mount_root):
+        raise ValueError(
+            f"{FLOW_NAS_ROOT_ENV} 与 {QC_NAS_MOUNT_ROOT_ENV} 必须同时配置"
+        )
+    if not flow_root:
+        return raw
+
+    normalized_flow_root = flow_root.replace("\\", "/").rstrip("/")
+    normalized_value = raw.replace("\\", "/")
+    if not normalized_flow_root.startswith("/"):
+        raise ValueError(f"{FLOW_NAS_ROOT_ENV} 必须是绝对 POSIX 路径")
+    if normalized_value != normalized_flow_root and not normalized_value.startswith(
+        normalized_flow_root + "/"
+    ):
+        return raw
+
+    relative = normalized_value[len(normalized_flow_root) :].lstrip("/")
+    relative_parts = relative.split("/") if relative else []
+    if any(part in {"", ".", ".."} for part in relative_parts):
+        raise ValueError("Flow NAS 路径包含无效路径段")
+    if not relative:
+        return mount_root
+    if mount_root.startswith("\\\\"):
+        return mount_root.rstrip("\\/") + "\\" + relative.replace("/", "\\")
+    return mount_root.rstrip("/") + "/" + relative
 
 
 def _resolve_file_uri(raw: str) -> Path:

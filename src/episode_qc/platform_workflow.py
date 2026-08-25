@@ -861,7 +861,7 @@ class QualityCacheManager:
             local_result,
             result_manifest,
         )
-        self._publish_versioned_result_copy(
+        versioned_result_path = self._publish_versioned_result_copy(
             job,
             local_result,
             result_manifest,
@@ -886,11 +886,24 @@ class QualityCacheManager:
             review_started_at=review_started_at,
             review_completed_at=review_completed_at,
         )
+        if not isinstance(response, dict) or response.get("status") != "completed":
+            raise QualityCacheError("Flow 已接收质检结果，但任务未进入 completed 状态")
+        try:
+            self._verify_result_readback(result_nas_path, result_manifest)
+            self._verify_result_file_readback(
+                versioned_result_path,
+                expected_sha256=result_sha256,
+            )
+        except (OSError, ValueError, QualityCacheError) as exc:
+            raise QualityCacheError(f"提交后 NAS 回读校验失败：{exc}") from exc
         state["result_synced"] = True
         state["result_synced_at"] = datetime.now(timezone.utc).isoformat()
+        state["result_readback_verified_at"] = state["result_synced_at"]
         state["result_nas_path"] = result_nas_path
         state["result_id"] = result_id
         state["result_sha256"] = result_sha256
+        state.pop("result_sync_error", None)
+        state.pop("result_sync_error_at", None)
         self._write_json_atomic(state_path, state)
         shutil.rmtree(local_results)
         return response
@@ -957,6 +970,7 @@ class QualityCacheManager:
     def cache_summary(self, job_code: str) -> dict[str, object] | None:
         safe_code = self._safe_component(job_code, "质检任务编号")
         state_path = self.cache_root / "ready" / safe_code / ".qc-cache.json"
+        is_ready_state = state_path.is_file()
         if not state_path.is_file():
             state_path = self._pre_cache_failure_state_path(safe_code)
         if not state_path.is_file():
@@ -975,9 +989,28 @@ class QualityCacheManager:
             "cached_bytes": int(state.get("cached_bytes") or 0),
             "total_bytes": int(state.get("total_bytes") or 0),
         }
+        if is_ready_state:
+            summary.update(
+                result_synced=state.get("result_synced") is True,
+                pending_result=isinstance(state.get("pending_result"), dict),
+            )
         if state.get("cache_error"):
             summary["cache_error"] = str(state["cache_error"])
+        if state.get("result_sync_error"):
+            summary["result_sync_error"] = str(state["result_sync_error"])
         return summary
+
+    def record_result_sync_error(self, job_code: str, error: str) -> None:
+        """Persist the last automatic reconciliation error for safe retries."""
+
+        state_path = self._state_path(job_code)
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise QualityCacheError("本地 Episode 缓存状态损坏，请人工检查") from exc
+        state["result_sync_error"] = str(error).strip() or "质检结果自动同步失败"
+        state["result_sync_error_at"] = datetime.now(timezone.utc).isoformat()
+        self._write_json_atomic(state_path, state)
 
     def flush_pending_cache_report(self, client: FlowClient, job_code: str) -> bool:
         """Retry a durable Flow cache-status report after reconnecting."""
@@ -1341,6 +1374,29 @@ class QualityCacheManager:
         if sha256_file(result_path) != expected_sha256:
             raise QualityCacheError(f"已发布质检结果文件 SHA-256 校验失败：{result_path}")
         return True
+
+    @classmethod
+    def _verify_result_readback(cls, result_path: str, expected_manifest: dict) -> None:
+        raw = str(result_path).strip().replace("\\", "/")
+        parent_uri, separator, name = raw.rpartition("/")
+        if not separator or name != "qc_result.json" or not parent_uri:
+            raise QualityCacheError("Flow 质检结果路径格式无效")
+        destination = resolve_target_directory(parent_uri)
+        cls._verify_published_result(destination, expected_manifest)
+
+    @staticmethod
+    def _verify_result_file_readback(
+        result_path: str,
+        *,
+        expected_sha256: str,
+    ) -> None:
+        raw = str(result_path).strip().replace("\\", "/")
+        parent_uri, separator, name = raw.rpartition("/")
+        if not separator or name != "qc_result.json" or not parent_uri:
+            raise QualityCacheError("版本化质检结果路径格式无效")
+        candidate = resolve_target_directory(parent_uri) / name
+        if not candidate.is_file() or sha256_file(candidate) != expected_sha256:
+            raise QualityCacheError(f"版本化质检结果 SHA-256 回读失败：{candidate}")
 
     def _ensure_disk_space(self, source_bytes: int) -> None:
         free = shutil.disk_usage(self.cache_root).free

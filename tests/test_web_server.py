@@ -199,6 +199,94 @@ def test_web_application_stops_heartbeats_after_flow_reports_lost_ownership(tmp_
         }
 
 
+def test_result_reconciliation_schedules_only_locally_completed_unsynced_jobs(
+    tmp_path: Path,
+    monkeypatch,
+):
+    tasks = [
+        {"flow_job_code": "QCJ-TARGET", "status": "completed"},
+        {"flow_job_code": "QCJ-LOCAL-INCOMPLETE", "status": "in_progress"},
+        {"flow_job_code": "QCJ-SYNCED", "status": "completed"},
+        {"flow_job_code": "QCJ-REMOTE-COMPLETED-PENDING", "status": "completed"},
+        {"flow_job_code": "QCJ-REMOTE-COMPLETED-CLEAN", "status": "completed"},
+    ]
+    summaries = {
+        "QCJ-TARGET": {"cache_complete": True, "result_synced": False},
+        "QCJ-LOCAL-INCOMPLETE": {"cache_complete": True, "result_synced": False},
+        "QCJ-SYNCED": {"cache_complete": True, "result_synced": True},
+        "QCJ-REMOTE-COMPLETED-PENDING": {
+            "cache_complete": True,
+            "result_synced": False,
+            "pending_result": True,
+        },
+        "QCJ-REMOTE-COMPLETED-CLEAN": {
+            "cache_complete": True,
+            "result_synced": False,
+            "pending_result": False,
+        },
+    }
+
+    class FakeManager:
+        def cache_summary(self, job_code):
+            return summaries.get(job_code)
+
+    with running_server(tmp_path) as (server, _base_url):
+        monkeypatch.setattr(web_server, "list_qc_tasks", lambda _db_path: tasks)
+        monkeypatch.setattr(server.application, "_quality_cache_manager", FakeManager)
+        client = object()
+        server.application._flow_client = client
+        scheduled = []
+        monkeypatch.setattr(
+            server.application._platform_executor,
+            "submit",
+            lambda *args: scheduled.append(args),
+        )
+
+        server.application._schedule_platform_result_reconciliation(
+            client,
+            {
+                "jobs": [
+                    {"code": "QCJ-TARGET", "status": "in_progress"},
+                    {"code": "QCJ-LOCAL-INCOMPLETE", "status": "in_progress"},
+                    {"code": "QCJ-SYNCED", "status": "in_progress"},
+                    {"code": "QCJ-REMOTE-COMPLETED-PENDING", "status": "completed"},
+                    {"code": "QCJ-REMOTE-COMPLETED-CLEAN", "status": "completed"},
+                ]
+            },
+            source="test",
+        )
+
+        assert [item[1:] for item in scheduled] == [
+            ("QCJ-TARGET", "test"),
+            ("QCJ-REMOTE-COMPLETED-PENDING", "test"),
+        ]
+
+
+def test_result_reconciliation_persists_failure_and_releases_single_flight(
+    tmp_path: Path,
+    monkeypatch,
+):
+    recorded = []
+
+    class FakeManager:
+        def record_result_sync_error(self, job_code, error):
+            recorded.append((job_code, error))
+
+    with running_server(tmp_path) as (server, _base_url):
+        monkeypatch.setattr(server.application, "_quality_cache_manager", FakeManager)
+        monkeypatch.setattr(
+            server.application,
+            "_submit_platform_job_once",
+            lambda _job_code: (_ for _ in ()).throw(FlowClientError("Flow offline")),
+        )
+        server.application._platform_result_jobs.add("QCJ-RETRY")
+
+        server.application._reconcile_platform_result("QCJ-RETRY", "test")
+
+        assert recorded == [("QCJ-RETRY", "Flow offline")]
+        assert "QCJ-RETRY" not in server.application._platform_result_jobs
+
+
 def test_cleanup_failure_does_not_stop_the_web_server(tmp_path: Path, monkeypatch, caplog):
     def fail_cleanup(_manager):
         raise RuntimeError("cleanup disk error")

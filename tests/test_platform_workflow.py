@@ -134,6 +134,70 @@ def test_atomic_json_writer_uses_platform_independent_lf(tmp_path: Path):
     assert target.read_bytes() == b'{\n  "name": "\xe6\xb5\x8b\xe8\xaf\x95"\n}\n'
 
 
+def test_atomic_json_writer_retries_transient_windows_permission_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    target = tmp_path / ".qc-cache.json"
+    target.write_text('{"old": true}\n', encoding="utf-8")
+    real_replace = platform_workflow.os.replace
+    replacements = []
+
+    def replace_with_transient_lock(source, destination):
+        replacements.append((Path(source), Path(destination)))
+        if len(replacements) == 1:
+            raise PermissionError(13, "file is temporarily locked", str(destination))
+        return real_replace(source, destination)
+
+    sleep = Mock()
+    monkeypatch.setattr(platform_workflow.os, "replace", replace_with_transient_lock)
+    monkeypatch.setattr(platform_workflow.time, "sleep", sleep)
+
+    QualityCacheManager._write_json_atomic(target, {"cache_complete": False})
+
+    assert json.loads(target.read_text(encoding="utf-8")) == {
+        "cache_complete": False
+    }
+    assert len(replacements) == 2
+    assert replacements[0][0] == replacements[1][0]
+    assert replacements[0][0].name.startswith("..qc-cache.json.")
+    assert replacements[0][0].name.endswith(".partial")
+    assert replacements[0][1] == target
+    assert not replacements[0][0].exists()
+    sleep.assert_called_once()
+
+
+def test_concurrent_atomic_json_writers_use_independent_partial_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    target = tmp_path / ".qc-cache.json"
+    real_replace = platform_workflow.os.replace
+    barrier = threading.Barrier(2)
+    sources = []
+    sources_lock = threading.Lock()
+
+    def synchronized_replace(source, destination):
+        with sources_lock:
+            sources.append(Path(source))
+        barrier.wait(timeout=3)
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(platform_workflow.os, "replace", synchronized_replace)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(
+                QualityCacheManager._write_json_atomic, target, {"writer": writer}
+            )
+            for writer in (1, 2)
+        ]
+        for future in futures:
+            future.result()
+
+    assert len(set(sources)) == 2
+    assert json.loads(target.read_text(encoding="utf-8"))["writer"] in {1, 2}
+    assert list(tmp_path.glob("*.partial")) == []
+
+
 def test_result_job_root_cannot_escape_assigned_asset_and_job():
     with pytest.raises(QualityCacheError, match="当前资产和任务编号"):
         QualityCacheManager._validate_result_job_root(
@@ -609,8 +673,11 @@ def test_cache_job_resumes_from_the_first_verified_episode_after_a_restart(
 
     monkeypatch.setattr(resumed_manager, "_copy_resumable", track_resumed_copy)
     resumed = resumed_manager.cache_job(FakeFlowClient(job), job)
+    completed = json.loads(state_path.read_text(encoding="utf-8"))
 
     assert resumed["cache_complete"] is True
+    assert completed["cache_status"] == "cache_ready"
+    assert "cache_error" not in completed
     assert first_primary not in resumed_sources
     assert second_primary in resumed_sources
     assert not partial_path.exists()

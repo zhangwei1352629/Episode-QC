@@ -34,6 +34,8 @@ DECISION_MAP = {
     "reject": "discard",
     "discard": "discard",
 }
+_ATOMIC_JSON_REPLACE_ATTEMPTS = 20
+_ATOMIC_JSON_REPLACE_RETRY_SECONDS = 0.05
 
 
 class FlowClientError(RuntimeError):
@@ -631,6 +633,7 @@ class QualityCacheManager:
 
         state["cache_complete"] = True
         state["cache_status"] = "cache_ready"
+        state.pop("cache_error", None)
         state["primary_files"] = primary_files
         self._write_progressive_state(state_path, state, total_bytes)
         response = self._report_cache_with_retry(
@@ -1863,14 +1866,33 @@ class QualityCacheManager:
     @staticmethod
     def _write_json_atomic(path: Path, value: object) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_name(path.name + ".partial")
+        temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.partial")
         # Write the exact UTF-8 bytes used by result SHA-256 calculation.
         # Text-mode writes translate LF to CRLF on Windows, which made the
         # uploaded result differ from the digest calculated before writing.
-        temporary.write_bytes(
-            (json.dumps(value, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
-        )
-        os.replace(temporary, path)
+        try:
+            temporary.write_bytes(
+                (json.dumps(value, ensure_ascii=False, indent=2) + "\n").encode(
+                    "utf-8"
+                )
+            )
+            for attempt in range(_ATOMIC_JSON_REPLACE_ATTEMPTS):
+                try:
+                    os.replace(temporary, path)
+                except OSError as exc:
+                    transient_windows_lock = isinstance(
+                        exc, PermissionError
+                    ) or getattr(exc, "winerror", None) in {5, 32}
+                    if (
+                        not transient_windows_lock
+                        or attempt == _ATOMIC_JSON_REPLACE_ATTEMPTS - 1
+                    ):
+                        raise
+                    time.sleep(_ATOMIC_JSON_REPLACE_RETRY_SECONDS)
+                else:
+                    break
+        finally:
+            temporary.unlink(missing_ok=True)
 
     @staticmethod
     def _emit(callback: ProgressCallback | None, state: dict[str, object]) -> None:

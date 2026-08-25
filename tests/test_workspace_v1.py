@@ -42,6 +42,7 @@ from episode_qc.workspace import (
     rescan_qc_task,
     save_annotation,
     scan_data_source,
+    sync_flow_previous_reviews,
     undo_annotation_change,
     update_episode_review,
     update_workspace_settings,
@@ -395,6 +396,83 @@ def test_flow_tasks_keep_their_bound_schema_when_local_active_schema_changes(tmp
     assert episode_detail(db_path, second["episodes"][0]["id"])["label_schema"] == second_schema
 
 
+def test_flow_previous_review_is_stored_read_only_and_survives_rescan(tmp_path: Path):
+    source_root = tmp_path / "cached-flow"
+    _write_sample_episode(source_root / "episodes" / "episode_000001")
+    db_path = tmp_path / "workspace.db"
+    scanned = scan_data_source(
+        db_path,
+        source_root,
+        task_code="QCJ-RECHECK-001",
+        origin="flow",
+        flow_job_code="QCJ-RECHECK-001",
+    )
+    local_episode_id = str(scanned["episodes"][0]["id"])
+    previous_review = {
+        "episode_review_result_id": 91,
+        "review_attempt_id": 72,
+        "job_code": "QCJ-INITIAL-001",
+        "attempt_version": 1,
+        "reviewer_name": "历史质检员",
+        "decision": "pass_with_labels",
+        "quality_grade": "good",
+        "source": {
+            "source_type": "feishu_history_qc",
+            "source_file_name": "历史质检结果.json",
+            "annotation_record_id": "rec-history",
+        },
+        "annotations": [
+            {
+                "id": 101,
+                "label_code": "legacy_body_sway",
+                "label_name": "历史躯干摆动",
+                "label_color": "#8844EE",
+                "scope": "time_range",
+                "start_offset_ns": 1_000_000_000,
+                "end_offset_ns": 2_000_000_000,
+                "severity": "normal",
+                "comment": "上一轮备注",
+            }
+        ],
+    }
+    job = {
+        "code": "QCJ-RECHECK-001",
+        "episodes": [
+            {
+                "episode_id": "AST-HISTORY-EP0001",
+                "relative_path": "episodes/episode_000001",
+                "previous_review": previous_review,
+            }
+        ],
+    }
+
+    updated = sync_flow_previous_reviews(
+        db_path,
+        job,
+        [
+            {
+                "episode_id": "AST-HISTORY-EP0001",
+                "local_episode_id": local_episode_id,
+                "relative_path": "episodes/episode_000001",
+            }
+        ],
+    )
+
+    assert updated == 1
+    detail = episode_detail(db_path, local_episode_id)
+    assert detail["episode"]["previous_review"] == previous_review
+    assert detail["annotations"] == []
+
+    scan_data_source(
+        db_path,
+        source_root,
+        task_code="QCJ-RECHECK-001",
+        origin="flow",
+        flow_job_code="QCJ-RECHECK-001",
+    )
+    assert episode_detail(db_path, local_episode_id)["episode"]["previous_review"] == previous_review
+
+
 def test_v1_import_playback_annotation_and_export_round_trip(tmp_path: Path):
     source_root = tmp_path / "含 空格的数据"
     mcap_path = _write_sample_episode(source_root / "episode_000001")
@@ -405,7 +483,7 @@ def test_v1_import_playback_annotation_and_export_round_trip(tmp_path: Path):
     workspace = initialize_workspace(db_path, reviewer_name="测试员")
     result = scan_data_source(db_path, source_root)
 
-    assert workspace["schema_version"] == 4
+    assert workspace["schema_version"] == 5
     assert result["discovered"] == 1
     assert result["ready"] == 1
     episode_id = result["episodes"][0]["id"]
@@ -788,7 +866,7 @@ def test_schema_v1_data_source_is_migrated_to_qc_task(tmp_path: Path):
     workspace = initialize_workspace(db_path)
     tasks = list_qc_tasks(db_path)
 
-    assert workspace["schema_version"] == 4
+    assert workspace["schema_version"] == 5
     assert len(tasks) == 1
     assert tasks[0]["task_name"] == "旧资产"
     assert tasks[0]["local_source_path"] == str(source_root)
@@ -797,6 +875,7 @@ def test_schema_v1_data_source_is_migrated_to_qc_task(tmp_path: Path):
     assert {"review_started_at", "review_completed_at"}.issubset(
         _table_columns(db_path, "qc_task")
     )
+    assert "previous_review_json" in _table_columns(db_path, "episode")
 
 
 def test_v1_bad_episode_does_not_block_valid_episode(tmp_path: Path):

@@ -52,6 +52,7 @@ from episode_qc.workspace import (
     rescan_qc_task,
     save_annotation,
     scan_data_source,
+    sync_flow_previous_reviews,
     undo_annotation_change,
     update_episode_review,
     update_workspace_settings,
@@ -925,11 +926,31 @@ class EpisodeQcWebApplication:
             None,
         )
 
-    @staticmethod
-    def _platform_job(client, job_code: str) -> dict[str, object]:
-        job = next((item for item in client.jobs() if item.get("code") == job_code), None)
+    def _platform_job(self, client, job_code: str) -> dict[str, object]:
+        if hasattr(client, "job"):
+            job = client.job(job_code)
+        else:
+            job = next(
+                (item for item in client.jobs() if item.get("code") == job_code),
+                None,
+            )
         if job is None:
             raise ValueError(f"Flow 中不存在或当前账号无权访问质检任务：{job_code}")
+        local_task = self._local_task_for_job(job_code)
+        episodes = job.get("episodes")
+        has_previous_review = isinstance(episodes, list) and any(
+            isinstance(item, dict) and "previous_review" in item
+            for item in episodes
+        )
+        if local_task is not None and has_previous_review:
+            manager = self._quality_cache_manager()
+            mapping_reader = getattr(manager, "local_episode_mappings", None)
+            try:
+                mappings = mapping_reader(job_code) if mapping_reader else []
+            except (OSError, QualityCacheError):
+                mappings = []
+            if mappings:
+                sync_flow_previous_reviews(self.paths.db_path, job, mappings)
         return job
 
     def _quality_cache_manager(self) -> QualityCacheManager:
@@ -1006,6 +1027,8 @@ class EpisodeQcWebApplication:
             if not mappings:
                 raise QualityCacheError("本地缓存尚未索引到已验证的 Flow Episode")
             manager.record_local_episodes(job_code, mappings)
+            if any("previous_review" in item for item in job.get("episodes", [])):
+                sync_flow_previous_reviews(self.paths.db_path, job, mappings)
             local_ready = True
             indexed_task_id = str(indexed["task_id"])
             cache_summary = manager.cache_summary(job_code) or {}

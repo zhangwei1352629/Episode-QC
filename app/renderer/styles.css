@@ -231,7 +231,7 @@ body.episodes-collapsed .episode-sidebar, body.labels-collapsed .label-sidebar {
 .timeline-range { width: calc(100% - 90px); margin-left: 90px; padding: 0; height: 15px; accent-color: var(--accent); }
 .timeline-ticks { margin-left: 90px; display: flex; justify-content: space-between; color: #697680; font-size: 9px; }
 
-.label-sidebar { border-left: 1px solid var(--line); min-height: 0; display: grid; grid-template-rows: minmax(0, 1fr) minmax(124px, .4fr) auto; overflow: hidden; }
+.label-sidebar { border-left: 1px solid var(--line); min-height: 0; display: grid; grid-template-rows: minmax(0, 1fr) auto minmax(124px, .4fr) auto; overflow: hidden; }
 .panel-section { min-height: 0; padding: 10px; border-bottom: 1px solid var(--line); }
 .label-section { display: flex; flex-direction: column; overflow: hidden; }
 .section-heading { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 7px; }
@@ -281,6 +281,23 @@ body.episodes-collapsed .episode-sidebar, body.labels-collapsed .label-sidebar {
 .label-help { display: block; margin-top: 3px; color: #a9b67d; font-size: 9px; }
 .label-button kbd, .decision-grid kbd { border: 1px solid #3b4249; border-radius: 3px; padding: 1px 4px; font-size: 8px; color: var(--muted); background: #090b0d; }
 .annotations-section { display: flex; flex-direction: column; overflow: hidden; }
+.previous-review-section { max-height: 210px; display: flex; flex-direction: column; gap: 5px; overflow: hidden; background: rgba(86, 116, 145, .08); }
+.previous-review-section[hidden] { display: none; }
+.previous-review-summary { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px; }
+.previous-review-summary span { min-width: 0; padding: 5px 6px; border: 1px solid #33414c; border-radius: 6px; background: #0e151b; }
+.previous-review-summary strong, .previous-review-summary small { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.previous-review-summary strong { color: #d6e1e7; font-size: 9.5px; }
+.previous-review-summary small { margin-top: 1px; color: var(--muted); font-size: 8px; }
+.previous-review-source { color: #91a3ae; font-size: 8px; line-height: 1.35; overflow-wrap: anywhere; }
+.previous-review-list { min-height: 0; display: grid; gap: 4px; overflow-y: auto; }
+.previous-review-item { display: grid; grid-template-columns: 4px minmax(0, 1fr) auto; align-items: center; gap: 6px; padding: 5px 6px; border: 1px solid #2f3b44; border-radius: 6px; background: #10171d; }
+.previous-review-item i { width: 4px; height: 24px; border-radius: 3px; }
+.previous-review-item span { min-width: 0; }
+.previous-review-item strong, .previous-review-item small { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.previous-review-item strong { font-size: 9.5px; }
+.previous-review-item small { margin-top: 2px; color: var(--muted); font-size: 8px; }
+.previous-review-item time { align-self: start; color: #9db5c4; font-size: 8px; font-variant-numeric: tabular-nums; }
+.previous-review-empty { color: var(--muted); font-size: 9px; padding: 5px 0; }
 .annotation-heading { align-items: center; margin-bottom: 2px; }
 .annotation-heading h3 { margin-top: 1px; }
 .section-helper { margin: 0 0 7px; color: #74818a; font-size: 8.5px; line-height: 1.35; }
@@ -317,11 +334,12 @@ body.episodes-collapsed .episode-sidebar, body.labels-collapsed .label-sidebar {
 @media (min-width: 1000px) {
   body.episodes-collapsed .label-sidebar {
     grid-template-columns: minmax(250px, 1fr) minmax(224px, .72fr);
-    grid-template-rows: minmax(0, 1fr) auto;
+    grid-template-rows: auto minmax(0, 1fr) auto;
   }
-  body.episodes-collapsed .label-section { grid-column: 1; grid-row: 1 / 3; border-right: 1px solid var(--line); border-bottom: 0; }
-  body.episodes-collapsed .annotations-section { grid-column: 2; grid-row: 1; }
-  body.episodes-collapsed .decision-section { grid-column: 2; grid-row: 2; border-bottom: 0; }
+  body.episodes-collapsed .label-section { grid-column: 1; grid-row: 1 / 4; border-right: 1px solid var(--line); border-bottom: 0; }
+  body.episodes-collapsed .previous-review-section { grid-column: 2; grid-row: 1; }
+  body.episodes-collapsed .annotations-section { grid-column: 2; grid-row: 2; }
+  body.episodes-collapsed .decision-section { grid-column: 2; grid-row: 3; border-bottom: 0; }
   body.episodes-collapsed .decision-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   body.episodes-collapsed .decision-copy small { display: block; }
 }
@@ -450,7 +468,8 @@ dialog::backdrop { background: rgba(0,0,0,.66); }
   .app-shell { grid-template-rows: 56px minmax(0, 1fr); }
   .topbar { padding: 0 12px; }
   .review-workspace { grid-template-rows: 54px minmax(230px, 1fr) 176px; }
-  .label-sidebar { grid-template-rows: minmax(0, 1fr) minmax(104px, .34fr) auto; }
+  .label-sidebar { grid-template-rows: minmax(0, 1fr) auto minmax(104px, .34fr) auto; }
+  .previous-review-section { max-height: 160px; }
   .panel-section { padding: 8px; }
   .section-heading { margin-bottom: 5px; }
   .scope-tabs { margin-bottom: 5px; }

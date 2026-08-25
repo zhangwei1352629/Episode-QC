@@ -18,7 +18,7 @@ from episode_qc.bvh import read_bvh_header
 from episode_qc.source_paths import resolve_source_directory
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 class WorkspaceConflictError(RuntimeError):
@@ -261,6 +261,7 @@ def _initialize_workspace(
                 reviewer_name TEXT,
                 last_playhead_ns INTEGER NOT NULL DEFAULT 0,
                 annotation_count INTEGER NOT NULL DEFAULT 0,
+                previous_review_json TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 reviewed_at TEXT,
@@ -380,6 +381,7 @@ def _initialize_workspace(
     _ensure_column(connection, "qc_task", "label_set_id", "TEXT REFERENCES label_set(id)")
     _ensure_column(connection, "qc_task", "review_started_at", "TEXT")
     _ensure_column(connection, "qc_task", "review_completed_at", "TEXT")
+    _ensure_column(connection, "episode", "previous_review_json", "TEXT")
     row = connection.execute("SELECT * FROM workspace LIMIT 1").fetchone()
     if row is None:
         workspace_id = _new_id("ws")
@@ -1412,6 +1414,9 @@ def _episode_rows(connection: sqlite3.Connection, where: str = "", parameters: t
         value["camera_count"] = int(value["camera_count"] or 0)
         value["mocap_available"] = bool(value["mocap_available"])
         value["duration_sec"] = (value["duration_ns"] or 0) / 1e9
+        value["previous_review"] = _loads(
+            value.pop("previous_review_json"), None
+        )
         rows.append(value)
     return rows
 
@@ -1801,6 +1806,147 @@ def episode_detail(db_path: str | Path, episode_id: str) -> dict[str, object]:
         annotations = _list_annotations(connection, episode_id)
         schema = _label_schema_for_task(connection, str(episode["task_id"]))
     return {"episode": episode, "streams": streams, "annotations": annotations, "label_schema": schema}
+
+
+def _safe_previous_review(value: object) -> dict[str, object] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("Flow 上一轮质检结果必须是对象")
+    allowed_fields = {
+        "episode_review_result_id",
+        "review_attempt_id",
+        "job_code",
+        "attempt_version",
+        "reviewer_name",
+        "completed_at",
+        "decision",
+        "quality_grade",
+        "annotation_count",
+        "quality_annotation_count",
+    }
+    safe = {key: value[key] for key in allowed_fields if key in value}
+    label_set = value.get("label_set")
+    if label_set is not None:
+        if not isinstance(label_set, dict):
+            raise ValueError("Flow 上一轮标签版本必须是对象")
+        safe["label_set"] = {
+            key: label_set[key]
+            for key in ("id", "label_set_id", "schema_version", "schema_hash")
+            if key in label_set
+        }
+    source = value.get("source")
+    if source is not None:
+        if not isinstance(source, dict):
+            raise ValueError("Flow 上一轮来源信息必须是对象")
+        safe["source"] = {
+            key: source[key]
+            for key in (
+                "source_type",
+                "source_file_name",
+                "annotation_record_id",
+                "asset_record_id",
+                "archive_sha256",
+                "result_id",
+            )
+            if key in source
+        }
+    raw_annotations = value.get("annotations", [])
+    if not isinstance(raw_annotations, list):
+        raise ValueError("Flow 上一轮标注必须是数组")
+    annotation_fields = (
+        "id",
+        "source_annotation_id",
+        "label_code",
+        "label_name",
+        "label_group",
+        "label_color",
+        "scope",
+        "start_offset_ns",
+        "end_offset_ns",
+        "target_type",
+        "target_key",
+        "severity",
+        "action",
+        "comment",
+        "attributes",
+    )
+    safe["annotations"] = []
+    for annotation in raw_annotations:
+        if not isinstance(annotation, dict):
+            raise ValueError("Flow 上一轮单条标注必须是对象")
+        safe["annotations"].append(
+            {key: annotation[key] for key in annotation_fields if key in annotation}
+        )
+    # Enforce that the payload remains JSON-compatible before writing it to
+    # the durable local workspace.
+    return json.loads(_json(safe))
+
+
+def sync_flow_previous_reviews(
+    db_path: str | Path,
+    job: dict[str, object],
+    mappings: list[dict[str, object]],
+) -> int:
+    """Attach Flow's immutable prior results to the matching local Episodes.
+
+    These facts are kept in a separate JSON column and never inserted into the
+    editable annotation table, so a V1 result cannot silently become part of a
+    V2 submission.
+    """
+
+    initialize_workspace(db_path)
+    job_code = str(job.get("code") or "").strip()
+    if not job_code:
+        raise ValueError("Flow 质检任务缺少任务编号")
+    raw_episodes = job.get("episodes")
+    if not isinstance(raw_episodes, list):
+        raise ValueError("Flow 质检任务 Episodes 必须是数组")
+    episodes_by_id: dict[str, dict[str, object]] = {}
+    for item in raw_episodes:
+        if not isinstance(item, dict) or not item.get("episode_id"):
+            raise ValueError("Flow 质检任务包含无效 Episode")
+        episode_id = str(item["episode_id"])
+        if episode_id in episodes_by_id:
+            raise ValueError(f"Flow 质检任务包含重复 Episode：{episode_id}")
+        episodes_by_id[episode_id] = item
+
+    updated = 0
+    with connect_workspace(db_path) as connection:
+        for mapping in mappings:
+            platform_episode_id = str(mapping.get("episode_id") or "")
+            local_episode_id = str(mapping.get("local_episode_id") or "")
+            platform_episode = episodes_by_id.get(platform_episode_id)
+            if platform_episode is None:
+                raise ValueError(
+                    f"本地 Episode 映射不属于当前 Flow 任务：{platform_episode_id}"
+                )
+            row = connection.execute(
+                """
+                SELECT e.id, t.flow_job_code
+                FROM episode e
+                JOIN data_source ds ON ds.id = e.data_source_id
+                JOIN qc_task t ON t.id = ds.task_id
+                WHERE e.id = ?
+                """,
+                (local_episode_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"本地 Episode 不存在：{local_episode_id}")
+            if str(row["flow_job_code"] or "") != job_code:
+                raise ValueError("不能把上一轮质检结果写入其他本地任务")
+            previous_review = _safe_previous_review(
+                platform_episode.get("previous_review")
+            )
+            connection.execute(
+                "UPDATE episode SET previous_review_json = ? WHERE id = ?",
+                (
+                    _json(previous_review) if previous_review is not None else None,
+                    local_episode_id,
+                ),
+            )
+            updated += 1
+    return updated
 
 
 def parse_label_schema(path: str | Path) -> tuple[dict[str, object], str, str, str]:

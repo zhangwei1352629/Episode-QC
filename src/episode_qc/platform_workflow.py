@@ -63,6 +63,9 @@ _FLOW_ANNOTATION_FIELDS = (
     "comment",
     "attributes",
 )
+_FLOW_OPTIONAL_ANNOTATION_FIELDS = frozenset(
+    {"id", "target_key", "severity", "action", "comment", "attributes"}
+)
 
 
 def _flow_label_set_reference(job: dict) -> dict | None:
@@ -93,6 +96,24 @@ def _flow_annotations(value: object) -> list[dict]:
             normalized["id"] = annotation["id"]
         normalized_annotations.append(normalized)
     return normalized_annotations
+
+
+def _flow_submission_annotations(value: object) -> list[dict]:
+    """Omit nullable optional fields from the Flow wire payload.
+
+    Existing pending result documents may already contain JSON null values.
+    Keep those immutable documents and their hashes unchanged while relying on
+    Flow's defaults for optional fields that were not actually populated.
+    """
+
+    return [
+        {
+            field: item
+            for field, item in annotation.items()
+            if item is not None or field not in _FLOW_OPTIONAL_ANNOTATION_FIELDS
+        }
+        for annotation in _flow_annotations(value)
+    ]
 
 
 def _api_error_message(value: object) -> str:
@@ -180,6 +201,9 @@ class FlowClient:
     def jobs(self, statuses: list[str] | None = None) -> list[dict]:
         return self.jobs_response(statuses)["jobs"]
 
+    def job(self, job_code: str) -> dict:
+        return self.request("GET", f"/api/v1/qc/jobs/{job_code}")
+
     def claim(self, job_code: str) -> dict:
         return self.request("POST", f"/api/v1/qc/jobs/{job_code}/claim", {})
 
@@ -247,7 +271,7 @@ class FlowClient:
             if episode_result.get("quality_grade"):
                 normalized["quality_grade"] = episode_result["quality_grade"]
             if "annotations" in episode_result:
-                normalized["annotations"] = _flow_annotations(
+                normalized["annotations"] = _flow_submission_annotations(
                     episode_result["annotations"]
                 )
             if episode_result.get("completed_at"):

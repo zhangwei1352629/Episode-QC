@@ -63,6 +63,48 @@ def test_flow_client_preserves_drf_list_error_message():
         client.request("POST", "/api/v1/qc/jobs/QCJ-001/work", {})
 
 
+def test_flow_client_omits_null_optional_annotation_fields_from_submission():
+    client = FlowClient("http://flow.test")
+    client.request = Mock(return_value={"code": "QCJ-NULL", "status": "completed"})
+    annotation = {
+        "id": "ann-null",
+        "label_code": "body_sway",
+        "scope": "time_range",
+        "start_offset_ns": 1,
+        "end_offset_ns": 2,
+        "target_type": "body",
+        "target_key": None,
+        "severity": None,
+        "action": None,
+        "comment": None,
+        "attributes": None,
+    }
+
+    client.submit_result(
+        "QCJ-NULL",
+        episode_results=[
+            {
+                "episode_id": "AST-NULL-EP0001",
+                "decision": "pass_with_labels",
+                "annotation_count": 1,
+                "annotations": [annotation],
+            }
+        ],
+    )
+
+    payload = client.request.call_args.args[2]
+    submitted = payload["episode_results"][0]["annotations"][0]
+    assert submitted == {
+        "id": "ann-null",
+        "label_code": "body_sway",
+        "scope": "time_range",
+        "start_offset_ns": 1,
+        "end_offset_ns": 2,
+        "target_type": "body",
+    }
+    assert annotation["target_key"] is None
+
+
 def test_flow_client_renews_claim_without_creating_work_heartbeat():
     client = FlowClient("http://flow.test")
     client.request = Mock(return_value={"code": "QCJ-HEARTBEAT", "status": "in_progress"})
@@ -73,6 +115,16 @@ def test_flow_client_renews_claim_without_creating_work_heartbeat():
     client.request.assert_called_once_with(
         "POST", "/api/v1/qc/jobs/QCJ-HEARTBEAT/heartbeat", {}
     )
+
+
+def test_flow_client_fetches_full_job_detail_for_previous_review():
+    client = FlowClient("http://flow.test")
+    client.request = Mock(return_value={"code": "QCJ-RECHECK", "episodes": []})
+
+    response = client.job("QCJ-RECHECK")
+
+    assert response == {"code": "QCJ-RECHECK", "episodes": []}
+    client.request.assert_called_once_with("GET", "/api/v1/qc/jobs/QCJ-RECHECK")
 
 
 def test_atomic_json_writer_uses_platform_independent_lf(tmp_path: Path):

@@ -33,6 +33,8 @@ const els = {
   labelSetMeta: $("label-set-meta"), targetContext: $("target-context"), labelList: $("label-list"),
   annotationComment: $("annotation-comment"), undo: $("undo"), redo: $("redo"),
   annotationCount: $("annotation-count"), annotationList: $("annotation-list"), decisionGrid: $("decision-grid"), decisionCurrent: $("decision-current"),
+  previousReviewSection: $("previous-review-section"), previousReviewCount: $("previous-review-count"),
+  previousReviewSummary: $("previous-review-summary"), previousReviewSource: $("previous-review-source"), previousReviewList: $("previous-review-list"),
   needsRecheck: $("needs-recheck"), toastStack: $("toast-stack"), taskCenterToastStack: $("task-center-toast-stack"), annotationEditor: $("annotation-editor"),
   editId: $("edit-id"), editStart: $("edit-start"), editEnd: $("edit-end"), editSeverity: $("edit-severity"),
   editAction: $("edit-action"), editComment: $("edit-comment"), deleteAnnotation: $("delete-annotation"),
@@ -976,6 +978,7 @@ function renderEpisodeDetail() {
   els.timelineEnd.textContent = formatDuration(state.durationNs / 1e9);
   renderClock();
   renderCoverageTracks();
+  renderPreviousReview();
   renderAnnotations();
   renderLabels();
   renderDecision();
@@ -1003,6 +1006,10 @@ function clearEpisodeView() {
   els.annotationTrack.innerHTML = "";
   els.annotationList.innerHTML = '<div class="empty-panel">暂无标注</div>';
   els.annotationCount.textContent = "0";
+  els.previousReviewSection.hidden = true;
+  els.previousReviewSummary.innerHTML = "";
+  els.previousReviewSource.textContent = "";
+  els.previousReviewList.innerHTML = "";
   renderJointOptions([]);
   renderMotionSourceOptions();
   state.selectedCameraId = null;
@@ -1434,6 +1441,48 @@ function renderAnnotations() {
     const width = annotation.scope === "time_point" ? 0.35 : state.durationNs ? Math.max(.35, ((annotation.end_offset_ns - annotation.start_offset_ns) / state.durationNs) * 100) : .35;
     return `<i class="annotation-block" data-annotation-id="${escapeHtml(annotation.annotation_id)}" title="${escapeHtml(label.name || annotation.label_code)}" style="left:${left}%;width:${width}%;background:${escapeHtml(label.color || "#8c959f")}"></i>`;
   }).join("");
+}
+
+function renderPreviousReview() {
+  const previous = state.detail?.episode?.previous_review;
+  if (!previous) {
+    els.previousReviewSection.hidden = true;
+    els.previousReviewCount.textContent = "0";
+    els.previousReviewSummary.innerHTML = "";
+    els.previousReviewSource.textContent = "";
+    els.previousReviewList.innerHTML = "";
+    return;
+  }
+  const annotations = Array.isArray(previous.annotations) ? previous.annotations : [];
+  const labelSet = previous.label_set || {};
+  const source = previous.source || {};
+  const grade = ({ excellent: "优", good: "良", fair: "中", poor: "差", invalid: "无效" })[previous.quality_grade] || previous.quality_grade || "未记录";
+  els.previousReviewSection.hidden = false;
+  els.previousReviewCount.textContent = String(annotations.length);
+  els.previousReviewSummary.innerHTML = `
+    <span><strong>${escapeHtml(decisionName(previous.decision) || "未记录")}</strong><small>结论</small></span>
+    <span><strong>${escapeHtml(grade)}</strong><small>等级</small></span>
+    <span><strong>${escapeHtml(previous.reviewer_name || "历史导入")}</strong><small>质检员</small></span>
+    <span><strong>V${escapeHtml(labelSet.schema_version || previous.attempt_version || "-")}</strong><small>标签版本</small></span>`;
+  const sourceParts = [];
+  if (source.source_file_name) sourceParts.push(`文件 ${source.source_file_name}`);
+  if (source.annotation_record_id) sourceParts.push(`飞书 ${source.annotation_record_id}`);
+  if (source.archive_sha256) sourceParts.push(`摘要 ${String(source.archive_sha256).slice(0, 12)}…`);
+  els.previousReviewSource.textContent = sourceParts.length
+    ? `来源：${sourceParts.join(" · ")}`
+    : "来源：Flow 历史质检事实";
+  els.previousReviewList.innerHTML = annotations.length
+    ? annotations.map((annotation) => {
+        const color = /^#[0-9A-Fa-f]{6}$/.test(String(annotation.label_color || "")) ? annotation.label_color : "#8c959f";
+        const timing = annotation.scope === "episode"
+          ? "整条"
+          : annotation.scope === "time_point"
+            ? formatClock(annotation.start_offset_ns)
+            : `${formatClock(annotation.start_offset_ns)}–${formatClock(annotation.end_offset_ns)}`;
+        const note = [annotation.severity || "未分级", annotation.comment || ""].filter(Boolean).join(" · ");
+        return `<div class="previous-review-item"><i style="background:${color}"></i><span><strong>${escapeHtml(annotation.label_name || annotation.label_code || "历史标签")}</strong><small>${escapeHtml(note)}</small></span><time>${escapeHtml(timing)}</time></div>`;
+      }).join("")
+    : '<div class="previous-review-empty">上一轮无标签标注</div>';
 }
 
 function openAnnotationEditor(annotationId) {

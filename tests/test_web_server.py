@@ -211,6 +211,69 @@ def test_cleanup_failure_does_not_stop_the_web_server(tmp_path: Path, monkeypatc
     assert "platform cache cleanup failed source=startup" in caplog.text
 
 
+def test_renderer_separates_previous_review_from_editable_annotations():
+    renderer_root = Path(__file__).resolve().parents[1] / "app" / "renderer"
+    html = (renderer_root / "index.html").read_text(encoding="utf-8")
+    script = (renderer_root / "renderer.js").read_text(encoding="utf-8")
+
+    assert 'id="previous-review-section"' in html
+    assert "上一轮质检" in html
+    assert "只读对照" in html
+    assert "function renderPreviousReview()" in script
+    assert "state.detail?.episode?.previous_review" in script
+    assert "来源：Flow 历史质检事实" in script
+    assert 'class="previous-review-item"' in script
+    assert 'data-annotation-id=' not in script.split(
+        "function renderPreviousReview()", 1
+    )[1].split("function openAnnotationEditor", 1)[0]
+
+
+def test_existing_cached_job_refreshes_previous_review_from_flow_detail(
+    tmp_path: Path, monkeypatch
+):
+    job = {
+        "code": "QCJ-HISTORY-REFRESH",
+        "episodes": [
+            {
+                "episode_id": "AST-HISTORY-EP0001",
+                "previous_review": {"decision": "pass", "annotations": []},
+            }
+        ],
+    }
+    mappings = [
+        {
+            "episode_id": "AST-HISTORY-EP0001",
+            "local_episode_id": "ep_local",
+        }
+    ]
+
+    class FakeClient:
+        def job(self, job_code):
+            assert job_code == job["code"]
+            return job
+
+    class FakeCache:
+        def local_episode_mappings(self, job_code):
+            assert job_code == job["code"]
+            return mappings
+
+    synced = []
+    monkeypatch.setattr(
+        web_server,
+        "sync_flow_previous_reviews",
+        lambda db_path, payload, local_mappings: synced.append(
+            (db_path, payload, local_mappings)
+        ),
+    )
+    with running_server(tmp_path) as (server, _base_url):
+        server.application._local_task_for_job = lambda _code: {"id": "task-local"}
+        server.application._quality_cache_manager = lambda: FakeCache()
+
+        assert server.application._platform_job(FakeClient(), job["code"]) == job
+
+    assert synced == [(server.application.paths.db_path, job, mappings)]
+
+
 def test_web_flow_label_schema_is_installed_before_ready_episode_indexing(tmp_path: Path, monkeypatch):
     schema = flow_label_schema()
     job = flow_label_job(code="QCJ-WEB-LABEL-SCHEMA", schema=schema)

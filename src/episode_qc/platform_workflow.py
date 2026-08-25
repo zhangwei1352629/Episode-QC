@@ -861,6 +861,12 @@ class QualityCacheManager:
             local_result,
             result_manifest,
         )
+        self._publish_versioned_result_copy(
+            job,
+            local_result,
+            result_manifest,
+            label_set=label_set,
+        )
         self._publish_latest_result_copy(
             job,
             local_result,
@@ -1154,6 +1160,91 @@ class QualityCacheManager:
                 raise QualityCacheError(f"无法原子发布质检结果：{exc}") from exc
         self._verify_published_result(destination, result_manifest)
         return f"{upload_uri}/{attempt_name}/qc_result.json"
+
+    @classmethod
+    def _publish_versioned_result_copy(
+        cls,
+        job: dict,
+        local_result: Path,
+        result_manifest: dict,
+        *,
+        label_set: dict | None,
+    ) -> str:
+        """Publish one immutable result below the reviewed asset directory.
+
+        ``qc_result.json`` at the asset root remains the convenient latest
+        copy.  This history tree is the durable, offline-readable lineage and
+        therefore refuses to replace an existing attempt with different
+        content.
+        """
+
+        asset_uri = str(job.get("source_uri") or job.get("asset_nas_uri") or "").strip()
+        if not asset_uri:
+            raise QualityCacheError("Flow 没有返回原始数据目录，无法保存版本化质检结果")
+        job_code = cls._safe_component(job.get("code"), "质检任务编号")
+        raw_version = str(
+            (label_set or {}).get("label_schema_version")
+            or (label_set or {}).get("schema_version")
+            or "unversioned"
+        )
+        version = cls._safe_component(raw_version, "标签版本")
+        version_directory = version if version.lower().startswith("v") else f"v{version}"
+        try:
+            attempt = int(result_manifest["attempt"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise QualityCacheError("质检结果清单缺少有效尝试轮次") from exc
+        if attempt < 1:
+            raise QualityCacheError("质检结果清单尝试轮次必须大于零")
+
+        history_manifest = dict(result_manifest)
+        history_manifest["storage_layout_version"] = 1
+        history_manifest["label_set"] = dict(label_set) if label_set is not None else None
+        attempt_name = f"attempt-{attempt:04d}"
+        staging: Path | None = None
+        try:
+            asset_root = resolve_source_directory(asset_uri)
+            history_root = asset_root / "qc_results" / version_directory / job_code
+            destination = history_root / attempt_name
+            resolved_asset = asset_root.resolve()
+            try:
+                destination.resolve(strict=False).relative_to(resolved_asset)
+            except ValueError as exc:
+                raise QualityCacheError("版本化质检结果目录越出原始数据目录") from exc
+            if destination.exists():
+                cls._verify_published_result(destination, history_manifest)
+                return str(destination / "qc_result.json")
+
+            history_root.mkdir(parents=True, exist_ok=True)
+            # Keep this component short: on Windows the D:\\nas link expands
+            # to a longer UNC path and a full UUID can cross MAX_PATH even
+            # though the final history directory itself is valid.
+            staging = history_root / f".qcr-{uuid.uuid4().hex[:12]}"
+            staging.mkdir()
+            temporary_result = staging / "qc_result.json.partial"
+            staged_result = staging / "qc_result.json"
+            shutil.copy2(local_result, temporary_result)
+            if sha256_file(temporary_result) != result_manifest["result_sha256"]:
+                raise QualityCacheError("版本化质检结果副本 SHA-256 校验失败")
+            os.replace(temporary_result, staged_result)
+            cls._write_json_atomic(staging / "result_manifest.json", history_manifest)
+            try:
+                os.replace(staging, destination)
+            except OSError as exc:
+                try:
+                    cls._verify_published_result(destination, history_manifest)
+                except QualityCacheError:
+                    raise QualityCacheError(f"无法原子发布版本化质检结果：{exc}") from exc
+            cls._verify_published_result(destination, history_manifest)
+            return str(destination / "qc_result.json")
+        except (OSError, ValueError, QualityCacheError) as exc:
+            if staging is not None and staging.exists():
+                try:
+                    shutil.rmtree(staging)
+                except OSError:
+                    pass
+            if isinstance(exc, QualityCacheError):
+                raise
+            raise QualityCacheError(f"无法在原始数据目录保存版本化质检结果：{exc}") from exc
 
     @staticmethod
     def _publish_latest_result_copy(

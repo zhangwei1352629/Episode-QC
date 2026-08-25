@@ -263,6 +263,207 @@ def test_latest_result_copy_uses_the_actual_source_uri_when_asset_alias_differs(
     assert not (alias_root / "qc_result.json").exists()
 
 
+def test_versioned_result_copy_preserves_every_label_schema_version(tmp_path: Path):
+    asset_root = tmp_path / "asset"
+    asset_root.mkdir()
+    first_result = tmp_path / "v1.json"
+    second_result = tmp_path / "v2.json"
+    first_result.write_bytes(b'{"result_id":"QCR-V1"}\n')
+    second_result.write_bytes(b'{"result_id":"QCR-V2"}\n')
+
+    def manifest(path: Path, *, result_id: str, job_code: str) -> dict:
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        return {
+            "schema_version": 1,
+            "result_id": result_id,
+            "result_sha256": digest,
+            "job_code": job_code,
+            "asset_id": "AST-HISTORY",
+            "attempt": 1,
+            "files": [
+                {
+                    "relative_path": "qc_result.json",
+                    "size_bytes": path.stat().st_size,
+                    "sha256": digest,
+                }
+            ],
+        }
+
+    first_manifest = manifest(
+        first_result,
+        result_id="QCR-V1",
+        job_code="QCJ-HISTORY-V1",
+    )
+    second_manifest = manifest(
+        second_result,
+        result_id="QCR-V2",
+        job_code="QCJ-HISTORY-V2",
+    )
+
+    first_path = QualityCacheManager._publish_versioned_result_copy(
+        {"source_uri": str(asset_root), "code": "QCJ-HISTORY-V1"},
+        first_result,
+        first_manifest,
+        label_set={
+            "label_set_id": "labels-history",
+            "label_schema_version": "1.0.0",
+            "label_schema_hash": "1" * 64,
+        },
+    )
+    QualityCacheManager._publish_latest_result_copy(
+        {"source_uri": str(asset_root)},
+        first_result,
+        result_sha256=first_manifest["result_sha256"],
+    )
+    second_path = QualityCacheManager._publish_versioned_result_copy(
+        {"source_uri": str(asset_root), "code": "QCJ-HISTORY-V2"},
+        second_result,
+        second_manifest,
+        label_set={
+            "label_set_id": "labels-history",
+            "label_schema_version": "2.0.0",
+            "label_schema_hash": "2" * 64,
+        },
+    )
+    QualityCacheManager._publish_latest_result_copy(
+        {"source_uri": str(asset_root)},
+        second_result,
+        result_sha256=second_manifest["result_sha256"],
+    )
+
+    assert first_path == str(
+        asset_root
+        / "qc_results"
+        / "v1.0.0"
+        / "QCJ-HISTORY-V1"
+        / "attempt-0001"
+        / "qc_result.json"
+    )
+    assert second_path == str(
+        asset_root
+        / "qc_results"
+        / "v2.0.0"
+        / "QCJ-HISTORY-V2"
+        / "attempt-0001"
+        / "qc_result.json"
+    )
+    assert Path(first_path).read_bytes() == first_result.read_bytes()
+    assert Path(second_path).read_bytes() == second_result.read_bytes()
+    assert (asset_root / "qc_result.json").read_bytes() == second_result.read_bytes()
+    history_manifest = json.loads(
+        (Path(first_path).parent / "result_manifest.json").read_text(encoding="utf-8")
+    )
+    assert history_manifest["storage_layout_version"] == 1
+    assert history_manifest["label_set"]["label_schema_version"] == "1.0.0"
+
+
+def test_versioned_result_copy_is_idempotent_and_rejects_conflicting_attempt(
+    tmp_path: Path,
+):
+    asset_root = tmp_path / "asset"
+    asset_root.mkdir()
+    local_result = tmp_path / "result.json"
+    local_result.write_bytes(b'{"result_id":"QCR-STABLE"}\n')
+    digest = hashlib.sha256(local_result.read_bytes()).hexdigest()
+    manifest = {
+        "schema_version": 1,
+        "result_id": "QCR-STABLE",
+        "result_sha256": digest,
+        "job_code": "QCJ-STABLE",
+        "asset_id": "AST-STABLE",
+        "attempt": 1,
+        "files": [
+            {
+                "relative_path": "qc_result.json",
+                "size_bytes": local_result.stat().st_size,
+                "sha256": digest,
+            }
+        ],
+    }
+    job = {"source_uri": str(asset_root), "code": "QCJ-STABLE"}
+    label_set = {
+        "label_set_id": "labels-stable",
+        "label_schema_version": "2.0.0",
+        "label_schema_hash": "3" * 64,
+    }
+
+    first = QualityCacheManager._publish_versioned_result_copy(
+        job,
+        local_result,
+        manifest,
+        label_set=label_set,
+    )
+    assert QualityCacheManager._publish_versioned_result_copy(
+        job,
+        local_result,
+        manifest,
+        label_set=label_set,
+    ) == first
+
+    conflicting = dict(manifest)
+    conflicting["result_id"] = "QCR-CONFLICT"
+    with pytest.raises(QualityCacheError, match="清单不同，禁止覆盖"):
+        QualityCacheManager._publish_versioned_result_copy(
+            job,
+            local_result,
+            conflicting,
+            label_set=label_set,
+        )
+
+
+def test_versioned_result_copy_uses_short_windows_safe_staging_component(
+    tmp_path: Path,
+    monkeypatch,
+):
+    asset_root = tmp_path / "asset"
+    asset_root.mkdir()
+    local_result = tmp_path / "result.json"
+    local_result.write_bytes(b'{"result_id":"QCR-SHORT"}\n')
+    digest = hashlib.sha256(local_result.read_bytes()).hexdigest()
+    manifest = {
+        "schema_version": 1,
+        "result_id": "QCR-SHORT",
+        "result_sha256": digest,
+        "job_code": "QCJ-SHORT",
+        "asset_id": "AST-SHORT",
+        "attempt": 1,
+        "files": [
+            {
+                "relative_path": "qc_result.json",
+                "size_bytes": local_result.stat().st_size,
+                "sha256": digest,
+            }
+        ],
+    }
+    real_replace = platform_workflow.os.replace
+    directory_sources = []
+
+    def capture_replace(source, destination, *args, **kwargs):
+        if Path(source).is_dir():
+            directory_sources.append(Path(source).name)
+        return real_replace(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(
+        platform_workflow.uuid,
+        "uuid4",
+        lambda: type("FixedUuid", (), {"hex": "1" * 32})(),
+    )
+    monkeypatch.setattr(platform_workflow.os, "replace", capture_replace)
+
+    QualityCacheManager._publish_versioned_result_copy(
+        {"source_uri": str(asset_root), "code": "QCJ-SHORT"},
+        local_result,
+        manifest,
+        label_set={
+            "label_set_id": "labels-short",
+            "label_schema_version": "2.0.0",
+            "label_schema_hash": "4" * 64,
+        },
+    )
+
+    assert directory_sources == [".qcr-111111111111"]
+
+
 def test_concurrent_latest_result_copies_use_independent_partial_files(
     tmp_path: Path, monkeypatch
 ):
@@ -1059,6 +1260,23 @@ def test_structured_label_flow_job_is_fully_cached_verified_submitted_and_safely
     result = json.loads(result_path.read_text(encoding="utf-8"))
     mirrored_result_path = asset_root / "qc_result.json"
     assert json.loads(mirrored_result_path.read_text(encoding="utf-8")) == result
+    history_result_path = (
+        asset_root
+        / "qc_results"
+        / "v1.0.0"
+        / job["code"]
+        / "attempt-0001"
+        / "qc_result.json"
+    )
+    assert json.loads(history_result_path.read_text(encoding="utf-8")) == result
+    history_manifest = json.loads(
+        (history_result_path.parent / "result_manifest.json").read_text(encoding="utf-8")
+    )
+    assert history_manifest["label_set"] == {
+        "label_set_id": "task-quality",
+        "label_schema_version": "1.0.0",
+        "label_schema_hash": canonical_json_sha256(FLOW_SCHEMA),
+    }
     assert list(asset_root.glob("*.partial")) == []
     assert [item["decision"] for item in result["episode_results"]] == [
         "pass_with_labels",
@@ -1159,7 +1377,7 @@ def test_result_copy_failure_keeps_pending_result_and_does_not_complete_flow(
     monkeypatch.setattr(platform_workflow.shutil, "copy2", fail_copy)
     client = FakeFlowClient(job)
 
-    with pytest.raises(QualityCacheError, match="无法在原始数据目录保存最新质检结果副本"):
+    with pytest.raises(QualityCacheError, match="无法在原始数据目录保存版本化质检结果"):
         cache.submit_result(
             client,
             job,
@@ -1175,6 +1393,7 @@ def test_result_copy_failure_keeps_pending_result_and_does_not_complete_flow(
     assert client.results == []
     assert (cache_root / "results-pending" / job["code"] / "qc_result.json").is_file()
     assert list(asset_root.glob("*.partial")) == []
+    assert list(asset_root.glob("qc_results/**/*.partial")) == []
     state = json.loads(state_path.read_text(encoding="utf-8"))
     assert state["pending_result"]["result_id"].startswith("QCR-")
     assert state.get("result_synced") is not True

@@ -34,7 +34,7 @@ const els = {
   annotationComment: $("annotation-comment"), undo: $("undo"), redo: $("redo"),
   annotationCount: $("annotation-count"), annotationList: $("annotation-list"), decisionGrid: $("decision-grid"), decisionCurrent: $("decision-current"),
   previousReviewSection: $("previous-review-section"), previousReviewCount: $("previous-review-count"),
-  previousReviewSummary: $("previous-review-summary"), previousReviewSource: $("previous-review-source"), previousReviewList: $("previous-review-list"),
+  previousReviewSummary: $("previous-review-summary"), previousReviewSource: $("previous-review-source"), previousReviewList: $("previous-review-list"), togglePreviousReview: $("toggle-previous-review"),
   needsRecheck: $("needs-recheck"), toastStack: $("toast-stack"), taskCenterToastStack: $("task-center-toast-stack"), annotationEditor: $("annotation-editor"),
   editId: $("edit-id"), editStart: $("edit-start"), editEnd: $("edit-end"), editSeverity: $("edit-severity"),
   editAction: $("edit-action"), editComment: $("edit-comment"), deleteAnnotation: $("delete-annotation"),
@@ -253,6 +253,9 @@ function bindEvents() {
   });
   els.previousReviewList.addEventListener("click", seekPreviousReview);
   els.previousAnnotationTrack.addEventListener("click", seekPreviousReview);
+  els.togglePreviousReview.addEventListener("click", () => {
+    setPreviousReviewExpanded(!els.previousReviewSection.classList.contains("expanded"));
+  });
   els.annotationTrack.addEventListener("click", (event) => {
     const item = event.target.closest("[data-annotation-id]");
     if (item) openAnnotationEditor(item.dataset.annotationId);
@@ -307,6 +310,7 @@ function bindEvents() {
 function restoreWorkspaceLayout() {
   setWorkspacePanel("episodes", window.localStorage.getItem("episodeQcEpisodesVisible") !== "false", false);
   setWorkspacePanel("labels", window.localStorage.getItem("episodeQcLabelsVisible") !== "false", false);
+  setPreviousReviewExpanded(window.localStorage.getItem("episodeQcPreviousReviewExpanded") === "true", false);
 }
 
 function toggleWorkspacePanel(panel) {
@@ -323,6 +327,13 @@ function setWorkspacePanel(panel, visible, persist = true) {
   button.classList.toggle("active", visible);
   if (persist) window.localStorage.setItem(isEpisodes ? "episodeQcEpisodesVisible" : "episodeQcLabelsVisible", String(visible));
   window.setTimeout(drawMotion, 190);
+}
+
+function setPreviousReviewExpanded(expanded, persist = true) {
+  els.previousReviewSection.classList.toggle("expanded", expanded);
+  els.togglePreviousReview.setAttribute("aria-expanded", String(expanded));
+  els.togglePreviousReview.textContent = expanded ? "收起" : "展开";
+  if (persist) window.localStorage.setItem("episodeQcPreviousReviewExpanded", String(expanded));
 }
 
 function handleWorkerEvent(payload) {

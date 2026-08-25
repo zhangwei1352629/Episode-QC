@@ -286,8 +286,16 @@ body.episodes-collapsed .episode-sidebar, body.labels-collapsed .label-sidebar {
 .label-help { display: block; margin-top: 3px; color: #a9b67d; font-size: 9px; }
 .label-button kbd, .decision-grid kbd { border: 1px solid #3b4249; border-radius: 3px; padding: 1px 4px; font-size: 8px; color: var(--muted); background: #090b0d; }
 .annotations-section { display: flex; flex-direction: column; overflow: hidden; }
-.previous-review-section { max-height: 210px; display: flex; flex-direction: column; gap: 5px; overflow: hidden; background: rgba(86, 116, 145, .08); }
+.previous-review-section { max-height: 42px; display: flex; flex-direction: column; gap: 5px; overflow: hidden; padding-top: 7px; padding-bottom: 7px; background: rgba(86, 116, 145, .08); transition: max-height .16s ease; }
+.previous-review-section.expanded { max-height: 210px; padding-top: 10px; padding-bottom: 10px; }
 .previous-review-section[hidden] { display: none; }
+.previous-review-section:not(.expanded) .section-heading { margin-bottom: 0; }
+.previous-review-section:not(.expanded) .previous-review-summary,
+.previous-review-section:not(.expanded) .previous-review-source,
+.previous-review-section:not(.expanded) .previous-review-list { display: none; }
+.previous-review-actions { display: flex; align-items: center; gap: 5px; }
+.previous-review-actions button { min-width: 38px; height: 24px; padding: 0 7px; border-color: #3a4a56; color: #b8c9d3; background: #111a21; font-size: 9px; }
+.previous-review-actions button:hover { border-color: #6d8797; }
 .previous-review-summary { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px; }
 .previous-review-summary span { min-width: 0; padding: 5px 6px; border: 1px solid #33414c; border-radius: 6px; background: #0e151b; }
 .previous-review-summary strong, .previous-review-summary small { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }

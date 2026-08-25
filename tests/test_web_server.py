@@ -218,6 +218,8 @@ def test_renderer_separates_previous_review_from_editable_annotations():
     styles = (renderer_root / "styles.css").read_text(encoding="utf-8")
 
     assert 'id="previous-review-section"' in html
+    assert 'id="toggle-previous-review"' in html
+    assert 'aria-expanded="false"' in html
     assert 'id="previous-annotation-track"' in html
     assert 'data-track-label="历史"' in html
     assert 'data-track-label="本轮"' in html
@@ -230,10 +232,14 @@ def test_renderer_separates_previous_review_from_editable_annotations():
     assert 'class="history-annotation-block"' in script
     assert "data-previous-start-ns" in script
     assert "seekTo(Number(item.dataset.previousStartNs))" in script
+    assert "function setPreviousReviewExpanded(" in script
+    assert 'classList.toggle("expanded", expanded)' in script
+    assert 'episodeQcPreviousReviewExpanded' in script
     assert "历史 ${previousAnnotations.length}" in script
     assert "历史结论" in script
     assert ".history-annotation-block" in styles
     assert ".history-label-badge" in styles
+    assert ".previous-review-section:not(.expanded)" in styles
     assert 'data-annotation-id=' not in script.split(
         "function renderPreviousReview()", 1
     )[1].split("function openAnnotationEditor", 1)[0]

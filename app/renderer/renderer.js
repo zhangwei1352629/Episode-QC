@@ -10,6 +10,10 @@ import {
   flowTaskGroupPresentation,
   groupFlowClaimPoolJobs,
 } from "./flow-task-groups.mjs";
+import {
+  canConfirmEpisode,
+  pendingInheritedDecision,
+} from "./incremental-review.mjs";
 import { loadInitialTasks } from "./startup.mjs";
 
 const $ = (id) => document.getElementById(id);
@@ -1718,7 +1722,7 @@ async function redo() {
 }
 
 async function setDecision(decision) {
-  if (!state.currentEpisodeId) return;
+  if (!state.currentEpisodeId) return false;
   setSaveState("saving", "保存结论…");
   try {
     const episode = await window.episodeQc.updateReview({ episodeId: state.currentEpisodeId, status: "completed", decision, reviewer: els.reviewerName.value.trim(), playheadNs: state.playheadNs });
@@ -1726,7 +1730,12 @@ async function setDecision(decision) {
     updateEpisodeFromDetail();
     renderDecision();
     setSaveState("saved", "已保存");
-  } catch (error) { setSaveState("error", "保存失败"); toast(error.message || String(error), "error"); }
+    return true;
+  } catch (error) {
+    setSaveState("error", "保存失败");
+    toast(error.message || String(error), "error");
+    return false;
+  }
 }
 
 async function setReviewStatus(status, showToast = true) {
@@ -1743,12 +1752,19 @@ async function setReviewStatus(status, showToast = true) {
 function renderDecision() {
   const episode = state.detail?.episode;
   const decision = episode?.quality_decision || "";
+  const inheritedDecision = pendingInheritedDecision(episode);
+  const displayedDecision = decision || inheritedDecision;
   els.decisionGrid.querySelectorAll("[data-decision]").forEach((button) => {
-    button.classList.toggle("active", button.dataset.decision === decision);
+    button.classList.toggle("active", button.dataset.decision === displayedDecision);
     button.disabled = !episode;
   });
-  els.decisionCurrent.textContent = decision ? decisionName(decision) : "未选择";
-  els.decisionCurrent.classList.toggle("selected", Boolean(decision));
+  els.decisionCurrent.textContent = decision
+    ? decisionName(decision)
+    : inheritedDecision
+      ? `继承：${decisionName(inheritedDecision)}（待确认）`
+      : "未选择";
+  els.decisionCurrent.classList.toggle("selected", Boolean(displayedDecision));
+  els.decisionCurrent.classList.toggle("inherited", Boolean(inheritedDecision));
   els.needsRecheck.classList.toggle("active", episode?.review_status === "needs_recheck");
   els.needsRecheck.disabled = !episode;
   renderReviewFooter();
@@ -1766,17 +1782,23 @@ function renderReviewFooter() {
   els.reviewModifiedCount.textContent = String(totals.modified);
   els.reviewRemovedCount.textContent = String(totals.removed);
   els.reviewPreservedCount.textContent = String(totals.preserved);
-  const status = state.detail?.episode?.review_status;
-  els.confirmCurrentEpisode.disabled = !["completed", "reviewed", "needs_recheck"].includes(status);
+  const episode = state.detail?.episode;
+  const status = episode?.review_status;
+  els.confirmCurrentEpisode.disabled = !canConfirmEpisode(episode);
   els.confirmCurrentEpisode.textContent = status === "needs_recheck" ? "保存待复核并继续" : "确认本条并继续";
 }
 
-function confirmCurrentEpisode() {
+async function confirmCurrentEpisode() {
   const episode = state.detail?.episode;
   if (!episode) return;
   if (!["completed", "reviewed", "needs_recheck"].includes(episode.review_status)) {
-    toast("请先选择 Episode 结论或标记为待复核", "error");
-    return;
+    const inheritedDecision = pendingInheritedDecision(episode);
+    if (!inheritedDecision) {
+      toast("请先选择 Episode 结论或标记为待复核", "error");
+      return;
+    }
+    const saved = await setDecision(inheritedDecision);
+    if (!saved) return;
   }
   const currentIndex = state.filteredEpisodes.findIndex((item) => item.id === state.currentEpisodeId);
   const next = state.filteredEpisodes[currentIndex + 1];

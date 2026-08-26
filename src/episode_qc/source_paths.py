@@ -132,6 +132,11 @@ def map_flow_nas_path(value: str) -> str:
 
     normalized_flow_root = flow_root.replace("\\", "/").rstrip("/")
     normalized_value = raw.replace("\\", "/")
+    # Flow directory URIs may carry one or more harmless trailing separators.
+    # Remove only those separators so an internal empty path segment remains
+    # invalid and cannot bypass the prefix-boundary validation below.
+    if normalized_value != "/":
+        normalized_value = normalized_value.rstrip("/")
     if not normalized_flow_root.startswith("/"):
         raise ValueError(f"{FLOW_NAS_ROOT_ENV} 必须是绝对 POSIX 路径")
     if normalized_value != normalized_flow_root and not normalized_value.startswith(

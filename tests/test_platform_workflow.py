@@ -47,6 +47,19 @@ FLOW_SCHEMA = {
 }
 
 
+def test_windows_extended_path_preserves_target_and_adds_win32_prefix():
+    unc = Path(r"\\nas.local\datasets\deep\asset")
+    drive = Path(r"N:\deep\asset")
+
+    assert str(platform_workflow._windows_extended_path(unc, windows=True)) == (
+        r"\\?\UNC\nas.local\datasets\deep\asset"
+    )
+    assert str(platform_workflow._windows_extended_path(drive, windows=True)) == (
+        r"\\?\N:\deep\asset"
+    )
+    assert platform_workflow._windows_extended_path(unc, windows=False) == unc
+
+
 def test_flow_client_preserves_drf_list_error_message():
     client = FlowClient("http://flow.test")
     client.opener.open = Mock(

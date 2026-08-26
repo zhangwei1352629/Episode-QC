@@ -38,6 +38,25 @@ _ATOMIC_JSON_REPLACE_ATTEMPTS = 20
 _ATOMIC_JSON_REPLACE_RETRY_SECONDS = 0.05
 
 
+def _windows_extended_path(path: Path, *, windows: bool | None = None) -> Path:
+    """Return a Windows extended-length view without changing the storage target."""
+
+    if windows is None:
+        windows = os.name == "nt"
+    if not windows:
+        return path
+    raw = str(path)
+    if raw.startswith("\\\\?\\"):
+        return path
+    if raw.startswith("\\\\"):
+        extended = "\\\\?\\UNC\\" + raw[2:]
+    elif re.match(r"^[A-Za-z]:[\\\\/]", raw):
+        extended = "\\\\?\\" + raw
+    else:
+        return path
+    return type(path)(extended)
+
+
 class FlowClientError(RuntimeError):
     def __init__(self, message: str, *, status_code: int | None = None):
         super().__init__(message)
@@ -1236,13 +1255,20 @@ class QualityCacheManager:
         staging: Path | None = None
         try:
             asset_root = resolve_source_directory(asset_uri)
-            history_root = asset_root / "qc_results" / version_directory / job_code
-            destination = history_root / attempt_name
+            logical_history_root = (
+                asset_root / "qc_results" / version_directory / job_code
+            )
+            logical_destination = logical_history_root / attempt_name
             resolved_asset = asset_root.resolve()
             try:
-                destination.resolve(strict=False).relative_to(resolved_asset)
+                logical_destination.resolve(strict=False).relative_to(resolved_asset)
             except ValueError as exc:
                 raise QualityCacheError("版本化质检结果目录越出原始数据目录") from exc
+            # A D:\\nas link expands to UNC when resolved.  Deep task names can
+            # therefore cross MAX_PATH only after the link expansion.  Keep the
+            # same NAS target but opt into Win32 extended-length I/O.
+            history_root = _windows_extended_path(logical_history_root)
+            destination = history_root / attempt_name
             if destination.exists():
                 cls._verify_published_result(destination, history_manifest)
                 return str(destination / "qc_result.json")
@@ -1292,8 +1318,9 @@ class QualityCacheManager:
         temporary: Path | None = None
         try:
             asset_root = resolve_source_directory(asset_uri)
-            destination = asset_root / "qc_result.json"
-            temporary = asset_root / f".qc_result.{uuid.uuid4().hex}.partial"
+            io_asset_root = _windows_extended_path(asset_root)
+            destination = io_asset_root / "qc_result.json"
+            temporary = io_asset_root / f".qc_result.{uuid.uuid4().hex}.partial"
             shutil.copy2(local_result, temporary)
             if sha256_file(temporary) != result_sha256:
                 raise QualityCacheError("数据目录质检结果副本 SHA-256 校验失败")

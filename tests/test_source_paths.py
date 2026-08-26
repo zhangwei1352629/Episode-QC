@@ -157,3 +157,6 @@ def test_maps_flow_nas_view_to_windows_unc(monkeypatch: pytest.MonkeyPatch):
     assert map_flow_nas_path(
         "/nas/data_collection/robot/task/AST-001"
     ) == r"\\delta-ai-nas.local\datasets\Delta_teleop\robot\task\AST-001"
+    assert map_flow_nas_path(
+        "/nas/data_collection/robot/task/AST-001/"
+    ) == r"\\delta-ai-nas.local\datasets\Delta_teleop\robot\task\AST-001"

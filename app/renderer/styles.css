@@ -236,7 +236,7 @@ body.episodes-collapsed .episode-sidebar, body.labels-collapsed .label-sidebar {
 .timeline-range { width: calc(100% - 90px); margin-left: 90px; padding: 0; height: 15px; accent-color: var(--accent); }
 .timeline-ticks { margin-left: 90px; display: flex; justify-content: space-between; color: #697680; font-size: 9px; }
 
-.label-sidebar { border-left: 1px solid var(--line); min-height: 0; display: grid; grid-template-rows: minmax(0, 1fr) auto minmax(124px, .4fr) auto; overflow: hidden; }
+.label-sidebar { border-left: 1px solid var(--line); min-height: 0; display: grid; grid-template-rows: minmax(0, 1fr) auto auto auto; overflow: hidden; }
 .panel-section { min-height: 0; padding: 10px; border-bottom: 1px solid var(--line); }
 .label-section { display: flex; flex-direction: column; overflow: hidden; }
 .section-heading { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 7px; }
@@ -285,7 +285,14 @@ body.episodes-collapsed .episode-sidebar, body.labels-collapsed .label-sidebar {
 .label-copy small { display: block; margin-top: 2px; color: var(--muted); font-size: 8.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .label-help { display: block; margin-top: 3px; color: #a9b67d; font-size: 9px; }
 .label-button kbd, .decision-grid kbd { border: 1px solid #3b4249; border-radius: 3px; padding: 1px 4px; font-size: 8px; color: var(--muted); background: #090b0d; }
-.annotations-section { display: flex; flex-direction: column; overflow: hidden; }
+.annotations-section { max-height: 42px; display: flex; flex-direction: column; overflow: hidden; padding-top: 7px; padding-bottom: 7px; transition: max-height .16s ease; }
+.annotations-section.expanded { max-height: min(210px, 36vh); padding-top: 10px; padding-bottom: 10px; }
+.annotations-section:not(.expanded) .annotation-heading { margin-bottom: 0; }
+.annotations-section:not(.expanded) .section-helper,
+.annotations-section:not(.expanded) .annotation-list { display: none; }
+.current-annotation-actions { display: flex; align-items: center; gap: 5px; }
+.current-annotation-actions button { min-width: 38px; height: 24px; padding: 0 7px; border: 1px solid #3a4a56; border-radius: 6px; color: #b8c9d3; background: #111a21; font-size: 9px; cursor: pointer; }
+.current-annotation-actions button:hover { border-color: #6d8797; }
 .previous-review-section { max-height: 42px; display: flex; flex-direction: column; gap: 5px; overflow: hidden; padding-top: 7px; padding-bottom: 7px; background: rgba(86, 116, 145, .08); transition: max-height .16s ease; }
 .previous-review-section.expanded { max-height: 210px; padding-top: 10px; padding-bottom: 10px; }
 .previous-review-section[hidden] { display: none; }

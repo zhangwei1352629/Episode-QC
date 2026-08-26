@@ -33,6 +33,8 @@ const els = {
   labelSetMeta: $("label-set-meta"), targetContext: $("target-context"), labelList: $("label-list"),
   annotationComment: $("annotation-comment"), undo: $("undo"), redo: $("redo"),
   annotationCount: $("annotation-count"), annotationList: $("annotation-list"), decisionGrid: $("decision-grid"), decisionCurrent: $("decision-current"),
+  annotationsSection: $("current-annotations-section"),
+  toggleCurrentAnnotations: $("toggle-current-annotations"),
   previousReviewSection: $("previous-review-section"), previousReviewCount: $("previous-review-count"),
   previousReviewSummary: $("previous-review-summary"), previousReviewSource: $("previous-review-source"), previousReviewList: $("previous-review-list"), togglePreviousReview: $("toggle-previous-review"),
   needsRecheck: $("needs-recheck"), toastStack: $("toast-stack"), taskCenterToastStack: $("task-center-toast-stack"), annotationEditor: $("annotation-editor"),
@@ -253,6 +255,9 @@ function bindEvents() {
   });
   els.previousReviewList.addEventListener("click", seekPreviousReview);
   els.previousAnnotationTrack.addEventListener("click", seekPreviousReview);
+  els.toggleCurrentAnnotations.addEventListener("click", () => {
+    setCurrentAnnotationsExpanded(!els.annotationsSection.classList.contains("expanded"));
+  });
   els.togglePreviousReview.addEventListener("click", () => {
     setPreviousReviewExpanded(!els.previousReviewSection.classList.contains("expanded"));
   });
@@ -310,6 +315,7 @@ function bindEvents() {
 function restoreWorkspaceLayout() {
   setWorkspacePanel("episodes", window.localStorage.getItem("episodeQcEpisodesVisible") !== "false", false);
   setWorkspacePanel("labels", window.localStorage.getItem("episodeQcLabelsVisible") !== "false", false);
+  setCurrentAnnotationsExpanded(window.localStorage.getItem("episodeQcCurrentAnnotationsExpanded") === "true", false);
   setPreviousReviewExpanded(window.localStorage.getItem("episodeQcPreviousReviewExpanded") === "true", false);
 }
 
@@ -334,6 +340,13 @@ function setPreviousReviewExpanded(expanded, persist = true) {
   els.togglePreviousReview.setAttribute("aria-expanded", String(expanded));
   els.togglePreviousReview.textContent = expanded ? "收起" : "展开";
   if (persist) window.localStorage.setItem("episodeQcPreviousReviewExpanded", String(expanded));
+}
+
+function setCurrentAnnotationsExpanded(expanded, persist = true) {
+  els.annotationsSection.classList.toggle("expanded", expanded);
+  els.toggleCurrentAnnotations.setAttribute("aria-expanded", String(expanded));
+  els.toggleCurrentAnnotations.textContent = expanded ? "收起" : "展开";
+  if (persist) window.localStorage.setItem("episodeQcCurrentAnnotationsExpanded", String(expanded));
 }
 
 function handleWorkerEvent(payload) {

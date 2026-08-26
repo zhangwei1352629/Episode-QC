@@ -120,3 +120,15 @@ test("收起任务栏后标注区使用双栏布局并优化备注、当前标�
   assert.match(css, /\.annotation-note textarea:focus\s*\{[^}]*min-height:/s);
   assert.match(css, /\.decision-copy small\s*\{[^}]*display:\s*none/s);
 });
+
+test("当前标注默认收起并把主要高度留给标签列表", () => {
+  const html = fs.readFileSync(path.resolve(__dirname, "../renderer/index.html"), "utf8");
+  const renderer = fs.readFileSync(path.resolve(__dirname, "../renderer/renderer.js"), "utf8");
+  const css = fs.readFileSync(path.resolve(__dirname, "../renderer/styles.css"), "utf8");
+
+  assert.match(html, /id="toggle-current-annotations"[^>]*aria-expanded="false"/);
+  assert.match(renderer, /function setCurrentAnnotationsExpanded\(expanded, persist = true\)/);
+  assert.match(renderer, /episodeQcCurrentAnnotationsExpanded/);
+  assert.match(css, /\.label-sidebar\s*\{[^}]*grid-template-rows:\s*minmax\(0, 1fr\) auto auto auto/s);
+  assert.match(css, /\.annotations-section:not\(\.expanded\)[^{]*\.annotation-list\s*\{\s*display:\s*none/s);
+});

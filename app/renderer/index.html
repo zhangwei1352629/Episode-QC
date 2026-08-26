@@ -18,6 +18,11 @@
             <p id="workspace-name">正在打开工作区…</p>
           </div>
         </div>
+        <div class="header-task-context" aria-live="polite">
+          <strong id="header-task-summary">尚未选择 QC 任务</strong>
+          <span id="header-label-version">标签 —</span>
+          <span id="header-review-round">当前 R1</span>
+        </div>
         <div class="top-actions">
           <div class="panel-toggles" aria-label="工作区面板">
             <button class="panel-toggle" id="toggle-episodes" type="button" title="显示或隐藏任务列表" aria-pressed="true"><span>☷</span><b>任务栏</b></button>
@@ -56,7 +61,6 @@
           <div class="current-task-footer">
             <span class="task-status" id="current-task-status">未加载</span>
             <div class="current-task-actions">
-              <button id="submit-flow-task" type="button" hidden>提交到 Flow</button>
               <button id="rescan-task" type="button" disabled>重新扫描</button>
             </div>
           </div>
@@ -142,8 +146,12 @@
             </div>
           </div>
           <div class="coverage-tracks" id="coverage-tracks"></div>
-          <div class="annotation-track history-annotation-track" id="previous-annotation-track" data-track-label="历史"></div>
-          <div class="annotation-track" id="annotation-track" data-track-label="本轮"></div>
+          <div class="timeline-view-controls" id="timeline-view-controls" aria-label="标注结果视图">
+            <button class="active" data-timeline-view="effective" type="button" aria-pressed="true">当前有效结果</button>
+            <button data-timeline-view="changes" type="button" aria-pressed="false">本轮变更</button>
+            <button data-timeline-view="history" type="button" aria-pressed="false">历史来源</button>
+          </div>
+          <div class="effective-annotation-tracks" id="annotation-track"></div>
           <input class="timeline-range" id="timeline-range" type="range" min="0" max="1000000" step="1" value="0" />
           <div class="timeline-ticks"><span>0:00</span><span>25%</span><span>50%</span><span>75%</span><span id="timeline-end">0:00</span></div>
         </section>
@@ -179,28 +187,15 @@
           </div>
         </section>
 
-        <section class="panel-section previous-review-section" id="previous-review-section" hidden>
+        <section class="panel-section annotations-section expanded" id="current-annotations-section">
           <div class="section-heading annotation-heading">
-            <div><span class="eyebrow">只读对照</span><h3>上一轮质检</h3></div>
-            <div class="previous-review-actions">
-              <span class="section-count" id="previous-review-count">0</span>
-              <button id="toggle-previous-review" type="button" aria-expanded="false">展开</button>
-            </div>
-          </div>
-          <div class="previous-review-summary" id="previous-review-summary"></div>
-          <div class="previous-review-source" id="previous-review-source"></div>
-          <div class="previous-review-list" id="previous-review-list"></div>
-        </section>
-
-        <section class="panel-section annotations-section" id="current-annotations-section">
-          <div class="section-heading annotation-heading">
-            <div><span class="eyebrow">已添加</span><h3>当前标注</h3></div>
+            <div><span class="eyebrow">增量质检</span><h3>本条有效标注</h3></div>
             <div class="current-annotation-actions">
               <span class="section-count" id="annotation-count">0</span>
-              <button id="toggle-current-annotations" type="button" aria-expanded="false">展开</button>
+              <button id="toggle-current-annotations" type="button" aria-expanded="true">收起</button>
             </div>
           </div>
-          <p class="section-helper">单击标注可修改时间、级别和备注</p>
+          <p class="section-helper">历史标注已合并到当前结果；单击即可按本轮修改，删除后保留变更记录</p>
           <div class="annotation-list" id="annotation-list"><div class="empty-panel">暂无标注</div></div>
         </section>
 
@@ -220,6 +215,20 @@
           <button class="needs-recheck" id="needs-recheck" type="button"><strong>标记为待复核</strong><small>暂不设置最终结论</small></button>
         </section>
       </aside>
+
+      <footer class="review-footer">
+        <div class="review-summary" id="review-summary">
+          <strong>本轮变更</strong>
+          <span>新增 <b id="review-added-count">0</b></span>
+          <span>修改 <b id="review-modified-count">0</b></span>
+          <span>移除 <b id="review-removed-count">0</b></span>
+          <span>原样保留 <b id="review-preserved-count">0</b></span>
+        </div>
+        <div class="review-footer-actions">
+          <button class="button primary" id="confirm-current-episode" type="button" disabled>确认本条并继续</button>
+          <button class="button flow-submit" id="submit-flow-task" type="button" hidden>提交本轮质检到 Flow</button>
+        </div>
+      </footer>
     </div>
 
     <div class="toast-stack" id="toast-stack" role="status" aria-live="polite" aria-atomic="true"></div>
@@ -267,6 +276,7 @@
       <form method="dialog" id="annotation-edit-form">
         <div class="dialog-heading"><h3>编辑标注</h3><button value="cancel" type="submit">×</button></div>
         <input id="edit-id" type="hidden" />
+        <p class="edit-provenance" id="edit-provenance" hidden></p>
         <div class="edit-times">
           <label>起点（秒）<input id="edit-start" type="number" min="0" step="0.001" /></label>
           <label>终点（秒）<input id="edit-end" type="number" min="0" step="0.001" /></label>

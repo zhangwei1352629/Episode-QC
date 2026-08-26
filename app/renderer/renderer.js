@@ -16,6 +16,8 @@ const $ = (id) => document.getElementById(id);
 
 const els = {
   workspaceName: $("workspace-name"), reviewerName: $("reviewer-name"), importLabels: $("import-labels"),
+  headerTaskSummary: $("header-task-summary"), headerLabelVersion: $("header-label-version"),
+  headerReviewRound: $("header-review-round"),
   nasStatus: $("nas-status"),
   exportFormat: $("export-format"), exportResults: $("export-results"), addSource: $("add-source"), saveState: $("save-state"),
   toggleEpisodes: $("toggle-episodes"), toggleLabels: $("toggle-labels"), toolMenu: $("tool-menu"),
@@ -27,24 +29,25 @@ const els = {
   motionCard: $("motion-card"), motionCanvas: $("motion-canvas"), motionEmpty: $("motion-empty"), jointLabelLayer: $("joint-label-layer"),
   motionSource: $("motion-source"), jointSelector: $("joint-selector"), jointLabels: $("joint-labels"), resetView: $("reset-view"), selectedJoint: $("selected-joint"),
   cameraGrid: $("camera-grid"), selectionLabel: $("selection-label"), markIn: $("mark-in"), markOut: $("mark-out"),
-  loopSelection: $("loop-selection"), coverageTracks: $("coverage-tracks"), previousAnnotationTrack: $("previous-annotation-track"), annotationTrack: $("annotation-track"),
-  timelineRange: $("timeline-range"), timelineEnd: $("timeline-end"), scopeTabs: $("scope-tabs"),
+  loopSelection: $("loop-selection"), coverageTracks: $("coverage-tracks"), annotationTrack: $("annotation-track"),
+  timelineViewControls: $("timeline-view-controls"), timelineRange: $("timeline-range"), timelineEnd: $("timeline-end"), scopeTabs: $("scope-tabs"),
   labelSearch: $("label-search"), labelGroupFilter: $("label-group-filter"), labelCount: $("label-count"),
   labelSetMeta: $("label-set-meta"), targetContext: $("target-context"), labelList: $("label-list"),
   annotationComment: $("annotation-comment"), undo: $("undo"), redo: $("redo"),
   annotationCount: $("annotation-count"), annotationList: $("annotation-list"), decisionGrid: $("decision-grid"), decisionCurrent: $("decision-current"),
   annotationsSection: $("current-annotations-section"),
   toggleCurrentAnnotations: $("toggle-current-annotations"),
-  previousReviewSection: $("previous-review-section"), previousReviewCount: $("previous-review-count"),
-  previousReviewSummary: $("previous-review-summary"), previousReviewSource: $("previous-review-source"), previousReviewList: $("previous-review-list"), togglePreviousReview: $("toggle-previous-review"),
   needsRecheck: $("needs-recheck"), toastStack: $("toast-stack"), taskCenterToastStack: $("task-center-toast-stack"), annotationEditor: $("annotation-editor"),
   editId: $("edit-id"), editStart: $("edit-start"), editEnd: $("edit-end"), editSeverity: $("edit-severity"),
-  editAction: $("edit-action"), editComment: $("edit-comment"), deleteAnnotation: $("delete-annotation"),
+  editAction: $("edit-action"), editComment: $("edit-comment"), editProvenance: $("edit-provenance"), deleteAnnotation: $("delete-annotation"),
   saveEdit: $("save-edit"), currentTaskName: $("current-task-name"), currentTaskCode: $("current-task-code"),
   currentTaskPath: $("current-task-path"), currentTaskStatus: $("current-task-status"),
   openTaskCenter: $("open-task-center"), rescanTask: $("rescan-task"), taskCenter: $("task-center"),
   closeTaskCenter: $("close-task-center"), taskCenterSummary: $("task-center-summary"),
   taskList: $("task-list"), taskCenterImport: $("task-center-import"), submitFlowTask: $("submit-flow-task"),
+  confirmCurrentEpisode: $("confirm-current-episode"), reviewSummary: $("review-summary"),
+  reviewAddedCount: $("review-added-count"), reviewModifiedCount: $("review-modified-count"),
+  reviewRemovedCount: $("review-removed-count"), reviewPreservedCount: $("review-preserved-count"),
   clearLocalTaskHistory: $("clear-local-task-history"),
   flowTaskStatus: $("flow-task-status"), flowTaskList: $("flow-task-list"),
   flowTaskPanel: $("flow-task-panel"), localTaskPanel: $("local-task-panel"),
@@ -92,13 +95,15 @@ const state = {
   drag: null,
   timelineSelecting: false,
   timelineAnchorNs: null,
+  timelineSurface: null,
   reviewerTimer: null,
   platform: { enabled: true, connected: false, jobs: [] },
   platformReviewers: [],
   labelSets: [],
   pendingFlowJobCode: null,
   flowPollTimer: null,
-  expandedFlowTaskKeys: new Set()
+  expandedFlowTaskKeys: new Set(),
+  timelineView: "effective"
 };
 
 const g1Viewer = new G1Viewer(els.motionCanvas, (status, error) => {
@@ -246,20 +251,32 @@ function bindEvents() {
     }
   });
   els.labelList.addEventListener("click", (event) => {
+    const focus = event.target.closest("[data-focus-label]");
+    if (focus) {
+      focusLabelAnnotations(focus.dataset.focusLabel);
+      return;
+    }
     const button = event.target.closest("[data-label-code]");
-    if (button) createAnnotation(button.dataset.labelCode);
+    if (!button) return;
+    if (button.dataset.focusOnly === "true") focusLabelAnnotations(button.dataset.labelCode);
+    else createAnnotation(button.dataset.labelCode);
   });
   els.annotationList.addEventListener("click", (event) => {
     const item = event.target.closest("[data-annotation-id]");
     if (item) openAnnotationEditor(item.dataset.annotationId);
   });
-  els.previousReviewList.addEventListener("click", seekPreviousReview);
-  els.previousAnnotationTrack.addEventListener("click", seekPreviousReview);
   els.toggleCurrentAnnotations.addEventListener("click", () => {
     setCurrentAnnotationsExpanded(!els.annotationsSection.classList.contains("expanded"));
   });
-  els.togglePreviousReview.addEventListener("click", () => {
-    setPreviousReviewExpanded(!els.previousReviewSection.classList.contains("expanded"));
+  els.timelineViewControls.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-timeline-view]");
+    if (!button) return;
+    state.timelineView = button.dataset.timelineView;
+    els.timelineViewControls.querySelectorAll("button").forEach((item) => {
+      item.classList.toggle("active", item === button);
+      item.setAttribute("aria-pressed", String(item === button));
+    });
+    renderAnnotations();
   });
   els.annotationTrack.addEventListener("click", (event) => {
     const item = event.target.closest("[data-annotation-id]");
@@ -277,6 +294,7 @@ function bindEvents() {
   });
   els.undo.addEventListener("click", undo);
   els.redo.addEventListener("click", redo);
+  els.confirmCurrentEpisode.addEventListener("click", confirmCurrentEpisode);
   els.decisionGrid.addEventListener("click", (event) => {
     const button = event.target.closest("[data-decision]");
     if (button) setDecision(button.dataset.decision);
@@ -315,8 +333,7 @@ function bindEvents() {
 function restoreWorkspaceLayout() {
   setWorkspacePanel("episodes", window.localStorage.getItem("episodeQcEpisodesVisible") !== "false", false);
   setWorkspacePanel("labels", window.localStorage.getItem("episodeQcLabelsVisible") !== "false", false);
-  setCurrentAnnotationsExpanded(window.localStorage.getItem("episodeQcCurrentAnnotationsExpanded") === "true", false);
-  setPreviousReviewExpanded(window.localStorage.getItem("episodeQcPreviousReviewExpanded") === "true", false);
+  setCurrentAnnotationsExpanded(window.localStorage.getItem("episodeQcCurrentAnnotationsExpanded") !== "false", false);
 }
 
 function toggleWorkspacePanel(panel) {
@@ -333,13 +350,6 @@ function setWorkspacePanel(panel, visible, persist = true) {
   button.classList.toggle("active", visible);
   if (persist) window.localStorage.setItem(isEpisodes ? "episodeQcEpisodesVisible" : "episodeQcLabelsVisible", String(visible));
   window.setTimeout(drawMotion, 190);
-}
-
-function setPreviousReviewExpanded(expanded, persist = true) {
-  els.previousReviewSection.classList.toggle("expanded", expanded);
-  els.togglePreviousReview.setAttribute("aria-expanded", String(expanded));
-  els.togglePreviousReview.textContent = expanded ? "收起" : "展开";
-  if (persist) window.localStorage.setItem("episodeQcPreviousReviewExpanded", String(expanded));
 }
 
 function setCurrentAnnotationsExpanded(expanded, persist = true) {
@@ -378,6 +388,7 @@ function handleEpisodeCacheReady(payload) {
 
 function renderTaskContext() {
   const task = state.currentTask;
+  renderHeaderContext();
   els.currentTaskName.textContent = task?.task_name || "尚未导入任务";
   els.currentTaskCode.textContent = task?.task_code || "—";
   const taskPath = task?.local_source_path || task?.source_uri || "点击“导入新任务”选择数据目录";
@@ -389,9 +400,14 @@ function renderTaskContext() {
   els.currentTaskStatus.dataset.status = task?.status || "empty";
   els.rescanTask.disabled = !task;
   const flowTask = Boolean(task?.origin === "flow" && task?.flow_job_code);
-  els.submitFlowTask.hidden = !flowTask || !["completed", "submitted"].includes(task.status);
-  els.submitFlowTask.disabled = task?.status === "submitted";
-  els.submitFlowTask.textContent = task?.status === "submitted" ? "已提交 Flow" : "提交到 Flow";
+  els.submitFlowTask.hidden = !flowTask;
+  els.submitFlowTask.disabled = !task || !["completed", "submitted"].includes(task.status);
+  els.submitFlowTask.textContent = task?.status === "submitted"
+    ? "已提交到 Flow"
+    : task?.status === "completed"
+      ? "提交本轮质检到 Flow"
+      : "完成全部 Episode 后提交";
+  renderReviewFooter();
 
   const completedTasks = state.tasks.filter((item) => ["completed", "submitted", "archived"].includes(item.status)).length;
   const failedTasks = state.tasks.filter((item) => item.status === "failed").length;
@@ -425,6 +441,23 @@ function renderTaskContext() {
         <span class="task-list-progress"><strong>${item.completed_count}/${item.episode_count}</strong><span>${formatBytes(item.source_size_bytes)} · 异常 ${item.error_count}</span></span>
       </button>`;
   }).join("");
+}
+
+function renderHeaderContext() {
+  const task = state.currentTask;
+  const episode = state.detail?.episode
+    || state.episodes.find((item) => item.id === state.currentEpisodeId)
+    || state.episodes[0]
+    || null;
+  const schema = state.labelSchema?.schema || {};
+  const taskCode = task?.flow_job_code || task?.task_code || "—";
+  const taskName = task?.task_name || "尚未选择 QC 任务";
+  els.headerTaskSummary.textContent = task ? `${taskCode} · ${taskName}` : taskName;
+  els.headerTaskSummary.title = task ? `${taskCode} · ${taskName}` : taskName;
+  els.headerLabelVersion.textContent = schema.schema_version
+    ? `标签 V${schema.schema_version}`
+    : "标签 —";
+  els.headerReviewRound.textContent = `当前 R${episode ? currentReviewRound(episode) : 1}`;
 }
 
 async function refreshPlatformJobs({ quiet = false } = {}) {
@@ -924,9 +957,8 @@ function renderEpisodeList() {
   }
   els.episodeList.innerHTML = state.filteredEpisodes.map((episode) => {
     const previous = episode.previous_review;
-    const previousAnnotations = Array.isArray(previous?.annotations) ? previous.annotations : [];
     const previousBadge = previous
-      ? `<em class="history-label-badge" title="上一轮质检">${previousAnnotations.length ? `历史 ${previousAnnotations.length}` : "历史结论"}</em>`
+      ? `<em class="history-label-badge" title="当前为第 ${currentReviewRound(episode)} 轮质检">R${currentReviewRound(episode)}</em>`
       : "";
     return `
       <button class="episode-item ${episode.id === state.currentEpisodeId ? "active" : ""}" data-episode-id="${escapeHtml(episode.id)}" data-status="${escapeHtml(episode.review_status)}" type="button">
@@ -934,7 +966,7 @@ function renderEpisodeList() {
         <span class="episode-copy">
           <strong>${escapeHtml(episode.episode_name)}</strong>
           <span title="${escapeHtml(episode.relative_path)}">${escapeHtml(episode.relative_path)}</span>
-          <span class="episode-badges"><em class="status-badge">${escapeHtml(reviewStatusName(episode.review_status))}</em>${episode.quality_decision ? `<em class="decision-badge">${escapeHtml(decisionName(episode.quality_decision))}</em>` : ""}<em>${episode.camera_count} CAM</em><em>${episode.mocap_available ? "MOCAP" : "无 MOCAP"}</em><em>${episode.annotation_count} 本轮</em>${previousBadge}</span>
+          <span class="episode-badges"><em class="status-badge">${escapeHtml(episodeReviewStatusName(episode))}</em>${episode.quality_decision ? `<em class="decision-badge">${escapeHtml(decisionName(episode.quality_decision))}</em>` : ""}<em>${episode.camera_count} CAM</em><em>${episode.mocap_available ? "MOCAP" : "无 MOCAP"}</em><em>${episode.annotation_count} 有效标注</em>${previousBadge}</span>
         </span>
         <time>${formatDuration(episode.duration_sec || 0)}</time>
       </button>`;
@@ -1005,13 +1037,13 @@ async function reloadCurrentEpisode() {
 function renderEpisodeDetail() {
   if (!state.detail) return;
   const episode = state.detail.episode;
+  renderHeaderContext();
   els.currentEpisode.textContent = episode.episode_name;
   els.episodeMeta.textContent = `${episode.data_group} · ${episode.camera_count} 路相机 · ${episode.mocap_available ? "Mocap 可解析" : "Mocap 不可用"} · ${episode.relative_path}`;
   els.durationTime.textContent = formatClock(state.durationNs);
   els.timelineEnd.textContent = formatDuration(state.durationNs / 1e9);
   renderClock();
   renderCoverageTracks();
-  renderPreviousReview();
   renderAnnotations();
   renderLabels();
   renderDecision();
@@ -1030,20 +1062,16 @@ function clearEpisodeView() {
   state.selectionEndNs = null;
   state.durationNs = 0;
   state.playheadNs = 0;
+  renderHeaderContext();
   els.currentEpisode.textContent = "未选择 Episode";
   els.episodeMeta.textContent = "请选择左侧数据";
   els.cameraGrid.innerHTML = '<div class="empty-panel">当前 Episode 的有效相机会在此动态显示</div>';
   els.motionEmpty.hidden = false;
   els.motionEmpty.textContent = "选择 Episode 后显示 G1 29DOF 机器人";
   els.coverageTracks.innerHTML = "";
-  els.previousAnnotationTrack.innerHTML = "";
   els.annotationTrack.innerHTML = "";
   els.annotationList.innerHTML = '<div class="empty-panel">暂无标注</div>';
   els.annotationCount.textContent = "0";
-  els.previousReviewSection.hidden = true;
-  els.previousReviewSummary.innerHTML = "";
-  els.previousReviewSource.textContent = "";
-  els.previousReviewList.innerHTML = "";
   renderJointOptions([]);
   renderMotionSourceOptions();
   state.selectedCameraId = null;
@@ -1054,6 +1082,7 @@ function clearEpisodeView() {
   renderClock();
   renderSelection();
   renderDecision();
+  renderReviewFooter();
   updatePlaybackButton();
   syncInteractiveState();
   drawMotion();
@@ -1148,13 +1177,20 @@ function renderMotionSourceOptions() {
 }
 
 function renderCoverageTracks() {
-  const streams = (state.detail?.streams || []).filter((item) => item.available);
-  const priority = { mocap: 0, camera: 1 };
-  const visible = [...streams].sort((a, b) => (priority[a.stream_type] ?? 3) - (priority[b.stream_type] ?? 3)).slice(0, 7);
-  els.coverageTracks.innerHTML = visible.map((stream) => `
-    <div class="coverage-row ${escapeHtml(stream.stream_type)}" title="${escapeHtml(stream.topic)} · ${stream.message_count} 条">
-      <span>${escapeHtml(stream.display_name)}</span><span class="coverage-bar"><i></i></span>
-    </div>`).join("");
+  const streams = state.detail?.streams || [];
+  const cameras = streams.filter((item) => item.stream_type === "camera" && item.available);
+  const mocapAvailable = streams.some((item) => item.stream_type === "mocap" && item.available);
+  const sourceLabel = `${cameras.length} 路相机${mocapAvailable ? " + Mocap" : " · 无 Mocap"}`;
+  const complete = cameras.length > 0 && mocapAvailable;
+  const messageCount = streams
+    .filter((item) => item.available)
+    .reduce((total, item) => total + Number(item.message_count || 0), 0);
+  els.coverageTracks.innerHTML = `
+    <div class="data-source-sync ${complete ? "complete" : "partial"}" title="${escapeHtml(sourceLabel)} · 合计 ${messageCount} 条消息">
+      <span><strong>数据源同步</strong><small>${escapeHtml(sourceLabel)}</small></span>
+      <span class="coverage-bar"><i></i></span>
+      <em>${complete ? "完整" : "部分可用"}</em>
+    </div>`;
 }
 
 async function requestVisualFrames(force = false) {
@@ -1288,6 +1324,7 @@ function renderSelection() {
 
 function renderLabels() {
   const labels = state.labelSchema?.labels || [];
+  const annotations = state.detail?.annotations || [];
   const groups = new Map((state.labelSchema?.groups || []).map((item) => [item.code, groupDisplayName(item.code, item.name)]));
   const groupCodes = [...new Set(labels.filter((label) => label.enabled !== false).map((label) => label.group).filter(Boolean))];
   const selectedGroup = els.labelGroupFilter.value;
@@ -1299,9 +1336,10 @@ function renderLabels() {
   const activeGroup = els.labelGroupFilter.value;
   const query = els.labelSearch.value.trim().toLowerCase();
   const enabled = labels.filter((label) => label.enabled !== false);
-  const visible = enabled.filter((label) => label.annotation_scopes?.includes(state.scope) && (activeGroup === "all" || label.group === activeGroup) && (!query || `${label.code} ${label.name} ${label.description || ""}`.toLowerCase().includes(query)));
+  const annotatedCodes = new Set(annotations.map((annotation) => annotation.label_code));
+  const visible = enabled.filter((label) => (label.annotation_scopes?.includes(state.scope) || annotatedCodes.has(label.code)) && (activeGroup === "all" || label.group === activeGroup) && (!query || `${label.code} ${label.name} ${label.description || ""}`.toLowerCase().includes(query)));
   const currentTarget = currentAnnotationTarget();
-  const usable = visible.filter((label) => labelSupportsTarget(label, currentTarget));
+  const usable = visible.filter((label) => label.annotation_scopes?.includes(state.scope) && labelSupportsTarget(label, currentTarget));
   const schemaHeader = state.labelSchema?.schema || {};
   const labelSetName = labelSetDisplayName(schemaHeader.label_set_id, schemaHeader.label_set_name);
   const versionText = schemaHeader.schema_version ? ` · v${schemaHeader.schema_version}` : "";
@@ -1314,14 +1352,20 @@ function renderLabels() {
   }
   els.labelList.innerHTML = visible.map((label) => {
     const supported = labelSupportsTarget(label, currentTarget);
-    const enabledForEpisode = supported && Boolean(state.detail);
+    const scopeSupported = label.annotation_scopes?.includes(state.scope);
+    const enabledForEpisode = supported && scopeSupported && Boolean(state.detail);
     const targetHint = targetTypesDescription(label.target_types || []);
     const title = supported
       ? `${label.name} · ${groups.get(label.group) || groupDisplayName(label.group)}${label.description ? `\n${label.description}` : ""}`
       : `当前对象“${currentTarget.displayName}”不可用；该标签支持：${targetHint}`;
+    const relatedAnnotations = annotations.filter((annotation) => annotation.label_code === label.code);
+    const annotationStatus = labelAnnotationStatus(relatedAnnotations);
+    const focusOnly = !enabledForEpisode && relatedAnnotations.length > 0;
     return `
-    <button class="label-button${enabledForEpisode ? "" : " target-disabled"}" data-label-code="${escapeHtml(label.code)}" style="--label-color:${escapeHtml(label.color || "#8c959f")}" title="${escapeHtml(state.detail ? title : "请先选择 Episode")}" type="button"${enabledForEpisode ? "" : " disabled"}>
-      <i class="label-color"></i><span class="label-copy"><strong>${escapeHtml(label.name)}</strong><small>${escapeHtml(supported ? (groups.get(label.group) || label.group) : `仅支持：${targetHint}`)}</small></span>${label.shortcut ? `<kbd>${escapeHtml(label.shortcut)}</kbd>` : ""}
+    <button class="label-button${enabledForEpisode ? "" : focusOnly ? " label-view-only" : " target-disabled"}" data-label-code="${escapeHtml(label.code)}" data-focus-only="${focusOnly}" style="--label-color:${escapeHtml(label.color || "#8c959f")}" title="${escapeHtml(focusOnly ? "当前范围不可新增；点击定位已有标注" : state.detail ? title : "请先选择 Episode")}" type="button"${enabledForEpisode || focusOnly ? "" : " disabled"}>
+      <i class="label-color"></i>
+      <span class="label-copy"><strong>${escapeHtml(label.name)}</strong><small>${escapeHtml(supported ? (groups.get(label.group) || label.group) : `仅支持：${targetHint}`)}</small></span>
+      <span class="label-button-meta">${annotationStatus ? `<span class="label-annotation-status ${annotationStatus.tone}" data-focus-label="${escapeHtml(label.code)}" title="定位该标签的全部有效标注">${escapeHtml(annotationStatus.text)}</span>` : ""}${label.shortcut ? `<kbd>${escapeHtml(label.shortcut)}</kbd>` : ""}</span>
     </button>`;
   }).join("");
 }
@@ -1467,84 +1511,118 @@ function renderAnnotations() {
   if (!annotations.length) els.annotationList.innerHTML = '<div class="empty-panel">暂无标注</div>';
   else els.annotationList.innerHTML = annotations.map((annotation) => {
     const label = labels.get(annotation.label_code) || { name: annotation.label_code, color: "#8c959f" };
-    return `<div class="annotation-item" data-annotation-id="${escapeHtml(annotation.annotation_id)}"><i style="background:${escapeHtml(label.color || "#8c959f")}"></i><span><strong>${escapeHtml(label.name)}</strong><small>${escapeHtml(annotationTargetName(annotation))} · ${escapeHtml(severities.get(annotation.severity) || annotation.severity || "未分级")}</small></span><time>${annotation.scope === "episode" ? "整条" : annotation.scope === "time_point" ? formatClock(annotation.start_offset_ns) : `${formatClock(annotation.start_offset_ns)}–${formatClock(annotation.end_offset_ns)}`}</time></div>`;
+    const round = annotationRoundMeta(annotation);
+    const badgeTitle = round.inherited
+      ? `从历史质检结果继承，可修改或删除；首次 R${round.originRound}，最近 R${round.lastRound}`
+      : `本轮 R${round.lastRound} 新增`;
+    return `<div class="annotation-item ${round.tone}" data-annotation-id="${escapeHtml(annotation.annotation_id)}"><i style="background:${escapeHtml(label.color || "#8c959f")}"></i><span><strong>${escapeHtml(label.name)}<em class="inherited-annotation-badge" title="${escapeHtml(badgeTitle)}">${escapeHtml(round.badge)}</em></strong><small>${escapeHtml(annotationTargetName(annotation))} · ${escapeHtml(severities.get(annotation.severity) || annotation.severity || "未分级")}</small></span><time>${annotationTiming(annotation)}</time></div>`;
   }).join("");
-  els.annotationTrack.innerHTML = annotations.map((annotation) => {
-    const label = labels.get(annotation.label_code) || {};
-    const left = state.durationNs ? (annotation.start_offset_ns / state.durationNs) * 100 : 0;
-    const width = annotation.scope === "time_point" ? 0.35 : state.durationNs ? Math.max(.35, ((annotation.end_offset_ns - annotation.start_offset_ns) / state.durationNs) * 100) : .35;
-    return `<i class="annotation-block" data-annotation-id="${escapeHtml(annotation.annotation_id)}" title="${escapeHtml(label.name || annotation.label_code)}" style="left:${left}%;width:${width}%;background:${escapeHtml(label.color || "#8c959f")}"></i>`;
-  }).join("");
+  renderAnnotationLanes(annotations, labels);
+  const summary = summarizeAnnotationChanges(
+    annotations,
+    state.detail?.deleted_annotation_lineages || [],
+  );
+  syncCurrentEpisodeIncrementalSummary(summary);
+  renderReviewFooter();
+  renderEpisodeList();
+  renderLabels();
 }
 
-function renderPreviousReview() {
-  const previous = state.detail?.episode?.previous_review;
-  if (!previous) {
-    els.previousReviewSection.hidden = true;
-    els.previousReviewCount.textContent = "0";
-    els.previousReviewSummary.innerHTML = "";
-    els.previousReviewSource.textContent = "";
-    els.previousReviewList.innerHTML = "";
-    els.previousAnnotationTrack.innerHTML = "";
+function renderAnnotationLanes(annotations, labels) {
+  const visible = annotations.filter((annotation) => {
+    const round = annotationRoundMeta(annotation);
+    if (state.timelineView === "changes") return round.tone === "added" || round.tone === "modified";
+    if (state.timelineView === "history") return round.inherited;
+    return true;
+  });
+  const grouped = new Map();
+  visible.forEach((annotation) => {
+    if (!grouped.has(annotation.label_code)) grouped.set(annotation.label_code, []);
+    grouped.get(annotation.label_code).push(annotation);
+  });
+  if (!grouped.size) {
+    els.annotationTrack.innerHTML = `<div class="timeline-empty">${state.timelineView === "changes" ? "本条暂时没有新增或修改" : "暂无有效标注"}</div>`;
     return;
   }
-  const annotations = Array.isArray(previous.annotations) ? previous.annotations : [];
-  const labelSet = previous.label_set || {};
-  const source = previous.source || {};
-  const grade = ({ excellent: "优", good: "良", fair: "中", poor: "差", invalid: "无效" })[previous.quality_grade] || previous.quality_grade || "未记录";
-  els.previousReviewSection.hidden = false;
-  els.previousReviewCount.textContent = String(annotations.length);
-  els.previousReviewSummary.innerHTML = `
-    <span><strong>${escapeHtml(decisionName(previous.decision) || "未记录")}</strong><small>结论</small></span>
-    <span><strong>${escapeHtml(grade)}</strong><small>等级</small></span>
-    <span><strong>${escapeHtml(previous.reviewer_name || "历史导入")}</strong><small>质检员</small></span>
-    <span><strong>V${escapeHtml(labelSet.schema_version || previous.attempt_version || "-")}</strong><small>标签版本</small></span>`;
-  const sourceParts = [];
-  if (source.source_file_name) sourceParts.push(`文件 ${source.source_file_name}`);
-  if (source.annotation_record_id) sourceParts.push(`飞书 ${source.annotation_record_id}`);
-  if (source.archive_sha256) sourceParts.push(`摘要 ${String(source.archive_sha256).slice(0, 12)}…`);
-  els.previousReviewSource.textContent = sourceParts.length
-    ? `来源：${sourceParts.join(" · ")}`
-    : "来源：Flow 历史质检事实";
-  els.previousReviewList.innerHTML = annotations.length
-    ? annotations.map((annotation) => {
-        const color = /^#[0-9A-Fa-f]{6}$/.test(String(annotation.label_color || "")) ? annotation.label_color : "#8c959f";
-        const timing = previousAnnotationTiming(annotation);
-        const target = annotationTargetName(annotation);
-        const note = [annotation.severity || "未分级", target, annotation.comment || ""].filter(Boolean).join(" · ");
-        return `<button type="button" class="previous-review-item" data-previous-start-ns="${safePreviousOffset(annotation.start_offset_ns)}" title="跳转到 ${escapeHtml(timing)}"><i style="background:${color}"></i><span><strong>${escapeHtml(annotation.label_name || annotation.label_code || "历史标签")}</strong><small>${escapeHtml(note)}</small></span><time>${escapeHtml(timing)}</time></button>`;
-      }).join("")
-    : '<div class="previous-review-empty">上一轮已完成，未记录问题标签</div>';
-  els.previousAnnotationTrack.innerHTML = annotations.map((annotation) => {
-    const color = /^#[0-9A-Fa-f]{6}$/.test(String(annotation.label_color || "")) ? annotation.label_color : "#8c959f";
-    const startNs = annotation.scope === "episode" ? 0 : safePreviousOffset(annotation.start_offset_ns);
-    const endNs = annotation.scope === "episode" ? state.durationNs : safePreviousOffset(annotation.end_offset_ns);
-    const left = state.durationNs ? Math.max(0, Math.min(100, (startNs / state.durationNs) * 100)) : 0;
-    const width = annotation.scope === "time_point"
-      ? .35
-      : state.durationNs
-        ? Math.max(.35, Math.min(100 - left, ((Math.max(startNs, endNs) - startNs) / state.durationNs) * 100))
-        : .35;
-    const name = annotation.label_name || annotation.label_code || "历史标签";
-    const timing = previousAnnotationTiming(annotation);
-    return `<button type="button" class="history-annotation-block" data-previous-start-ns="${startNs}" aria-label="上一轮：${escapeHtml(name)}，${escapeHtml(timing)}" title="${escapeHtml(name)} · ${escapeHtml(timing)}" style="left:${left}%;width:${width}%;background:${color};border-color:${color}"></button>`;
+  els.annotationTrack.innerHTML = [...grouped.entries()].map(([labelCode, items]) => {
+    const label = labels.get(labelCode) || { name: labelCode, color: "#8c959f" };
+    const blocks = items.map((annotation) => {
+      const round = annotationRoundMeta(annotation);
+      const startNs = annotation.scope === "episode" ? 0 : Math.max(0, Number(annotation.start_offset_ns) || 0);
+      const endNs = annotation.scope === "episode" ? state.durationNs : Math.max(startNs, Number(annotation.end_offset_ns) || 0);
+      const left = state.durationNs ? Math.max(0, Math.min(100, (startNs / state.durationNs) * 100)) : 0;
+      const width = state.durationNs ? Math.max(.7, Math.min(100 - left, ((endNs - startNs) / state.durationNs) * 100)) : .7;
+      const pointClass = annotation.scope === "time_point" ? " annotation-point" : "";
+      return `<button type="button" class="annotation-block ${round.tone}${pointClass}" data-annotation-id="${escapeHtml(annotation.annotation_id)}" aria-label="${escapeHtml(label.name)}，${escapeHtml(annotationTiming(annotation))}，${escapeHtml(round.badge)}" title="${escapeHtml(label.name)} · ${escapeHtml(annotationTiming(annotation))} · ${escapeHtml(round.badge)}" style="--annotation-left:${left}%;--annotation-width:${width}%;--annotation-color:${escapeHtml(label.color || "#8c959f")}"><span>${escapeHtml(round.shortBadge)}</span></button>`;
+    }).join("");
+    return `<div class="effective-annotation-lane" data-label-lane="${escapeHtml(labelCode)}"><div class="annotation-lane-label" title="${escapeHtml(label.name)}"><i style="background:${escapeHtml(label.color || "#8c959f")}"></i><span>${escapeHtml(label.name)}</span></div><div class="annotation-lane-surface">${blocks}</div></div>`;
   }).join("");
 }
 
-function safePreviousOffset(value) {
-  return Math.max(0, Number(value) || 0);
-}
-
-function previousAnnotationTiming(annotation) {
+function annotationTiming(annotation) {
   if (annotation.scope === "episode") return "整条";
   if (annotation.scope === "time_point") return formatClock(annotation.start_offset_ns);
   return `${formatClock(annotation.start_offset_ns)}–${formatClock(annotation.end_offset_ns)}`;
 }
 
-function seekPreviousReview(event) {
-  const item = event.target.closest("[data-previous-start-ns]");
-  if (!item) return;
-  seekTo(Number(item.dataset.previousStartNs));
+function currentReviewRound(episode = state.detail?.episode) {
+  const historyCount = Number(episode?.review_history_count || 0);
+  return Math.max(1, historyCount + 1);
+}
+
+function annotationRoundMeta(annotation) {
+  const source = annotation.attributes?._incremental_source;
+  const currentRound = currentReviewRound();
+  const inherited = Boolean(source);
+  const sourceRound = Math.max(1, Number(source?.round_number || source?.origin_round_number || 1));
+  const originRound = Math.max(1, Number(source?.origin_round_number || sourceRound));
+  const modified = inherited && Boolean(annotation.created_at && annotation.updated_at && annotation.created_at !== annotation.updated_at);
+  if (!inherited) {
+    return { inherited: false, modified: false, originRound: currentRound, lastRound: currentRound, tone: "added", badge: `本轮新增 · R${currentRound}`, shortBadge: `R${currentRound}` };
+  }
+  if (modified) {
+    return { inherited: true, modified: true, originRound, lastRound: currentRound, tone: "modified", badge: `R${sourceRound}→R${currentRound} 已修改`, shortBadge: `R${sourceRound}→R${currentRound}` };
+  }
+  return { inherited: true, modified: false, originRound, lastRound: sourceRound, tone: "inherited", badge: `已标注 · R${sourceRound}`, shortBadge: `R${sourceRound}` };
+}
+
+function labelAnnotationStatus(annotations) {
+  if (!annotations.length) return null;
+  const metas = annotations.map(annotationRoundMeta);
+  const currentRound = currentReviewRound();
+  if (metas.some((item) => item.modified)) return { text: `${annotations.length}处 · R${currentRound} 已修改`, tone: "modified" };
+  if (metas.some((item) => !item.inherited)) return { text: `${annotations.length}处 · 本轮新增`, tone: "added" };
+  const rounds = [...new Set(metas.map((item) => item.lastRound))].sort((a, b) => a - b);
+  return { text: `${annotations.length}处 · ${rounds.map((round) => `R${round}`).join("/")}`, tone: "inherited" };
+}
+
+function summarizeAnnotationChanges(annotations, deletedLineages) {
+  const summary = { added: 0, modified: 0, removed: new Set(deletedLineages).size, preserved: 0 };
+  annotations.forEach((annotation) => {
+    const meta = annotationRoundMeta(annotation);
+    if (!meta.inherited) summary.added += 1;
+    else if (meta.modified) summary.modified += 1;
+    else summary.preserved += 1;
+  });
+  return summary;
+}
+
+function syncCurrentEpisodeIncrementalSummary(summary) {
+  const episode = state.episodes.find((item) => item.id === state.currentEpisodeId);
+  if (!episode) return;
+  episode.incremental_added_count = summary.added;
+  episode.incremental_modified_count = summary.modified;
+  episode.incremental_removed_count = summary.removed;
+  episode.incremental_preserved_count = summary.preserved;
+}
+
+function focusLabelAnnotations(labelCode) {
+  const lane = els.annotationTrack.querySelector(`[data-label-lane="${CSS.escape(labelCode)}"]`);
+  if (!lane) return;
+  lane.classList.remove("focused");
+  lane.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  requestAnimationFrame(() => lane.classList.add("focused"));
+  window.setTimeout(() => lane.classList.remove("focused"), 1200);
 }
 
 function openAnnotationEditor(annotationId) {
@@ -1558,6 +1636,11 @@ function openAnnotationEditor(annotationId) {
   fillSelect(els.editSeverity, state.labelSchema?.severity_levels || [], annotation.severity);
   fillSelect(els.editAction, state.labelSchema?.actions || [], annotation.action);
   els.editComment.value = annotation.comment || "";
+  const round = annotationRoundMeta(annotation);
+  els.editProvenance.hidden = false;
+  els.editProvenance.textContent = round.inherited
+    ? `首次标注 R${round.originRound} · 最近修改 R${round.lastRound} · 保存后记为 R${currentReviewRound()} 变更`
+    : `本轮 R${round.lastRound} 新增标注`;
   seekTo(annotation.start_offset_ns);
   els.annotationEditor.showModal();
 }
@@ -1595,10 +1678,16 @@ async function saveAnnotationEdit() {
 async function deleteCurrentAnnotation() {
   const annotationId = els.editId.value;
   if (!annotationId) return;
+  const annotation = state.detail?.annotations?.find((item) => item.annotation_id === annotationId);
   setSaveState("saving", "删除中…");
   try {
     await window.episodeQc.deleteAnnotation(annotationId);
     state.detail.annotations = state.detail.annotations.filter((item) => item.annotation_id !== annotationId);
+    const lineage = annotation?.attributes?._incremental_lineage_id;
+    const deletedLineages = state.detail.deleted_annotation_lineages ||= [];
+    if (lineage && !deletedLineages.includes(lineage)) {
+      deletedLineages.push(lineage);
+    }
     state.detail.episode.annotation_count = state.detail.annotations.length;
     updateEpisodeFromDetail();
     renderAnnotations();
@@ -1662,6 +1751,37 @@ function renderDecision() {
   els.decisionCurrent.classList.toggle("selected", Boolean(decision));
   els.needsRecheck.classList.toggle("active", episode?.review_status === "needs_recheck");
   els.needsRecheck.disabled = !episode;
+  renderReviewFooter();
+}
+
+function renderReviewFooter() {
+  const totals = state.episodes.reduce((summary, episode) => {
+    summary.added += Number(episode.incremental_added_count || 0);
+    summary.modified += Number(episode.incremental_modified_count || 0);
+    summary.removed += Number(episode.incremental_removed_count || 0);
+    summary.preserved += Number(episode.incremental_preserved_count || 0);
+    return summary;
+  }, { added: 0, modified: 0, removed: 0, preserved: 0 });
+  els.reviewAddedCount.textContent = String(totals.added);
+  els.reviewModifiedCount.textContent = String(totals.modified);
+  els.reviewRemovedCount.textContent = String(totals.removed);
+  els.reviewPreservedCount.textContent = String(totals.preserved);
+  const status = state.detail?.episode?.review_status;
+  els.confirmCurrentEpisode.disabled = !["completed", "reviewed", "needs_recheck"].includes(status);
+  els.confirmCurrentEpisode.textContent = status === "needs_recheck" ? "保存待复核并继续" : "确认本条并继续";
+}
+
+function confirmCurrentEpisode() {
+  const episode = state.detail?.episode;
+  if (!episode) return;
+  if (!["completed", "reviewed", "needs_recheck"].includes(episode.review_status)) {
+    toast("请先选择 Episode 结论或标记为待复核", "error");
+    return;
+  }
+  const currentIndex = state.filteredEpisodes.findIndex((item) => item.id === state.currentEpisodeId);
+  const next = state.filteredEpisodes[currentIndex + 1];
+  if (next) openEpisode(next.id);
+  else toast("当前筛选范围内的 Episode 已全部确认", "success");
 }
 
 function updateEpisodeFromDetail() {
@@ -1669,6 +1789,18 @@ function updateEpisodeFromDetail() {
   if (index >= 0) state.episodes[index] = { ...state.episodes[index], ...state.detail.episode };
   renderEpisodeList();
   refreshTaskSummaries();
+}
+
+function episodeReviewStatusName(episode) {
+  if (episode.review_status === "needs_recheck") return "待复核";
+  const hasPrevious = Boolean(episode.previous_review);
+  const changed = Number(episode.incremental_added_count || 0)
+    + Number(episode.incremental_modified_count || 0)
+    + Number(episode.incremental_removed_count || 0) > 0;
+  if (["completed", "reviewed"].includes(episode.review_status) && hasPrevious) return "本轮确认完成";
+  if (changed) return "本轮已修改";
+  if (episode.review_status === "unreviewed" && hasPrevious) return "已继承待确认";
+  return reviewStatusName(episode.review_status);
 }
 
 async function refreshTaskSummaries() {
@@ -1937,8 +2069,11 @@ function handleKeyboard(event) {
 
 function beginTimelineSelection(event) {
   if (event.target.closest("[data-annotation-id]") || !state.durationNs) return;
+  const surface = event.target.closest(".annotation-lane-surface");
+  if (!surface) return;
   state.timelineSelecting = true;
-  state.timelineAnchorNs = Math.round(timelineTimeFromPointer(event));
+  state.timelineSurface = surface;
+  state.timelineAnchorNs = Math.round(timelineTimeFromPointer(event, surface));
   state.selectionStartNs = state.timelineAnchorNs;
   state.selectionEndNs = state.selectionStartNs;
   els.annotationTrack.setPointerCapture?.(event.pointerId);
@@ -1947,7 +2082,7 @@ function beginTimelineSelection(event) {
 
 function updateTimelineSelection(event) {
   if (!state.timelineSelecting) return;
-  const time = Math.round(timelineTimeFromPointer(event));
+  const time = Math.round(timelineTimeFromPointer(event, state.timelineSurface));
   state.selectionStartNs = Math.min(state.timelineAnchorNs, time);
   state.selectionEndNs = Math.max(state.timelineAnchorNs, time);
   renderSelection();
@@ -1957,12 +2092,14 @@ function endTimelineSelection() {
   if (!state.timelineSelecting) return;
   state.timelineSelecting = false;
   state.timelineAnchorNs = null;
+  state.timelineSurface = null;
   if (state.selectionEndNs === state.selectionStartNs) state.selectionEndNs = Math.min(state.durationNs, state.selectionStartNs + Math.round(1e9 / 30));
   renderSelection();
 }
 
-function timelineTimeFromPointer(event) {
-  const rect = els.annotationTrack.getBoundingClientRect();
+function timelineTimeFromPointer(event, surface = null) {
+  const target = surface || event.target.closest?.(".annotation-lane-surface") || els.annotationTrack.querySelector(".annotation-lane-surface");
+  const rect = target?.getBoundingClientRect() || els.annotationTrack.getBoundingClientRect();
   const ratio = Math.max(0, Math.min(1, (event.clientX - rect.left) / Math.max(1, rect.width)));
   return ratio * state.durationNs;
 }

@@ -121,14 +121,36 @@ test("收起任务栏后标注区使用双栏布局并优化备注、当前标�
   assert.match(css, /\.decision-copy small\s*\{[^}]*display:\s*none/s);
 });
 
-test("当前标注默认收起并把主要高度留给标签列表", () => {
+test("本条有效标注默认展开并保留手动收起能力", () => {
   const html = fs.readFileSync(path.resolve(__dirname, "../renderer/index.html"), "utf8");
   const renderer = fs.readFileSync(path.resolve(__dirname, "../renderer/renderer.js"), "utf8");
   const css = fs.readFileSync(path.resolve(__dirname, "../renderer/styles.css"), "utf8");
 
-  assert.match(html, /id="toggle-current-annotations"[^>]*aria-expanded="false"/);
+  assert.match(html, /id="toggle-current-annotations"[^>]*aria-expanded="true"/);
   assert.match(renderer, /function setCurrentAnnotationsExpanded\(expanded, persist = true\)/);
   assert.match(renderer, /episodeQcCurrentAnnotationsExpanded/);
-  assert.match(css, /\.label-sidebar\s*\{[^}]*grid-template-rows:\s*minmax\(0, 1fr\) auto auto auto/s);
+  assert.match(css, /\.label-sidebar\s*\{[^}]*grid-template-rows:\s*minmax\(0, 1fr\) auto auto/s);
   assert.match(css, /\.annotations-section:not\(\.expanded\)[^{]*\.annotation-list\s*\{\s*display:\s*none/s);
+});
+
+test("顶栏持续显示当前任务、标签版本和质检轮次", () => {
+  const html = fs.readFileSync(path.resolve(__dirname, "../renderer/index.html"), "utf8");
+  const renderer = fs.readFileSync(path.resolve(__dirname, "../renderer/renderer.js"), "utf8");
+  const css = fs.readFileSync(path.resolve(__dirname, "../renderer/styles.css"), "utf8");
+
+  assert.match(html, /id="header-task-summary"/);
+  assert.match(html, /id="header-label-version"/);
+  assert.match(html, /id="header-review-round"/);
+  assert.match(renderer, /function renderHeaderContext\(\)/);
+  assert.match(renderer, /currentReviewRound\(episode\)/);
+  assert.match(css, /\.header-task-context\s*\{/);
+});
+
+test("时间轴结果筛选向辅助技术回报当前选中状态", () => {
+  const html = fs.readFileSync(path.resolve(__dirname, "../renderer/index.html"), "utf8");
+  const renderer = fs.readFileSync(path.resolve(__dirname, "../renderer/renderer.js"), "utf8");
+
+  assert.match(html, /data-timeline-view="effective"[^>]*aria-pressed="true"/);
+  assert.match(html, /data-timeline-view="changes"[^>]*aria-pressed="false"/);
+  assert.match(renderer, /item\.setAttribute\("aria-pressed", String\(item === button\)\)/);
 });

@@ -350,6 +350,7 @@ class EpisodeQcWebApplication:
         self._jobs_lock = threading.Lock()
         self._platform_jobs: set[str] = set()
         self._platform_owned_jobs: set[str] = set()
+        self._platform_history_synced_jobs: set[str] = set()
         self._platform_ownership_errors: dict[str, str] = {}
         self._platform_progress: dict[str, dict[str, object]] = {}
         self._platform_result_jobs: set[str] = set()
@@ -486,7 +487,9 @@ class EpisodeQcWebApplication:
                 "reviewer": str(response.get("reviewer") or reviewer_name),
             }
             self._flow_error = ""
+            self._platform_history_synced_jobs.clear()
         self._refresh_platform_owned_jobs(response)
+        self._sync_existing_platform_review_histories(client, response)
         self._resume_incomplete_platform_caches(client, response)
         self._schedule_platform_result_reconciliation(
             client,
@@ -504,6 +507,7 @@ class EpisodeQcWebApplication:
             self._flow_connection = {}
             self._flow_error = ""
             self._platform_owned_jobs.clear()
+            self._platform_history_synced_jobs.clear()
             self._platform_ownership_errors.clear()
         return {"connected": False, "jobs": []}
 
@@ -524,6 +528,7 @@ class EpisodeQcWebApplication:
             }
         response = client.jobs_response()
         self._refresh_platform_owned_jobs(response)
+        self._sync_existing_platform_review_histories(client, response)
         return self._platform_payload(response)
 
     def _refresh_platform_owned_jobs(self, response: dict[str, object]) -> None:
@@ -545,6 +550,42 @@ class EpisodeQcWebApplication:
                 for code, message in self._platform_ownership_errors.items()
                 if code in owned
             }
+
+    def _sync_existing_platform_review_histories(
+        self,
+        client,
+        response: dict[str, object],
+    ) -> None:
+        """Upgrade already-cached owned jobs with complete incremental history."""
+
+        reviewer = str(response.get("reviewer") or "")
+        if not reviewer:
+            return
+        for item in response.get("jobs", []):
+            if (
+                not isinstance(item, dict)
+                or not item.get("code")
+                or item.get("reviewer_name") != reviewer
+                or item.get("status") in {"completed", "waiting_data"}
+            ):
+                continue
+            job_code = str(item["code"])
+            if self._local_task_for_job(job_code) is None:
+                continue
+            with self._platform_lock:
+                if job_code in self._platform_history_synced_jobs:
+                    continue
+            try:
+                self._platform_job(client, job_code)
+            except (FlowClientError, OSError, QualityCacheError, ValueError) as exc:
+                LOGGER.warning(
+                    "Flow QC history sync failed for existing job %s: %s",
+                    job_code,
+                    exc,
+                )
+                continue
+            with self._platform_lock:
+                self._platform_history_synced_jobs.add(job_code)
 
     def _heartbeat_platform_claims_once(self) -> None:
         with self._platform_lock:
@@ -924,6 +965,9 @@ class EpisodeQcWebApplication:
                         "local_episode_id": mapping["local_episode_id"],
                         "review_status": episode.get("review_status"),
                         "reviewer_name": episode.get("reviewer_name"),
+                        "deleted_annotation_lineages": detail.get(
+                            "deleted_annotation_lineages", []
+                        ),
                     },
                 }
             )
@@ -1150,7 +1194,8 @@ class EpisodeQcWebApplication:
         local_task = self._local_task_for_job(job_code)
         episodes = job.get("episodes")
         has_previous_review = isinstance(episodes, list) and any(
-            isinstance(item, dict) and "previous_review" in item
+            isinstance(item, dict)
+            and ("previous_review" in item or "review_history" in item)
             for item in episodes
         )
         if local_task is not None and has_previous_review:
@@ -1240,7 +1285,10 @@ class EpisodeQcWebApplication:
             if not mappings:
                 raise QualityCacheError("本地缓存尚未索引到已验证的 Flow Episode")
             manager.record_local_episodes(job_code, mappings)
-            if any("previous_review" in item for item in job.get("episodes", [])):
+            if any(
+                "previous_review" in item or "review_history" in item
+                for item in job.get("episodes", [])
+            ):
                 sync_flow_previous_reviews(self.paths.db_path, job, mappings)
             local_ready = True
             indexed_task_id = str(indexed["task_id"])

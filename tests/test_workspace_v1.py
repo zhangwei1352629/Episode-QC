@@ -473,6 +473,146 @@ def test_flow_previous_review_is_stored_read_only_and_survives_rescan(tmp_path: 
     assert episode_detail(db_path, local_episode_id)["episode"]["previous_review"] == previous_review
 
 
+def test_flow_incremental_history_is_editable_and_deleted_labels_do_not_return(
+    tmp_path: Path,
+):
+    source_root = tmp_path / "cached-flow-incremental"
+    _write_sample_episode(source_root / "episodes" / "episode_000001")
+    db_path = tmp_path / "workspace.db"
+    current_schema = json.loads(json.dumps(FLOW_SCHEMA))
+    current_schema["schema"]["schema_version"] = "3.0.0"
+    current_schema["labels"].append(
+        {
+            **current_schema["labels"][0],
+            "code": "camera_shake",
+            "name": "相机抖动",
+            "shortcut": "C",
+        }
+    )
+    flow_job = {
+        "label_set_id": "task-quality",
+        "label_schema_version": "3.0.0",
+        "label_schema": current_schema,
+        "label_schema_hash": canonical_json_sha256(current_schema),
+    }
+    installed = install_flow_label_schema(db_path, flow_job)
+    scanned = scan_data_source(
+        db_path,
+        source_root,
+        task_code="QCJ-V3",
+        origin="flow",
+        flow_job_code="QCJ-V3",
+        label_set_id=str(installed["id"]),
+    )
+    local_episode_id = str(scanned["episodes"][0]["id"])
+    first_lineage = "QCJ-V1:ann-1"
+    histories = [
+        {
+            "job_code": "QCJ-V1",
+            "review_attempt_id": 1,
+            "episode_review_result_id": 11,
+            "label_set": {"schema_version": "1.0.0"},
+            "annotations": [
+                {
+                    "id": "ann-1",
+                    "label_code": "body_sway",
+                    "scope": "episode",
+                    "target_type": "global",
+                    "severity": "normal",
+                    "action": "keep",
+                    "comment": "第一轮",
+                }
+            ],
+        },
+        {
+            "job_code": "QCJ-V2",
+            "review_attempt_id": 2,
+            "episode_review_result_id": 22,
+            "label_set": {"schema_version": "2.0.0"},
+            "annotations": [
+                {
+                    "id": "ann-2",
+                    "label_code": "camera_shake",
+                    "scope": "episode",
+                    "target_type": "global",
+                    "severity": "normal",
+                    "action": "keep",
+                    "comment": "第二轮新增",
+                }
+            ],
+        },
+    ]
+    job = {
+        "code": "QCJ-V3",
+        "episodes": [
+            {
+                "episode_id": "AST-INCREMENTAL-EP0001",
+                "relative_path": "episodes/episode_000001",
+                "review_history": histories,
+                "previous_review": histories[-1],
+            }
+        ],
+    }
+    mappings = [
+        {
+            "episode_id": "AST-INCREMENTAL-EP0001",
+            "local_episode_id": local_episode_id,
+            "relative_path": "episodes/episode_000001",
+        }
+    ]
+
+    assert sync_flow_previous_reviews(db_path, job, mappings) == 1
+    detail = episode_detail(db_path, local_episode_id)
+    assert [item["label_code"] for item in detail["annotations"]] == [
+        "body_sway",
+        "camera_shake",
+    ]
+    inherited_body, inherited_camera = detail["annotations"]
+    assert inherited_body["attributes"]["_incremental_lineage_id"] == first_lineage
+    assert inherited_body["attributes"]["_incremental_source"]["round_number"] == 1
+    assert inherited_body["attributes"]["_incremental_source"]["origin_round_number"] == 1
+    assert inherited_camera["attributes"]["_incremental_source"]["schema_version"] == "2.0.0"
+    assert inherited_camera["attributes"]["_incremental_source"]["round_number"] == 2
+    assert detail["episode"]["review_history_count"] == 2
+    episode_summary = workspace_state(db_path, task_id=scanned["task_id"])["episodes"][0]
+    assert episode_summary["incremental_added_count"] == 0
+    assert episode_summary["incremental_modified_count"] == 0
+    assert episode_summary["incremental_removed_count"] == 0
+    assert episode_summary["incremental_preserved_count"] == 2
+
+    delete_annotation(db_path, inherited_body["annotation_id"])
+    saved_camera = save_annotation(
+        db_path,
+        {
+            "episode_id": local_episode_id,
+            "label_code": inherited_camera["label_code"],
+            "scope": inherited_camera["scope"],
+            "start_offset_ns": inherited_camera["start_offset_ns"],
+            "end_offset_ns": inherited_camera["end_offset_ns"],
+            "target_type": inherited_camera["target_type"],
+            "target_key": inherited_camera["target_key"],
+            "severity": inherited_camera["severity"],
+            "action": inherited_camera["action"],
+            "comment": "第三轮已修改",
+            "attributes": inherited_camera["attributes"],
+        },
+        annotation_id=inherited_camera["annotation_id"],
+    )
+    assert saved_camera["comment"] == "第三轮已修改"
+
+    # A later Flow refresh is idempotent: local edits and deletion tombstones win.
+    assert sync_flow_previous_reviews(db_path, job, mappings) == 1
+    refreshed = episode_detail(db_path, local_episode_id)
+    assert len(refreshed["annotations"]) == 1
+    assert refreshed["annotations"][0]["comment"] == "第三轮已修改"
+    assert refreshed["deleted_annotation_lineages"] == [first_lineage]
+    episode_summary = workspace_state(db_path, task_id=scanned["task_id"])["episodes"][0]
+    assert episode_summary["incremental_added_count"] == 0
+    assert episode_summary["incremental_modified_count"] == 1
+    assert episode_summary["incremental_removed_count"] == 1
+    assert episode_summary["incremental_preserved_count"] == 0
+
+
 def test_v1_import_playback_annotation_and_export_round_trip(tmp_path: Path):
     source_root = tmp_path / "含 空格的数据"
     mcap_path = _write_sample_episode(source_root / "episode_000001")

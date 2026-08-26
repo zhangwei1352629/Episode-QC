@@ -299,43 +299,45 @@ def test_cleanup_failure_does_not_stop_the_web_server(tmp_path: Path, monkeypatc
     assert "platform cache cleanup failed source=startup" in caplog.text
 
 
-def test_renderer_separates_previous_review_from_editable_annotations():
+def test_renderer_unifies_incremental_history_and_keeps_one_flow_submit_action():
     renderer_root = Path(__file__).resolve().parents[1] / "app" / "renderer"
     html = (renderer_root / "index.html").read_text(encoding="utf-8")
     script = (renderer_root / "renderer.js").read_text(encoding="utf-8")
     styles = (renderer_root / "styles.css").read_text(encoding="utf-8")
 
-    assert 'id="previous-review-section"' in html
-    assert 'id="toggle-previous-review"' in html
+    assert 'id="previous-review-section"' not in html
+    assert 'id="previous-annotation-track"' not in html
     assert 'id="toggle-current-annotations"' in html
-    assert 'aria-expanded="false"' in html
-    assert 'id="previous-annotation-track"' in html
-    assert 'data-track-label="历史"' in html
-    assert 'data-track-label="本轮"' in html
-    assert "上一轮质检" in html
-    assert "只读对照" in html
-    assert "function renderPreviousReview()" in script
-    assert "state.detail?.episode?.previous_review" in script
-    assert "来源：Flow 历史质检事实" in script
-    assert 'class="previous-review-item"' in script
-    assert 'class="history-annotation-block"' in script
-    assert "data-previous-start-ns" in script
-    assert "seekTo(Number(item.dataset.previousStartNs))" in script
-    assert "function setPreviousReviewExpanded(" in script
+    assert 'aria-expanded="true"' in html
+    assert 'id="coverage-tracks"' in html
+    assert 'id="annotation-track"' in html
+    assert 'class="effective-annotation-tracks"' in html
+    assert "本条有效标注" in html
+    assert "历史标注已合并到当前结果" in html
+    assert html.count('id="submit-flow-task"') == 1
+    assert "提交本轮质检到 Flow" in html
+    assert 'id="confirm-current-episode"' in html
+    assert 'id="review-summary"' in html
+    assert "function renderCoverageTracks()" in script
+    assert "数据源同步" in script
+    assert "六路相机 + Mocap" not in script
+    assert "function renderAnnotationLanes(" in script
+    assert "function annotationRoundMeta(" in script
+    assert "function renderReviewFooter(" in script
+    assert "function confirmCurrentEpisode(" in script
     assert "function setCurrentAnnotationsExpanded(" in script
     assert 'classList.toggle("expanded", expanded)' in script
-    assert 'episodeQcPreviousReviewExpanded' in script
     assert 'episodeQcCurrentAnnotationsExpanded' in script
-    assert "历史 ${previousAnnotations.length}" in script
-    assert "历史结论" in script
-    assert ".history-annotation-block" in styles
+    assert "inherited-annotation-badge" in script
+    assert "从历史质检结果继承，可修改或删除" in script
     assert ".history-label-badge" in styles
-    assert ".previous-review-section:not(.expanded)" in styles
+    assert ".inherited-annotation-badge" in styles
+    assert ".data-source-sync" in styles
+    assert ".effective-annotation-lane" in styles
+    assert ".annotation-point" in styles
+    assert ".review-footer" in styles
     assert ".annotations-section:not(.expanded)" in styles
-    assert "grid-template-rows: minmax(0, 1fr) auto auto auto" in styles
-    assert 'data-annotation-id=' not in script.split(
-        "function renderPreviousReview()", 1
-    )[1].split("function openAnnotationEditor", 1)[0]
+    assert "grid-template-rows: minmax(0, 1fr) auto auto" in styles
 
 
 def test_existing_cached_job_refreshes_previous_review_from_flow_detail(
@@ -455,6 +457,107 @@ def test_existing_cached_job_rebuilds_previous_review_mapping_when_cache_state_i
             ],
         )
     ]
+
+
+def test_flow_login_upgrades_existing_owned_cache_history_once_per_connection(
+    tmp_path: Path, monkeypatch
+):
+    response = {
+        "reviewer": "reviewer-a",
+        "jobs": [
+            {
+                "code": "QCJ-HISTORY-LOGIN",
+                "status": "in_progress",
+                "reviewer_name": "reviewer-a",
+            }
+        ],
+    }
+    detail = {
+        "code": "QCJ-HISTORY-LOGIN",
+        "episodes": [
+            {
+                "episode_id": "AST-HISTORY-EP0001",
+                "review_history": [
+                    {
+                        "job_code": "QCJ-HISTORY-V1",
+                        "decision": "pass",
+                        "annotations": [],
+                    },
+                    {
+                        "job_code": "QCJ-HISTORY-V2",
+                        "decision": "pass_with_labels",
+                        "annotations": [{"label_code": "quality-blur"}],
+                    },
+                ],
+            }
+        ],
+    }
+
+    class FakeClient:
+        def __init__(self):
+            self.job_calls = 0
+
+        def jobs_response(self):
+            return response
+
+        def job(self, job_code):
+            assert job_code == detail["code"]
+            self.job_calls += 1
+            return detail
+
+    class FakeCache:
+        def local_episode_mappings(self, job_code):
+            assert job_code == detail["code"]
+            return [
+                {
+                    "episode_id": "AST-HISTORY-EP0001",
+                    "local_episode_id": "ep_local",
+                }
+            ]
+
+    client = FakeClient()
+    synced = []
+    monkeypatch.setattr(
+        web_server,
+        "sync_flow_previous_reviews",
+        lambda db_path, payload, mappings: synced.append(
+            (db_path, payload, mappings)
+        ),
+    )
+    with running_server(tmp_path) as (server, _base_url):
+        application = server.application
+        application._flow_client_factory = lambda *_args: client
+        application._local_task_for_job = lambda code: (
+            {"id": "task-local"} if code == detail["code"] else None
+        )
+        application._quality_cache_manager = lambda: FakeCache()
+        application._resume_incomplete_platform_caches = lambda *_args: None
+        application._schedule_platform_result_reconciliation = lambda *_args, **_kwargs: None
+        application._platform_payload = lambda _payload: {"connected": True}
+
+        application.connect_platform(
+            {
+                "baseUrl": "http://flow.example",
+                "username": "reviewer-a",
+                "password": "test-only",
+            }
+        )
+        application.get_platform_jobs()
+
+        assert client.job_calls == 1
+        assert len(synced) == 1
+        assert synced[0][1] == detail
+
+        application.connect_platform(
+            {
+                "baseUrl": "http://flow.example",
+                "username": "reviewer-a",
+                "password": "test-only",
+            }
+        )
+
+    assert client.job_calls == 2
+    assert len(synced) == 2
 
 
 def test_web_flow_label_schema_is_installed_before_ready_episode_indexing(tmp_path: Path, monkeypatch):
@@ -1090,6 +1193,7 @@ def test_web_flow_label_schema_submit_uses_direct_annotations(tmp_path: Path, mo
                 "annotation_count": 1,
             },
             "annotations": [annotation],
+            "deleted_annotation_lineages": ["QCJ-V1:legacy-ann"],
         },
     )
     with running_server(tmp_path) as (server, _base_url):
@@ -1107,6 +1211,7 @@ def test_web_flow_label_schema_submit_uses_direct_annotations(tmp_path: Path, mo
         "local_episode_id": "ep_local",
         "review_status": "completed",
         "reviewer_name": "Web 质检员",
+        "deleted_annotation_lineages": ["QCJ-V1:legacy-ann"],
     }
 
 def request_json(url: str, *, method: str = "GET", payload: dict[str, object] | None = None):

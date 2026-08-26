@@ -262,6 +262,7 @@ def _initialize_workspace(
                 last_playhead_ns INTEGER NOT NULL DEFAULT 0,
                 annotation_count INTEGER NOT NULL DEFAULT 0,
                 previous_review_json TEXT,
+                review_history_count INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 reviewed_at TEXT,
@@ -382,6 +383,12 @@ def _initialize_workspace(
     _ensure_column(connection, "qc_task", "review_started_at", "TEXT")
     _ensure_column(connection, "qc_task", "review_completed_at", "TEXT")
     _ensure_column(connection, "episode", "previous_review_json", "TEXT")
+    _ensure_column(
+        connection,
+        "episode",
+        "review_history_count",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
     row = connection.execute("SELECT * FROM workspace LIMIT 1").fetchone()
     if row is None:
         workspace_id = _new_id("ws")
@@ -1399,11 +1406,24 @@ def _episode_rows(connection: sqlite3.Connection, where: str = "", parameters: t
                t.task_code, t.task_name, t.origin AS task_origin,
                t.source_type,
                SUM(CASE WHEN s.stream_type = 'camera' AND s.available = 1 THEN 1 ELSE 0 END) AS camera_count,
-               MAX(CASE WHEN s.stream_type = 'mocap' AND s.available = 1 THEN 1 ELSE 0 END) AS mocap_available
+               MAX(CASE WHEN s.stream_type = 'mocap' AND s.available = 1 THEN 1 ELSE 0 END) AS mocap_available,
+               COALESCE(changes.incremental_added_count, 0) AS incremental_added_count,
+               COALESCE(changes.incremental_modified_count, 0) AS incremental_modified_count,
+               COALESCE(changes.incremental_removed_count, 0) AS incremental_removed_count,
+               COALESCE(changes.incremental_preserved_count, 0) AS incremental_preserved_count
         FROM episode e
         JOIN data_source ds ON ds.id = e.data_source_id
         JOIN qc_task t ON t.id = ds.task_id
         LEFT JOIN stream s ON s.episode_id = e.id
+        LEFT JOIN (
+            SELECT episode_id,
+                   SUM(CASE WHEN deleted_at IS NULL AND source != 'flow_incremental' THEN 1 ELSE 0 END) AS incremental_added_count,
+                   SUM(CASE WHEN deleted_at IS NULL AND source = 'flow_incremental' AND updated_at != created_at THEN 1 ELSE 0 END) AS incremental_modified_count,
+                   SUM(CASE WHEN deleted_at IS NOT NULL AND source = 'flow_incremental' THEN 1 ELSE 0 END) AS incremental_removed_count,
+                   SUM(CASE WHEN deleted_at IS NULL AND source = 'flow_incremental' AND updated_at = created_at THEN 1 ELSE 0 END) AS incremental_preserved_count
+            FROM annotation
+            GROUP BY episode_id
+        ) changes ON changes.episode_id = e.id
         {where}
         GROUP BY e.id
         ORDER BY e.data_group COLLATE NOCASE, e.relative_path COLLATE NOCASE
@@ -1413,6 +1433,13 @@ def _episode_rows(connection: sqlite3.Connection, where: str = "", parameters: t
         value = dict(row)
         value["camera_count"] = int(value["camera_count"] or 0)
         value["mocap_available"] = bool(value["mocap_available"])
+        for key in (
+            "incremental_added_count",
+            "incremental_modified_count",
+            "incremental_removed_count",
+            "incremental_preserved_count",
+        ):
+            value[key] = int(value[key] or 0)
         value["duration_sec"] = (value["duration_ns"] or 0) / 1e9
         value["previous_review"] = _loads(
             value.pop("previous_review_json"), None
@@ -1804,8 +1831,17 @@ def episode_detail(db_path: str | Path, episode_id: str) -> dict[str, object]:
             value["metadata"] = _loads(value.pop("metadata_json"), {})
             streams.append(value)
         annotations = _list_annotations(connection, episode_id)
+        deleted_annotation_lineages = _deleted_annotation_lineages(
+            connection, episode_id
+        )
         schema = _label_schema_for_task(connection, str(episode["task_id"]))
-    return {"episode": episode, "streams": streams, "annotations": annotations, "label_schema": schema}
+    return {
+        "episode": episode,
+        "streams": streams,
+        "annotations": annotations,
+        "deleted_annotation_lineages": deleted_annotation_lineages,
+        "label_schema": schema,
+    }
 
 
 def _safe_previous_review(value: object) -> dict[str, object] | None:
@@ -1824,8 +1860,20 @@ def _safe_previous_review(value: object) -> dict[str, object] | None:
         "quality_grade",
         "annotation_count",
         "quality_annotation_count",
+        "job_type",
+        "deleted_annotation_lineages",
+        "round_number",
     }
     safe = {key: value[key] for key in allowed_fields if key in value}
+    if "deleted_annotation_lineages" in value:
+        deleted_lineages = value["deleted_annotation_lineages"]
+        if not isinstance(deleted_lineages, list):
+            raise ValueError("Flow 已删除历史标注血缘必须是数组")
+        safe["deleted_annotation_lineages"] = [
+            lineage.strip()
+            for lineage in deleted_lineages
+            if isinstance(lineage, str) and lineage.strip()
+        ]
     label_set = value.get("label_set")
     if label_set is not None:
         if not isinstance(label_set, dict):
@@ -1883,17 +1931,161 @@ def _safe_previous_review(value: object) -> dict[str, object] | None:
     return json.loads(_json(safe))
 
 
+def _incremental_lineage(review: dict[str, object], annotation: dict[str, object]) -> str:
+    attributes = annotation.get("attributes")
+    if isinstance(attributes, dict):
+        existing = attributes.get("_incremental_lineage_id")
+        if isinstance(existing, str) and existing.strip():
+            return existing.strip()
+    annotation_identity = annotation.get("source_annotation_id") or annotation.get("id")
+    return f"{review.get('job_code') or 'history'}:{annotation_identity}"
+
+
+def _seed_incremental_annotations(
+    connection: sqlite3.Connection,
+    *,
+    job_code: str,
+    local_episode_id: str,
+    review_history: list[dict[str, object]],
+) -> int:
+    """Materialize all compatible historical facts as copy-on-write annotations."""
+
+    episode = connection.execute(
+        """
+        SELECT e.*, t.label_set_id, w.reviewer_name AS workspace_reviewer
+        FROM episode e
+        JOIN data_source ds ON ds.id = e.data_source_id
+        JOIN qc_task t ON t.id = ds.task_id
+        CROSS JOIN workspace w
+        WHERE e.id = ?
+        """,
+        (local_episode_id,),
+    ).fetchone()
+    if episode is None or not episode["label_set_id"]:
+        return 0
+    label_set = connection.execute(
+        "SELECT * FROM label_set WHERE id = ?",
+        (episode["label_set_id"],),
+    ).fetchone()
+    if label_set is None:
+        return 0
+    definitions = {
+        str(row["code"]): row
+        for row in connection.execute(
+            "SELECT * FROM label_definition WHERE label_set_id = ? AND enabled = 1",
+            (episode["label_set_id"],),
+        )
+    }
+
+    effective: dict[
+        str, tuple[dict[str, object], dict[str, object], int]
+    ] = {}
+    origin_rounds: dict[str, int] = {}
+    for review_index, review in enumerate(review_history, start=1):
+        try:
+            round_number = max(1, int(review.get("round_number") or review_index))
+        except (TypeError, ValueError):
+            round_number = review_index
+        deleted = review.get("deleted_annotation_lineages")
+        if isinstance(deleted, list):
+            for lineage in deleted:
+                if isinstance(lineage, str):
+                    effective.pop(lineage, None)
+        annotations = review.get("annotations")
+        if not isinstance(annotations, list):
+            continue
+        for annotation in annotations:
+            if not isinstance(annotation, dict):
+                continue
+            lineage = _incremental_lineage(review, annotation)
+            origin_rounds.setdefault(lineage, round_number)
+            effective[lineage] = (
+                review,
+                annotation,
+                origin_rounds[lineage],
+            )
+
+    inserted = 0
+    now = _now()
+    for lineage, (review, annotation, origin_round_number) in effective.items():
+        label_code = str(annotation.get("label_code") or "")
+        label = definitions.get(label_code)
+        if label is None:
+            continue
+        attributes = annotation.get("attributes")
+        attributes = dict(attributes) if isinstance(attributes, dict) else {}
+        attributes["_incremental_lineage_id"] = lineage
+        attributes["_incremental_source"] = {
+            "job_code": review.get("job_code"),
+            "review_attempt_id": review.get("review_attempt_id"),
+            "episode_review_result_id": review.get("episode_review_result_id"),
+            "annotation_id": annotation.get("id"),
+            "round_number": review.get("round_number"),
+            "origin_round_number": origin_round_number,
+            "schema_version": (review.get("label_set") or {}).get("schema_version")
+            if isinstance(review.get("label_set"), dict)
+            else None,
+        }
+        payload = {
+            "label_code": label_code,
+            "scope": annotation.get("scope"),
+            "start_offset_ns": annotation.get("start_offset_ns", 0),
+            "end_offset_ns": annotation.get("end_offset_ns", 0),
+            "target_type": annotation.get("target_type"),
+            "target_key": annotation.get("target_key"),
+            "severity": annotation.get("severity"),
+            "action": annotation.get("action"),
+            "comment": annotation.get("comment") or "",
+            "attributes": attributes,
+        }
+        try:
+            normalized = _validate_annotation_payload(payload, episode, label)
+        except (TypeError, ValueError):
+            continue
+        annotation_id = _stable_id(
+            "ann", "flow-incremental", job_code, local_episode_id, lineage
+        )
+        cursor = connection.execute(
+            """
+            INSERT OR IGNORE INTO annotation(
+                id, episode_id, label_set_key, label_schema_version, label_code, scope,
+                start_offset_ns, end_offset_ns, target_type, target_key, severity, action,
+                comment, attributes_json, source, status, reviewer_name, created_at,
+                updated_at, deleted_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'flow_incremental',
+                      'confirmed', ?, ?, ?, NULL)
+            """,
+            (
+                annotation_id,
+                local_episode_id,
+                label_set["label_set_key"],
+                label_set["version"],
+                normalized["label_code"],
+                normalized["scope"],
+                normalized["start_offset_ns"],
+                normalized["end_offset_ns"],
+                normalized["target_type"],
+                normalized.get("target_key"),
+                normalized.get("severity") or label["default_severity"],
+                normalized.get("action") or label["default_action"],
+                normalized.get("comment", ""),
+                _json(normalized.get("attributes", {})),
+                episode["workspace_reviewer"] or "",
+                now,
+                now,
+            ),
+        )
+        inserted += max(0, int(cursor.rowcount or 0))
+    _refresh_annotation_count(connection, local_episode_id)
+    return inserted
+
+
 def sync_flow_previous_reviews(
     db_path: str | Path,
     job: dict[str, object],
     mappings: list[dict[str, object]],
 ) -> int:
-    """Attach Flow's immutable prior results to the matching local Episodes.
-
-    These facts are kept in a separate JSON column and never inserted into the
-    editable annotation table, so a V1 result cannot silently become part of a
-    V2 submission.
-    """
+    """Attach immutable history and create an editable incremental work copy."""
 
     initialize_workspace(db_path)
     job_code = str(job.get("code") or "").strip()
@@ -1935,15 +2127,38 @@ def sync_flow_previous_reviews(
                 raise ValueError(f"本地 Episode 不存在：{local_episode_id}")
             if str(row["flow_job_code"] or "") != job_code:
                 raise ValueError("不能把上一轮质检结果写入其他本地任务")
-            previous_review = _safe_previous_review(
-                platform_episode.get("previous_review")
-            )
+            raw_history = platform_episode.get("review_history")
+            if raw_history is None:
+                raw_history = (
+                    [platform_episode.get("previous_review")]
+                    if platform_episode.get("previous_review") is not None
+                    else []
+                )
+            if not isinstance(raw_history, list):
+                raise ValueError("Flow 历史质检结果必须是数组")
+            review_history = []
+            for round_number, raw_review in enumerate(raw_history, start=1):
+                safe_review = _safe_previous_review(raw_review)
+                if safe_review is None:
+                    continue
+                safe_review["round_number"] = round_number
+                review_history.append(safe_review)
+            previous_review = dict(review_history[-1]) if review_history else None
+            if previous_review is not None:
+                previous_review.pop("round_number", None)
             connection.execute(
-                "UPDATE episode SET previous_review_json = ? WHERE id = ?",
+                "UPDATE episode SET previous_review_json = ?, review_history_count = ? WHERE id = ?",
                 (
                     _json(previous_review) if previous_review is not None else None,
+                    len(review_history),
                     local_episode_id,
                 ),
+            )
+            _seed_incremental_annotations(
+                connection,
+                job_code=job_code,
+                local_episode_id=local_episode_id,
+                review_history=review_history,
             )
             updated += 1
     return updated
@@ -2583,6 +2798,25 @@ def _list_annotations(connection: sqlite3.Connection, episode_id: str) -> list[d
             (episode_id,),
         )
     ]
+
+
+def _deleted_annotation_lineages(
+    connection: sqlite3.Connection, episode_id: str
+) -> list[str]:
+    lineages: set[str] = set()
+    for row in connection.execute(
+        "SELECT attributes_json FROM annotation WHERE episode_id = ? AND deleted_at IS NOT NULL",
+        (episode_id,),
+    ):
+        attributes = _loads(row["attributes_json"], {})
+        lineage = (
+            attributes.get("_incremental_lineage_id")
+            if isinstance(attributes, dict)
+            else None
+        )
+        if isinstance(lineage, str) and lineage.strip():
+            lineages.add(lineage.strip())
+    return sorted(lineages)
 
 
 def list_annotations(db_path: str | Path, episode_id: str) -> list[dict[str, object]]:

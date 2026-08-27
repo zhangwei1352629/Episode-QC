@@ -200,6 +200,54 @@ def test_web_application_stops_heartbeats_after_flow_reports_lost_ownership(tmp_
         }
 
 
+def test_web_application_does_not_renew_failed_platform_jobs(tmp_path: Path):
+    response = {
+        "reviewer": "Web 质检员",
+        "jobs": [
+            {
+                "code": "QCJ-ACTIVE",
+                "reviewer_name": "Web 质检员",
+                "status": "claimed",
+            },
+            {
+                "code": "QCJ-FAILED",
+                "reviewer_name": "Web 质检员",
+                "status": "failed",
+            },
+        ],
+    }
+
+    with running_server(tmp_path) as (server, _base_url):
+        server.application._platform_owned_jobs.add("QCJ-FAILED")
+
+        server.application._refresh_platform_owned_jobs(response)
+
+        assert server.application._platform_owned_jobs == {"QCJ-ACTIVE"}
+
+
+def test_sqlite_lock_retry_retries_only_locked_operations(monkeypatch):
+    attempts = []
+    delays = []
+
+    def operation():
+        attempts.append(True)
+        if len(attempts) < 3:
+            raise sqlite3.OperationalError("database is locked")
+        return "ready"
+
+    monkeypatch.setattr(web_server.time, "sleep", delays.append)
+
+    assert web_server._retry_sqlite_locked(operation, delays=(0.1, 0.2)) == "ready"
+    assert len(attempts) == 3
+    assert delays == [0.1, 0.2]
+
+    with pytest.raises(sqlite3.OperationalError, match="malformed"):
+        web_server._retry_sqlite_locked(
+            lambda: (_ for _ in ()).throw(sqlite3.OperationalError("database malformed")),
+            delays=(0.1,),
+        )
+
+
 def test_result_reconciliation_schedules_only_locally_completed_unsynced_jobs(
     tmp_path: Path,
     monkeypatch,
@@ -864,6 +912,66 @@ def test_web_failed_claim_keeps_pre_cache_failure_journal_and_does_not_start_cac
 
         assert cache.has_pre_cache_failure(job["code"])
         assert scheduled == []
+
+
+def test_web_serializes_duplicate_claims_before_calling_flow(tmp_path: Path, monkeypatch):
+    job = {"code": "QCJ-WEB-DUPLICATE-CLAIM", "status": "pending"}
+    first_claim_started = threading.Event()
+    release_claim = threading.Event()
+
+    class FakeFlowClient:
+        def __init__(self):
+            self.claims = []
+
+        def jobs(self):
+            return [dict(job)]
+
+        def claim(self, job_code):
+            self.claims.append(job_code)
+            first_claim_started.set()
+            assert release_claim.wait(timeout=3)
+            return {**job, "status": "claimed"}
+
+    class FakeCache:
+        def cache_summary(self, _job_code):
+            return None
+
+        def has_pre_cache_failure(self, _job_code):
+            return False
+
+    with running_server(tmp_path) as (server, _base_url):
+        client = FakeFlowClient()
+        scheduled = []
+        responses = []
+        errors = []
+        server.application._flow_client = client
+        monkeypatch.setattr(server.application, "_quality_cache_manager", FakeCache)
+        monkeypatch.setattr(
+            server.application._platform_executor,
+            "submit",
+            lambda *args: scheduled.append(args),
+        )
+
+        def claim():
+            try:
+                responses.append(server.application.claim_platform_job(job["code"]))
+            except Exception as exc:  # pragma: no cover - diagnostic capture
+                errors.append(exc)
+
+        first = threading.Thread(target=claim)
+        second = threading.Thread(target=claim)
+        first.start()
+        assert first_claim_started.wait(timeout=3)
+        second.start()
+        time.sleep(0.05)
+        release_claim.set()
+        first.join(timeout=3)
+        second.join(timeout=3)
+
+        assert errors == []
+        assert client.claims == [job["code"]]
+        assert len(scheduled) == 1
+        assert sorted(item["accepted"] for item in responses) == [False, True]
 
 
 def test_web_reclaims_pending_flow_job_when_local_cache_is_complete(tmp_path: Path, monkeypatch):

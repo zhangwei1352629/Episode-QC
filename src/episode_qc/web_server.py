@@ -14,10 +14,12 @@ from pathlib import Path
 import queue
 import re
 import secrets
+import sqlite3
 import threading
+import time
 import traceback
 import shutil
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 import webbrowser
 
@@ -70,11 +72,32 @@ WILDCARD_WEB_HOSTS = frozenset({"0.0.0.0", "::"})
 PLATFORM_CACHE_CLEANUP_INTERVAL_SECONDS = 60 * 60
 PLATFORM_CLAIM_HEARTBEAT_INTERVAL_SECONDS = 30
 PLATFORM_RESULT_RECONCILE_INTERVAL_SECONDS = 5 * 60
+SQLITE_LOCK_RETRY_DELAYS_SECONDS = (0.1, 0.25, 0.5, 1.0)
 NAS_PROBE_PATH_ENV = "EPISODE_QC_NAS_PROBE_PATH"
 NAS_UNAVAILABLE_MESSAGE = (
     "NAS 当前不可用；可继续查看本机已有任务，依赖 NAS 的领取、缓存、导入和提交操作将在恢复后可用。"
 )
 LOGGER = logging.getLogger(__name__)
+
+
+def _retry_sqlite_locked(
+    operation: Callable[[], Any],
+    *,
+    delays: tuple[float, ...] = SQLITE_LOCK_RETRY_DELAYS_SECONDS,
+) -> Any:
+    """Retry transient SQLite lock conflicts without hiding other DB errors."""
+
+    for delay in delays:
+        try:
+            return operation()
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower():
+                raise
+            LOGGER.warning(
+                "QC workspace database is locked; retrying in %.2fs", delay
+            )
+            time.sleep(delay)
+    return operation()
 
 
 @dataclass(frozen=True)
@@ -362,6 +385,8 @@ class EpisodeQcWebApplication:
         self._platform_progress: dict[str, dict[str, object]] = {}
         self._platform_result_jobs: set[str] = set()
         self._platform_lock = threading.RLock()
+        self._platform_claim_locks: dict[str, threading.Lock] = {}
+        self._workspace_write_lock = threading.RLock()
         self._flow_client_factory = FlowClient
         self._flow_client: FlowClient | None = None
         self._flow_connection: dict[str, str] = {}
@@ -409,31 +434,47 @@ class EpisodeQcWebApplication:
     def nas_status(self) -> dict[str, object]:
         return self._nas_status_monitor.status()
 
+    def _platform_claim_lock(self, job_code: str) -> threading.Lock:
+        with self._platform_lock:
+            return self._platform_claim_locks.setdefault(job_code, threading.Lock())
+
+    def _write_workspace(self, operation: Callable[[], Any]) -> Any:
+        with self._workspace_write_lock:
+            return _retry_sqlite_locked(operation)
+
     def get_workspace_state(self, task_id: str | None = None) -> dict[str, object]:
         if task_id is None:
             tasks = list_qc_tasks(self.paths.db_path)
             task_id = str(tasks[0]["id"]) if tasks else None
         state = workspace_state(self.paths.db_path, task_id=task_id)
         if not state.get("label_schema") and self.paths.default_label_schema.is_file():
-            import_label_schema(self.paths.db_path, self.paths.default_label_schema)
+            self._write_workspace(
+                lambda: import_label_schema(
+                    self.paths.db_path, self.paths.default_label_schema
+                )
+            )
             state = workspace_state(self.paths.db_path, task_id=task_id)
         return state
 
     def update_settings(self, request: dict[str, object]) -> dict[str, object]:
-        return update_workspace_settings(
-            self.paths.db_path,
-            name=request.get("name") if isinstance(request.get("name"), str) else None,
-            reviewer_name=request.get("reviewer") if isinstance(request.get("reviewer"), str) else None,
-            last_episode_id=request.get("lastEpisodeId") if isinstance(request.get("lastEpisodeId"), str) else None,
-            task_id=request.get("taskId") if isinstance(request.get("taskId"), str) else None,
+        return self._write_workspace(
+            lambda: update_workspace_settings(
+                self.paths.db_path,
+                name=request.get("name") if isinstance(request.get("name"), str) else None,
+                reviewer_name=request.get("reviewer") if isinstance(request.get("reviewer"), str) else None,
+                last_episode_id=request.get("lastEpisodeId") if isinstance(request.get("lastEpisodeId"), str) else None,
+                task_id=request.get("taskId") if isinstance(request.get("taskId"), str) else None,
+            )
         )
 
     def get_tasks(self) -> dict[str, object]:
         return {"tasks": list_qc_tasks(self.paths.db_path)}
 
     def clear_local_task_history(self, keep_task_id: str | None) -> dict[str, object]:
-        result = clear_local_task_history(
-            self.paths.db_path, keep_task_id=keep_task_id
+        result = self._write_workspace(
+            lambda: clear_local_task_history(
+                self.paths.db_path, keep_task_id=keep_task_id
+            )
         )
         for episode_id in result["removed_episode_ids"]:
             self.playback.remove(str(episode_id))
@@ -446,13 +487,18 @@ class EpisodeQcWebApplication:
         return {"label_sets": list_label_sets(self.paths.db_path)}
 
     def activate_label_set(self, label_set_id: str) -> dict[str, object]:
-        return {
-            "active": activate_label_set(self.paths.db_path, label_set_id),
-            "label_sets": list_label_sets(self.paths.db_path),
-        }
+        def activate() -> dict[str, object]:
+            return {
+                "active": activate_label_set(self.paths.db_path, label_set_id),
+                "label_sets": list_label_sets(self.paths.db_path),
+            }
+
+        return self._write_workspace(activate)
 
     def delete_label_set(self, label_set_id: str) -> dict[str, object]:
-        return delete_label_set(self.paths.db_path, label_set_id)
+        return self._write_workspace(
+            lambda: delete_label_set(self.paths.db_path, label_set_id)
+        )
 
     def get_platform_reviewers(self, request: dict[str, object]) -> dict[str, object]:
         self._assert_flow_enabled()
@@ -548,7 +594,7 @@ class EpisodeQcWebApplication:
             if isinstance(item, dict)
             and item.get("code")
             and item.get("reviewer_name") == reviewer
-            and item.get("status") not in {"completed", "waiting_data"}
+            and item.get("status") not in {"completed", "failed", "waiting_data"}
         }
         with self._platform_lock:
             self._platform_owned_jobs = owned
@@ -840,6 +886,10 @@ class EpisodeQcWebApplication:
             self._platform_executor.submit(self._cache_platform_job, client, job_code)
 
     def claim_platform_job(self, job_code: str) -> dict[str, object]:
+        with self._platform_claim_lock(job_code):
+            return self._claim_platform_job_once(job_code)
+
+    def _claim_platform_job_once(self, job_code: str) -> dict[str, object]:
         self._assert_flow_enabled()
         client = self._require_flow_client()
         job = self._platform_job(client, job_code)
@@ -849,6 +899,9 @@ class EpisodeQcWebApplication:
             raise ValueError("质检任务已经完成")
         local_task = self._local_task_for_job(job_code)
         manager = self._quality_cache_manager()
+        with self._platform_lock:
+            if job_code in self._platform_jobs:
+                return {"accepted": False, "job": job, "caching": True}
         summary = None
         if local_task and local_task.get("status") != "failed":
             summary = manager.cache_summary(job_code)
@@ -871,10 +924,12 @@ class EpisodeQcWebApplication:
         cache_recovery = bool(local_task and summary is None)
         workspace_backup = None
         if cache_recovery:
-            workspace_backup = backup_workspace_database(
-                self.paths.db_path,
-                self.paths.root / "backups",
-                reason=f"cache-recovery-{job_code}",
+            workspace_backup = self._write_workspace(
+                lambda: backup_workspace_database(
+                    self.paths.db_path,
+                    self.paths.root / "backups",
+                    reason=f"cache-recovery-{job_code}",
+                )
             )
         claimed = client.claim(job_code)
         with self._platform_lock:
@@ -1025,7 +1080,9 @@ class EpisodeQcWebApplication:
                 review_completed_at=task["review_completed_at"],
             )
         response = manager.submit_result(client, job, **submit_values)
-        local_task = mark_qc_task_submitted(self.paths.db_path, job_code)
+        local_task = self._write_workspace(
+            lambda: mark_qc_task_submitted(self.paths.db_path, job_code)
+        )
         with self._platform_lock:
             self._platform_owned_jobs.discard(job_code)
             self._platform_ownership_errors.pop(job_code, None)
@@ -1285,7 +1342,11 @@ class EpisodeQcWebApplication:
             ):
                 mappings = []
             if mappings:
-                sync_flow_previous_reviews(self.paths.db_path, job, mappings)
+                self._write_workspace(
+                    lambda: sync_flow_previous_reviews(
+                        self.paths.db_path, job, mappings
+                    )
+                )
         return job
 
     def _quality_cache_manager(self) -> QualityCacheManager:
@@ -1329,27 +1390,33 @@ class EpisodeQcWebApplication:
                 if viewer_profile == "ego_omniego" or asset_type == "egocentric"
                 else "robot_teleoperation"
             )
-            indexed = scan_data_source(
-                self.paths.db_path,
-                str(values["cache_dir"]),
-                profile_path=profile_path,
-                task_code=job_code,
-                task_name=str(job.get("task_name") or job.get("asset_id") or job_code),
-                origin="flow",
-                flow_job_code=job_code,
-                asset_id=str(job.get("asset_id") or "") or None,
-                label_set_id=bound_label_set_id,
-                source_uri=str(job.get("source_uri") or job.get("asset_nas_uri") or ""),
-                task_metadata={"flow_job": job},
-                task_kind=task_kind,
-                annotation_mode=str(
-                    job.get("annotation_mode")
-                    or ("open" if task_kind == "ego_omniego" else "library")
-                ),
-                annotation_schema_version=str(
-                    job.get("annotation_schema_version")
-                    or ("ego_open_v1" if task_kind == "ego_omniego" else "")
-                ),
+            indexed = self._write_workspace(
+                lambda: scan_data_source(
+                    self.paths.db_path,
+                    str(values["cache_dir"]),
+                    profile_path=profile_path,
+                    task_code=job_code,
+                    task_name=str(
+                        job.get("task_name") or job.get("asset_id") or job_code
+                    ),
+                    origin="flow",
+                    flow_job_code=job_code,
+                    asset_id=str(job.get("asset_id") or "") or None,
+                    label_set_id=bound_label_set_id,
+                    source_uri=str(
+                        job.get("source_uri") or job.get("asset_nas_uri") or ""
+                    ),
+                    task_metadata={"flow_job": job},
+                    task_kind=task_kind,
+                    annotation_mode=str(
+                        job.get("annotation_mode")
+                        or ("open" if task_kind == "ego_omniego" else "library")
+                    ),
+                    annotation_schema_version=str(
+                        job.get("annotation_schema_version")
+                        or ("ego_open_v1" if task_kind == "ego_omniego" else "")
+                    ),
+                )
             )
             ready_by_path = {
                 str(Path(item["relative_path"]).as_posix()).strip("./"): item
@@ -1391,7 +1458,11 @@ class EpisodeQcWebApplication:
                 "previous_review" in item or "review_history" in item
                 for item in job.get("episodes", [])
             ):
-                sync_flow_previous_reviews(self.paths.db_path, job, mappings)
+                self._write_workspace(
+                    lambda: sync_flow_previous_reviews(
+                        self.paths.db_path, job, mappings
+                    )
+                )
             local_ready = True
             indexed_task_id = str(indexed["task_id"])
             cache_summary = manager.cache_summary(job_code) or {}
@@ -1448,7 +1519,9 @@ class EpisodeQcWebApplication:
             installed_label_set = (
                 {"active": False}
                 if str(job.get("annotation_mode") or "") == "open"
-                else install_flow_label_schema(self.paths.db_path, job)
+                else self._write_workspace(
+                    lambda: install_flow_label_schema(self.paths.db_path, job)
+                )
             )
             bound_label_set_id = (
                 str(installed_label_set["id"])
@@ -1502,6 +1575,9 @@ class EpisodeQcWebApplication:
                     )
                 except Exception:
                     pass
+            with self._platform_lock:
+                self._platform_owned_jobs.discard(job_code)
+                self._platform_ownership_errors.pop(job_code, None)
             publish_progress(
                 {
                     "status": "cache_failed" if local_ready else "failed",
@@ -1520,18 +1596,28 @@ class EpisodeQcWebApplication:
             raise ValueError("请输入数据源目录")
         profile_path = self.paths.default_profile if self.paths.default_profile.is_file() else None
         task_kind = str(request.get("taskKind") or "robot_teleoperation")
-        return scan_data_source(
-            self.paths.db_path,
-            root_path,
-            profile_path=profile_path,
-            task_kind=task_kind,
-            annotation_mode="open" if task_kind == "ego_omniego" else "library",
-            annotation_schema_version="ego_open_v1" if task_kind == "ego_omniego" else "",
+        return self._write_workspace(
+            lambda: scan_data_source(
+                self.paths.db_path,
+                root_path,
+                profile_path=profile_path,
+                task_kind=task_kind,
+                annotation_mode=(
+                    "open" if task_kind == "ego_omniego" else "library"
+                ),
+                annotation_schema_version=(
+                    "ego_open_v1" if task_kind == "ego_omniego" else ""
+                ),
+            )
         )
 
     def rescan_task(self, task_id: str) -> dict[str, object]:
         profile_path = self.paths.default_profile if self.paths.default_profile.is_file() else None
-        return rescan_qc_task(self.paths.db_path, task_id, profile_path=profile_path)
+        return self._write_workspace(
+            lambda: rescan_qc_task(
+                self.paths.db_path, task_id, profile_path=profile_path
+            )
+        )
 
     def prepare_episode(self, episode_id: str) -> dict[str, object]:
         detail = episode_detail(self.paths.db_path, episode_id)
@@ -1560,7 +1646,9 @@ class EpisodeQcWebApplication:
             raise ValueError("没有待确认的标签库导入")
         path = self.pending_label_schema
         self.pending_label_schema = None
-        return import_label_schema(self.paths.db_path, path)
+        return self._write_workspace(
+            lambda: import_label_schema(self.paths.db_path, path)
+        )
 
     def save_annotation(self, request: dict[str, object]) -> dict[str, object]:
         payload = request.get("payload")
@@ -1569,25 +1657,68 @@ class EpisodeQcWebApplication:
         annotation_id = request.get("annotationId")
         if annotation_id is not None and not isinstance(annotation_id, str):
             raise ValueError("标注 ID 无效")
-        return save_annotation(
-            self.paths.db_path,
-            payload,
-            annotation_id=annotation_id,
-            session_id=self.session_id,
-            expected_updated_at=(
-                payload.get("updated_at") if annotation_id and isinstance(payload.get("updated_at"), str) else None
-            ),
+        return self._write_workspace(
+            lambda: save_annotation(
+                self.paths.db_path,
+                payload,
+                annotation_id=annotation_id,
+                session_id=self.session_id,
+                expected_updated_at=(
+                    payload.get("updated_at")
+                    if annotation_id and isinstance(payload.get("updated_at"), str)
+                    else None
+                ),
+            )
+        )
+
+    def undo_annotation(self) -> dict[str, object]:
+        return self._write_workspace(
+            lambda: undo_annotation_change(
+                self.paths.db_path, session_id=self.session_id
+            )
+        )
+
+    def redo_annotation(self) -> dict[str, object]:
+        return self._write_workspace(
+            lambda: redo_annotation_change(
+                self.paths.db_path, session_id=self.session_id
+            )
+        )
+
+    def remove_annotation(self, annotation_id: str) -> dict[str, object]:
+        return self._write_workspace(
+            lambda: delete_annotation(
+                self.paths.db_path, annotation_id, session_id=self.session_id
+            )
         )
 
     def update_review(self, episode_id: str, request: dict[str, object]) -> dict[str, object]:
         playhead = request.get("playheadNs")
-        updated = update_episode_review(
-            self.paths.db_path,
-            episode_id,
-            review_status=request.get("status") if isinstance(request.get("status"), str) else None,
-            quality_decision=request.get("decision") if isinstance(request.get("decision"), str) else None,
-            reviewer_name=request.get("reviewer") if isinstance(request.get("reviewer"), str) else None,
-            last_playhead_ns=round(float(playhead)) if isinstance(playhead, (int, float)) else None,
+        updated = self._write_workspace(
+            lambda: update_episode_review(
+                self.paths.db_path,
+                episode_id,
+                review_status=(
+                    request.get("status")
+                    if isinstance(request.get("status"), str)
+                    else None
+                ),
+                quality_decision=(
+                    request.get("decision")
+                    if isinstance(request.get("decision"), str)
+                    else None
+                ),
+                reviewer_name=(
+                    request.get("reviewer")
+                    if isinstance(request.get("reviewer"), str)
+                    else None
+                ),
+                last_playhead_ns=(
+                    round(float(playhead))
+                    if isinstance(playhead, (int, float))
+                    else None
+                ),
+            )
         )
         if isinstance(request.get("status"), str) or isinstance(request.get("decision"), str):
             self._schedule_platform_review_progress(episode_id)
@@ -1866,11 +1997,11 @@ class EpisodeQcRequestHandler(BaseHTTPRequestHandler):
             return
         if method == "POST" and path == "/api/undo":
             self._discard_body()
-            self._send_json(undo_annotation_change(app.paths.db_path, session_id=app.session_id))
+            self._send_json(app.undo_annotation())
             return
         if method == "POST" and path == "/api/redo":
             self._discard_body()
-            self._send_json(redo_annotation_change(app.paths.db_path, session_id=app.session_id))
+            self._send_json(app.redo_annotation())
             return
         if method == "POST" and path == "/api/export":
             self._send_json(app.export(self._json_body()))
@@ -1920,9 +2051,7 @@ class EpisodeQcRequestHandler(BaseHTTPRequestHandler):
             return
         annotation_match = re.fullmatch(r"/api/annotations/(ann_[a-f0-9]{24,32})", path)
         if method == "DELETE" and annotation_match:
-            self._send_json(
-                delete_annotation(app.paths.db_path, annotation_match.group(1), session_id=app.session_id)
-            )
+            self._send_json(app.remove_annotation(annotation_match.group(1)))
             return
         self._send_json({"error": "API 不存在"}, HTTPStatus.NOT_FOUND)
 

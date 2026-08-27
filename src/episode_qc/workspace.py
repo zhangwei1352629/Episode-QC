@@ -23,7 +23,7 @@ TASK_KINDS = {"robot_teleoperation", "ego_omniego"}
 ANNOTATION_MODES = {"library", "open"}
 OPEN_ANNOTATION_TYPES = {"action", "pose_quality", "camera_quality", "exception", "object_state", "other"}
 EGO_OPEN_SCHEMA_VERSION = "ego_open_v1"
-EPISODE_INDEX_VERSION = 2
+EPISODE_INDEX_VERSION = 3
 
 
 class WorkspaceConflictError(RuntimeError):
@@ -1470,13 +1470,30 @@ def _classify_stream(
             display = str(definition.get("display_name") or (_camera_name(topic) if stream_type == "camera" else key))
             return stream_type, key, display, definition.get("adapter"), str(definition.get("encoding") or message_encoding)
     if (
-        schema_name in {"foxglove.CompressedImage", "sensor_msgs/CompressedImage"}
+        schema_name
+        in {
+            "foxglove.CompressedImage",
+            "foxglove.CompressedVideo",
+            "sensor_msgs/CompressedImage",
+        }
         or (("camera" in topic or "/cam" in topic or "/t265_" in topic) and "image" in topic)
     ):
-        adapter = "ros1_compressed_image_v1" if schema_name == "sensor_msgs/CompressedImage" else "foxglove_compressed_image_v1"
-        return "camera", "camera", _camera_name(topic), adapter, "jpeg"
+        if schema_name == "sensor_msgs/CompressedImage":
+            adapter = "ros1_compressed_image_v1"
+            encoding = "jpeg"
+        elif schema_name == "foxglove.CompressedVideo":
+            adapter = "foxglove_compressed_video_h264_v1"
+            encoding = "h264"
+        else:
+            adapter = "foxglove_compressed_image_v1"
+            encoding = "jpeg"
+        return "camera", "camera", _camera_name(topic), adapter, encoding
     if topic == "/dohc/skeleton":
         return "mocap", "human_pose", "人体 Pose 骨架", "dohc_smpl_24_v1", message_encoding
+    if topic == "/pose/body" and schema_name == "pose.BodyFrame":
+        return "mocap", "human_pose", "人体 Pose 骨架", "omniego_body_frame_v1", message_encoding
+    if topic.startswith("/pose/") and schema_name.startswith("pose."):
+        return "pose_component", None, topic.strip("/"), None, message_encoding
     if topic == "/mocap/human_motion" or "mocap" in topic:
         return "mocap", "human_motion", "人体 Mocap", "human_motion_json_v1" if message_encoding == "json" else None, message_encoding
     if "retarget" in topic:

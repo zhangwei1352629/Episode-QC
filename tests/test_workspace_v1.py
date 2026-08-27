@@ -645,7 +645,7 @@ def test_v1_import_playback_annotation_and_export_round_trip(tmp_path: Path):
     assert len(manifest["cameras"]) == 1
     assert manifest["motion"]["available"] is True
     assert manifest["motion"]["joint_names"] == ["Hips", "Head"]
-    assert manifest["cache_version"] == 7
+    assert manifest["cache_version"] == 8
     assert manifest["motion"]["frame_encoding"] == "episode-qc-motion-f32-le-v1"
     assert manifest["robot_actions"]["default_source"] == "policy"
     assert {item["key"] for item in manifest["robot_actions"]["sources"] if item["available"]} == {

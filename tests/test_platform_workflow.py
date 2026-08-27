@@ -629,6 +629,86 @@ class FakeFlowClient:
         return {**self.job, "status": "completed", "submitted": values}
 
 
+def test_cache_job_materializes_flow_manifest_for_ego_without_writing_source(
+    tmp_path: Path,
+):
+    asset_root = tmp_path / "external-ego" / "AST-EGO"
+    episode_root = asset_root / "episode_000001"
+    episode_root.mkdir(parents=True)
+    primary = episode_root / "capture.mcap"
+    primary.write_bytes(b"ego-mcap-payload")
+    job = {
+        "code": "QCJ-EGO",
+        "asset_id": "AST-EGO",
+        "asset_type": "egocentric",
+        "viewer_profile": "ego_omniego",
+        "source_uri": str(asset_root),
+        "episodes": [
+            {
+                "episode_id": "AST-EGO-EP0001",
+                "relative_path": "episode_000001",
+                "primary_file": "capture.mcap",
+                "checksum_sha256": hashlib.sha256(primary.read_bytes()).hexdigest(),
+            }
+        ],
+    }
+    manifest = publish_asset_manifest(
+        asset_root,
+        job,
+        ["episode_000001/capture.mcap"],
+    )
+    source_manifest = asset_root / "asset_manifest.json"
+    source_manifest.unlink()
+
+    cached = QualityCacheManager(tmp_path / "cache", reserve_bytes=0).cache_job(
+        FakeFlowClient(job),
+        job,
+    )
+
+    cached_manifest = Path(cached["cache_dir"]) / "asset_manifest.json"
+    assert json.loads(cached_manifest.read_text(encoding="utf-8")) == manifest
+    assert canonical_json_sha256(json.loads(cached_manifest.read_text(encoding="utf-8"))) == (
+        job["asset_manifest_sha256"]
+    )
+    assert source_manifest.exists() is False
+    assert (Path(cached["cache_dir"]) / "episode_000001/capture.mcap").read_bytes() == (
+        primary.read_bytes()
+    )
+
+
+def test_cache_job_still_requires_published_manifest_for_non_ego_job(tmp_path: Path):
+    asset_root = tmp_path / "nas" / "AST-ROBOT"
+    episode_root = asset_root / "episode_000001"
+    episode_root.mkdir(parents=True)
+    primary = episode_root / "motion.bvh"
+    primary.write_bytes(b"robot-motion")
+    job = {
+        "code": "QCJ-ROBOT",
+        "asset_id": "AST-ROBOT",
+        "source_uri": str(asset_root),
+        "episodes": [
+            {
+                "episode_id": "AST-ROBOT-EP0001",
+                "relative_path": "episode_000001",
+                "primary_file": "motion.bvh",
+                "checksum_sha256": hashlib.sha256(primary.read_bytes()).hexdigest(),
+            }
+        ],
+    }
+    publish_asset_manifest(
+        asset_root,
+        job,
+        ["episode_000001/motion.bvh"],
+    )
+    (asset_root / "asset_manifest.json").unlink()
+
+    with pytest.raises(QualityCacheError, match="尚未发布 asset_manifest.json"):
+        QualityCacheManager(tmp_path / "cache", reserve_bytes=0).cache_job(
+            FakeFlowClient(job),
+            job,
+        )
+
+
 def test_submit_result_binds_gapped_episode_directories_instead_of_list_positions(
     tmp_path: Path,
 ):

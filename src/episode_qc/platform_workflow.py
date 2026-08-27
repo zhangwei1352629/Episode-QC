@@ -385,7 +385,11 @@ class QualityCacheManager:
             else client.claim(job_code)
         )
         source = resolve_source_directory(str(claimed["source_uri"]))
-        files, asset_manifest_sha256 = self._manifest_file_specs(claimed, source)
+        (
+            files,
+            asset_manifest_sha256,
+            generated_manifest_payload,
+        ) = self._manifest_file_specs(claimed, source)
         episode_specs, manifest_file = self._episode_file_specs(claimed, files)
         total_bytes = sum(int(item["size_bytes"]) for item in files)
         asset_directory = self._asset_directory_name(claimed)
@@ -468,14 +472,41 @@ class QualityCacheManager:
         )
 
         if not state.get("asset_manifest_ready"):
-            copied_bytes = self._copy_resumable(
-                source / manifest_file["relative_path"],
-                ready_root / manifest_file["relative_path"],
-                copied_bytes=copied_bytes,
-                total_bytes=total_bytes,
-                callback=copy_progress,
-                expected_size=int(manifest_file["size_bytes"]),
-            )
+            manifest_target = ready_root / manifest_file["relative_path"]
+            if generated_manifest_payload is None:
+                copied_bytes = self._copy_resumable(
+                    source / manifest_file["relative_path"],
+                    manifest_target,
+                    copied_bytes=copied_bytes,
+                    total_bytes=total_bytes,
+                    callback=copy_progress,
+                    expected_size=int(manifest_file["size_bytes"]),
+                )
+            else:
+                manifest_already_cached = (
+                    manifest_target.is_file()
+                    and manifest_target.stat().st_size
+                    == int(manifest_file["size_bytes"])
+                    and sha256_file(manifest_target) == manifest_file["sha256"]
+                )
+                if not manifest_already_cached:
+                    self._write_bytes_atomic(
+                        manifest_target,
+                        generated_manifest_payload,
+                    )
+                    copied_bytes += len(generated_manifest_payload)
+                    copy_progress(
+                        {
+                            "status": "caching",
+                            "progress": (
+                                int(copied_bytes * 100 / total_bytes)
+                                if total_bytes
+                                else 100
+                            ),
+                            "cached_bytes": copied_bytes,
+                            "current_file": "asset_manifest.json (Flow)",
+                        }
+                    )
             self._verify_manifest_files(
                 ready_root,
                 [manifest_file],
@@ -1563,6 +1594,13 @@ class QualityCacheManager:
         return cleaned or "asset"
 
     @staticmethod
+    def _is_ego_job(job: dict) -> bool:
+        return (
+            str(job.get("viewer_profile") or "") == "ego_omniego"
+            or str(job.get("asset_type") or "") == "egocentric"
+        )
+
+    @staticmethod
     def _safe_component(value: object, field_name: str) -> str:
         text = str(value or "")
         if not text or text in {".", ".."} or not re.fullmatch(r"[A-Za-z0-9._-]+", text):
@@ -1798,7 +1836,7 @@ class QualityCacheManager:
         self,
         job: dict,
         source_root: Path,
-    ) -> tuple[list[dict], str]:
+    ) -> tuple[list[dict], str, bytes | None]:
         manifest = job.get("asset_manifest") or {}
         if not isinstance(manifest, dict) or not manifest.get("episodes"):
             raise QualityCacheError("Flow 任务缺少完整 asset_manifest，禁止下载")
@@ -1834,13 +1872,21 @@ class QualityCacheManager:
             raise QualityCacheError("Flow 返回的资产清单摘要不一致")
 
         published_manifest = source_root / "asset_manifest.json"
+        generated_manifest_payload: bytes | None = None
         try:
             stored_manifest = json.loads(published_manifest.read_text(encoding="utf-8"))
         except FileNotFoundError as exc:
-            raise QualityCacheError("NAS 资产尚未发布 asset_manifest.json") from exc
+            if not self._is_ego_job(job):
+                raise QualityCacheError("NAS 资产尚未发布 asset_manifest.json") from exc
+            generated_manifest_payload = (
+                json.dumps(manifest, ensure_ascii=False, indent=2) + "\n"
+            ).encode("utf-8")
         except (OSError, json.JSONDecodeError) as exc:
             raise QualityCacheError("NAS asset_manifest.json 无法读取") from exc
-        if canonical_json_sha256(stored_manifest) != manifest_digest:
+        if (
+            generated_manifest_payload is None
+            and canonical_json_sha256(stored_manifest) != manifest_digest
+        ):
             raise QualityCacheError("NAS 资产清单与 Flow 登记内容不一致")
 
         specs = []
@@ -1898,14 +1944,24 @@ class QualityCacheManager:
                 f"资产清单缺少 Episode 主文件：{', '.join(missing_primaries)}"
             )
 
+        if generated_manifest_payload is None:
+            manifest_size = published_manifest.stat().st_size
+            manifest_file_sha256 = sha256_file(published_manifest)
+        else:
+            manifest_size = len(generated_manifest_payload)
+            manifest_file_sha256 = hashlib.sha256(generated_manifest_payload).hexdigest()
         specs.append(
             {
                 "relative_path": "asset_manifest.json",
-                "size_bytes": published_manifest.stat().st_size,
-                "sha256": sha256_file(published_manifest),
+                "size_bytes": manifest_size,
+                "sha256": manifest_file_sha256,
             }
         )
-        return sorted(specs, key=lambda item: item["relative_path"]), manifest_digest
+        return (
+            sorted(specs, key=lambda item: item["relative_path"]),
+            manifest_digest,
+            generated_manifest_payload,
+        )
 
     @staticmethod
     def _verify_manifest_files(
@@ -2159,18 +2215,11 @@ class QualityCacheManager:
         return copied_bytes
 
     @staticmethod
-    def _write_json_atomic(path: Path, value: object) -> None:
+    def _write_bytes_atomic(path: Path, payload: bytes) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.partial")
-        # Write the exact UTF-8 bytes used by result SHA-256 calculation.
-        # Text-mode writes translate LF to CRLF on Windows, which made the
-        # uploaded result differ from the digest calculated before writing.
         try:
-            temporary.write_bytes(
-                (json.dumps(value, ensure_ascii=False, indent=2) + "\n").encode(
-                    "utf-8"
-                )
-            )
+            temporary.write_bytes(payload)
             for attempt in range(_ATOMIC_JSON_REPLACE_ATTEMPTS):
                 try:
                     os.replace(temporary, path)
@@ -2188,6 +2237,16 @@ class QualityCacheManager:
                     break
         finally:
             temporary.unlink(missing_ok=True)
+
+    @staticmethod
+    def _write_json_atomic(path: Path, value: object) -> None:
+        # Write the exact UTF-8 bytes used by result SHA-256 calculation.
+        # Text-mode writes translate LF to CRLF on Windows, which made the
+        # uploaded result differ from the digest calculated before writing.
+        QualityCacheManager._write_bytes_atomic(
+            path,
+            (json.dumps(value, ensure_ascii=False, indent=2) + "\n").encode("utf-8"),
+        )
 
     @staticmethod
     def _emit(callback: ProgressCallback | None, state: dict[str, object]) -> None:

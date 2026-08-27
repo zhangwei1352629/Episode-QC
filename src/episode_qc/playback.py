@@ -7,6 +7,8 @@ import math
 import os
 import shutil
 import struct
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from typing import BinaryIO
@@ -14,12 +16,13 @@ from typing import BinaryIO
 from mcap.reader import make_reader
 
 from episode_qc.bvh import iter_bvh_motion, read_bvh_header
-from episode_qc.compressed_image import decode_compressed_image
+from episode_qc.compressed_image import _iter_fields, decode_compressed_image
+from episode_qc.compressed_video import decode_compressed_video
 from episode_qc.messagepack import decode_messagepack
 from episode_qc.workspace import _json, _now, connect_workspace, episode_detail
 
 
-PLAYBACK_CACHE_VERSION = 7
+PLAYBACK_CACHE_VERSION = 8
 MOTION_FRAME_ENCODING = "episode-qc-motion-f32-le-v1"
 ACTION_FRAME_ENCODING = "episode-qc-action-f32-le-v2"
 ACTION_ROOT_POSITION = 1
@@ -180,6 +183,12 @@ def prepare_episode_cache(
     motion_topics = {item["topic"] for item in motion_streams}
     camera_files: dict[str, BinaryIO] = {}
     camera_indices: dict[str, list[list[int]]] = {str(item["id"]): [] for item in camera_streams}
+    h264_files: dict[str, BinaryIO] = {}
+    h264_offsets: dict[str, list[int]] = {
+        str(item["id"]): []
+        for item in camera_streams
+        if item.get("adapter_id") == "foxglove_compressed_video_h264_v1"
+    }
     motion_file: BinaryIO | None = None
     motion_index: list[list[int]] = []
     action_by_topic = {
@@ -198,7 +207,10 @@ def prepare_episode_cache(
         cameras_dir = temp_dir / "cameras"
         cameras_dir.mkdir()
         for item in camera_streams:
-            camera_files[str(item["id"])] = (cameras_dir / f"{item['id']}.frames").open("wb")
+            stream_id = str(item["id"])
+            camera_files[stream_id] = (cameras_dir / f"{stream_id}.frames").open("wb")
+            if stream_id in h264_offsets:
+                h264_files[stream_id] = (cameras_dir / f"{stream_id}.h264").open("wb")
         if motion_streams:
             motion_dir = temp_dir / "mocap"
             motion_dir.mkdir()
@@ -237,13 +249,27 @@ def prepare_episode_cache(
                         stream = camera_by_topic[channel.topic]
                         stream_id = str(stream["id"])
                         try:
-                            compressed = decode_compressed_image(message.data)
-                            output = camera_files[stream_id]
-                            byte_offset = output.tell()
-                            output.write(compressed.data)
-                            camera_indices[stream_id].append(
-                                [offset_ns, byte_offset, len(compressed.data), len(camera_indices[stream_id])]
-                            )
+                            if stream_id in h264_offsets:
+                                compressed_video = decode_compressed_video(message.data)
+                                if compressed_video.format.lower() not in {"h264", "avc"}:
+                                    raise ValueError(
+                                        f"不支持的 CompressedVideo 格式: {compressed_video.format}"
+                                    )
+                                h264_files[stream_id].write(compressed_video.data)
+                                h264_offsets[stream_id].append(offset_ns)
+                            else:
+                                compressed = decode_compressed_image(message.data)
+                                output = camera_files[stream_id]
+                                byte_offset = output.tell()
+                                output.write(compressed.data)
+                                camera_indices[stream_id].append(
+                                    [
+                                        offset_ns,
+                                        byte_offset,
+                                        len(compressed.data),
+                                        len(camera_indices[stream_id]),
+                                    ]
+                                )
                         except Exception as exc:
                             if len(decode_errors) < 100:
                                 decode_errors.append(f"{channel.topic}: {type(exc).__name__}: {exc}")
@@ -280,6 +306,42 @@ def prepare_episode_cache(
             finally:
                 if source is not None:
                     source.close()
+        for output in h264_files.values():
+            output.close()
+        h264_files.clear()
+        for stream_id, offsets in h264_offsets.items():
+            raw_path = cameras_dir / f"{stream_id}.h264"
+            mjpeg_path = cameras_dir / f"{stream_id}.mjpeg"
+            try:
+                _transcode_h264_to_mjpeg(raw_path, mjpeg_path)
+                output = camera_files[stream_id]
+                for frame_index, jpeg in enumerate(_iter_mjpeg_frames(mjpeg_path)):
+                    if frame_index >= len(offsets):
+                        break
+                    byte_offset = output.tell()
+                    output.write(jpeg)
+                    camera_indices[stream_id].append(
+                        [offsets[frame_index], byte_offset, len(jpeg), frame_index]
+                    )
+                if len(camera_indices[stream_id]) != len(offsets):
+                    stream = next(
+                        item for item in camera_streams if str(item["id"]) == stream_id
+                    )
+                    decode_errors.append(
+                        f"{stream['topic']}: "
+                        f"H264 解码帧数 {len(camera_indices[stream_id])}/{len(offsets)}"
+                    )
+            except Exception as exc:
+                if len(decode_errors) < 100:
+                    stream = next(
+                        item for item in camera_streams if str(item["id"]) == stream_id
+                    )
+                    decode_errors.append(
+                        f"{stream['topic']}: {type(exc).__name__}: {exc}"
+                    )
+            finally:
+                raw_path.unlink(missing_ok=True)
+                mjpeg_path.unlink(missing_ok=True)
         for output in camera_files.values():
             output.close()
         camera_files.clear()
@@ -393,6 +455,8 @@ def prepare_episode_cache(
     except Exception:
         for output in camera_files.values():
             output.close()
+        for output in h264_files.values():
+            output.close()
         if motion_file:
             motion_file.close()
         for output in action_files.values():
@@ -445,7 +509,10 @@ def _link_manifest_frame_files(source_root: Path, destination_root: Path, manife
 
 
 def decode_human_motion(payload: bytes) -> tuple[dict[str, object], list[str]]:
-    value = json.loads(payload)
+    try:
+        value = json.loads(payload)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _decode_omniego_body_frame(payload)
     if isinstance(value, dict):
         datasets = value.get("datasets")
         smpl = datasets.get("smpl_joints") if isinstance(datasets, dict) else value.get("smpl_joints")
@@ -483,6 +550,138 @@ def decode_human_motion(payload: bytes) -> tuple[dict[str, object], list[str]]:
         "source_timestamp_ns": value.get("source_timestamp_ns"),
         "sequence": value.get("sequence"),
     }, names
+
+
+def _decode_omniego_body_frame(
+    payload: bytes,
+) -> tuple[dict[str, object], list[str]]:
+    header: bytes | None = None
+    transforms: list[bytes] = []
+    for field_number, wire_type, value in _iter_fields(payload):
+        if field_number == 1 and wire_type == 2:
+            header = value
+        elif field_number == 2 and wire_type == 2:
+            transforms.append(value)
+    if len(transforms) not in {22, 24}:
+        raise ValueError(f"OmniEgo BodyFrame 必须包含 22 或 24 个关节，实际 {len(transforms)}")
+
+    positions: list[list[float]] = []
+    rotations: list[list[float]] = []
+    validity: list[bool] = []
+    for transform in transforms:
+        position_payload: bytes | None = None
+        quaternion_payload: bytes | None = None
+        for field_number, wire_type, value in _iter_fields(transform):
+            if field_number == 1 and wire_type == 2:
+                position_payload = value
+            elif field_number == 2 and wire_type == 2:
+                quaternion_payload = value
+        position = _protobuf_doubles(position_payload, 3)
+        quaternion = _protobuf_doubles(quaternion_payload, 4)
+        valid = all(math.isfinite(item) for item in position + quaternion)
+        positions.append(position if valid else [0.0, 0.0, 0.0])
+        rotations.append(quaternion if valid else [1.0, 0.0, 0.0, 0.0])
+        validity.append(valid)
+
+    sequence = None
+    source_timestamp_ns = None
+    if header is not None:
+        for field_number, wire_type, value in _iter_fields(header):
+            if wire_type != 0:
+                continue
+            if field_number == 1:
+                sequence = int(value)
+            elif field_number == 2:
+                source_timestamp_ns = int(value)
+    names = list(SMPL_24_JOINT_NAMES[: len(transforms)])
+    return {
+        "positions": positions,
+        "rotations_wxyz": rotations,
+        "validity": validity,
+        "source_timestamp_ns": source_timestamp_ns,
+        "sequence": sequence,
+    }, names
+
+
+def _protobuf_doubles(payload: bytes | None, expected: int) -> list[float]:
+    if payload is None:
+        raise ValueError("OmniEgo BodyFrame 缺少关节位姿字段")
+    values = {
+        field_number: struct.unpack("<d", value)[0]
+        for field_number, wire_type, value in _iter_fields(payload)
+        if wire_type == 1 and 1 <= field_number <= expected
+    }
+    return [values.get(index, 0.0) for index in range(1, expected + 1)]
+
+
+def _ffmpeg_executable() -> Path:
+    configured = str(os.environ.get("EPISODE_QC_FFMPEG") or "").strip()
+    candidates = [
+        Path(configured) if configured else None,
+        Path(found) if (found := shutil.which("ffmpeg")) else None,
+        Path(sys.prefix).parent / "bin" / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg"),
+    ]
+    for candidate in candidates:
+        if candidate and candidate.is_file():
+            return candidate
+    raise ValueError("未找到 FFmpeg，无法解码 OmniEgo H264 视频")
+
+
+def _transcode_h264_to_mjpeg(source: Path, destination: Path) -> None:
+    if not source.is_file() or source.stat().st_size == 0:
+        raise ValueError("OmniEgo H264 视频流为空")
+    result = subprocess.run(
+        [
+            str(_ffmpeg_executable()),
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "h264",
+            "-i",
+            str(source),
+            "-an",
+            "-fps_mode",
+            "passthrough",
+            "-q:v",
+            "3",
+            "-f",
+            "mjpeg",
+            str(destination),
+        ],
+        capture_output=True,
+        check=False,
+        timeout=600,
+    )
+    if result.returncode != 0:
+        error = result.stderr.decode("utf-8", errors="replace").strip()
+        raise ValueError(f"FFmpeg 解码 OmniEgo H264 失败：{error[-500:]}")
+
+
+def _iter_mjpeg_frames(path: Path):
+    buffer = b""
+    with path.open("rb") as source:
+        while True:
+            chunk = source.read(1024 * 1024)
+            if chunk:
+                buffer += chunk
+            while True:
+                start = buffer.find(b"\xff\xd8")
+                if start < 0:
+                    buffer = buffer[-1:]
+                    break
+                end = buffer.find(b"\xff\xd9", start + 2)
+                if end < 0:
+                    buffer = buffer[start:]
+                    break
+                end += 2
+                yield buffer[start:end]
+                buffer = buffer[end:]
+            if not chunk:
+                break
+    if buffer.strip(b"\x00"):
+        raise ValueError("FFmpeg 输出包含不完整 JPEG 帧")
 
 
 def _decode_dohc_smpl_motion(
@@ -700,6 +899,8 @@ def decode_robot_action_frame(payload: bytes, source_key: str) -> dict[str, obje
 def _parent_indices(names: list[str]) -> list[int]:
     if names == SMPL_24_JOINT_NAMES:
         return list(SMPL_24_PARENT_INDICES)
+    if names == SMPL_24_JOINT_NAMES[:22]:
+        return list(SMPL_24_PARENT_INDICES[:22])
     lookup = {name: index for index, name in enumerate(names)}
     return [lookup.get(HUMAN_PARENT_NAMES.get(name, ""), -1) for name in names]
 

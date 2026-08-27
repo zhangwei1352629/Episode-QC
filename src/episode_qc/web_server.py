@@ -33,6 +33,7 @@ from episode_qc.playback import (
     prepare_episode_cache,
     public_cache_manifest,
 )
+from episode_qc.source_paths import resolve_source_directory
 from episode_qc.workspace import (
     backup_workspace_database,
     delete_annotation,
@@ -84,6 +85,7 @@ class WebPaths:
     static_root: Path
     default_profile: Path
     default_label_schema: Path
+    ego_label_schema: Path
 
 
 class NasStatusMonitor:
@@ -169,6 +171,11 @@ def default_web_paths(workspace_root: str | Path | None = None) -> WebPaths:
             packaged_static / "label-template-simple.yaml"
             if packaged_static.is_dir()
             else project_root / "app" / "renderer" / "label-template-simple.yaml"
+        ),
+        ego_label_schema=(
+            packaged_static / "label-schema-ego-manual.yaml"
+            if packaged_static.is_dir()
+            else project_root / "app" / "renderer" / "label-schema-ego-manual.yaml"
         ),
     )
 
@@ -944,7 +951,19 @@ class EpisodeQcWebApplication:
             ensure_work_session_before_submit = True
             reclaim_before_submit = True
         manager = self._quality_cache_manager()
-        mappings = manager.local_episode_mappings(job_code)
+        mappings = self._workspace_episode_mappings(job, task)
+        if mappings:
+            mapping_writer = getattr(manager, "record_local_episodes", None)
+            if mapping_writer:
+                mapping_writer(job_code, mappings)
+        elif str(task.get("id") or "").strip() and isinstance(
+            job.get("episodes"), list
+        ) and job.get("episodes"):
+            raise ValueError(
+                "质检结果无法按实际 Episode 目录建立完整映射，已阻止按列表顺序提交"
+            )
+        else:
+            mappings = manager.local_episode_mappings(job_code)
         if not mappings:
             raise ValueError("质检任务缺少本地 Episode 映射")
         episode_results = []
@@ -961,8 +980,26 @@ class EpisodeQcWebApplication:
                     "annotation_count": int(episode.get("annotation_count") or 0),
                     "annotations": detail["annotations"],
                     "completed_at": episode.get("reviewed_at"),
+                    **(
+                        {
+                            "relative_episode_path": mapping["relative_path"],
+                            "episode_name": Path(str(mapping["relative_path"])).name,
+                        }
+                        if mapping.get("relative_path")
+                        else {}
+                    ),
                     "result": {
                         "local_episode_id": mapping["local_episode_id"],
+                        **(
+                            {
+                                "relative_episode_path": mapping["relative_path"],
+                                "episode_name": Path(
+                                    str(mapping["relative_path"])
+                                ).name,
+                            }
+                            if mapping.get("relative_path")
+                            else {}
+                        ),
                         "review_status": episode.get("review_status"),
                         "reviewer_name": episode.get("reviewer_name"),
                         "deleted_annotation_lineages": detail.get(
@@ -1115,6 +1152,8 @@ class EpisodeQcWebApplication:
         self,
         job: dict[str, object],
         local_task: dict[str, object],
+        *,
+        require_complete: bool = True,
     ) -> list[dict[str, object]]:
         """Rebuild safe Flow mappings for legacy tasks without cache state."""
 
@@ -1158,6 +1197,7 @@ class EpisodeQcWebApplication:
 
         mappings: list[dict[str, object]] = []
         seen_platform_paths: set[str] = set()
+        seen_local_episode_ids: set[str] = set()
         for item in platform_episodes:
             if not isinstance(item, dict):
                 return []
@@ -1170,8 +1210,24 @@ class EpisodeQcWebApplication:
             ):
                 return []
             seen_platform_paths.add(relative_path)
-            local_episode_id = local_by_path.get(relative_path)
+            candidate_paths = [relative_path]
+            primary_file = normalized_relative_path(item.get("primary_file"))
+            if primary_file:
+                candidate_paths.append(
+                    normalized_relative_path(f"{relative_path}/{primary_file}")
+                )
+            matched_local_ids = {
+                local_by_path[path]
+                for path in candidate_paths
+                if path in local_by_path
+            }
+            if len(matched_local_ids) > 1:
+                return []
+            local_episode_id = next(iter(matched_local_ids), "")
             if local_episode_id:
+                if local_episode_id in seen_local_episode_ids:
+                    return []
+                seen_local_episode_ids.add(local_episode_id)
                 mappings.append(
                     {
                         "episode_id": platform_episode_id,
@@ -1179,7 +1235,11 @@ class EpisodeQcWebApplication:
                         "relative_path": relative_path,
                     }
                 )
-        return mappings if len(mappings) == len(local_by_path) else []
+        if len(mappings) != len(local_by_path):
+            return []
+        if require_complete and len(mappings) != len(platform_episodes):
+            return []
+        return mappings
 
     def _platform_job(self, client, job_code: str) -> dict[str, object]:
         if hasattr(client, "job"):
@@ -1205,8 +1265,25 @@ class EpisodeQcWebApplication:
                 mappings = mapping_reader(job_code) if mapping_reader else []
             except (OSError, QualityCacheError):
                 mappings = []
-            if not mappings:
-                mappings = self._workspace_episode_mappings(job, local_task)
+            workspace_mappings = self._workspace_episode_mappings(
+                job,
+                local_task,
+                require_complete=False,
+            )
+            if workspace_mappings:
+                mappings = workspace_mappings
+                mapping_writer = getattr(manager, "record_local_episodes", None)
+                if mapping_writer:
+                    mapping_writer(job_code, mappings)
+            elif (
+                str(local_task.get("id") or "").strip()
+                and episodes
+                and all(
+                    isinstance(item, dict) and item.get("relative_path")
+                    for item in episodes
+                )
+            ):
+                mappings = []
             if mappings:
                 sync_flow_previous_reviews(self.paths.db_path, job, mappings)
         return job
@@ -1245,6 +1322,13 @@ class EpisodeQcWebApplication:
                 if self.paths.default_profile.is_file()
                 else None
             )
+            viewer_profile = str(job.get("viewer_profile") or "")
+            asset_type = str(job.get("asset_type") or "")
+            task_kind = (
+                "ego_omniego"
+                if viewer_profile == "ego_omniego" or asset_type == "egocentric"
+                else "robot_teleoperation"
+            )
             indexed = scan_data_source(
                 self.paths.db_path,
                 str(values["cache_dir"]),
@@ -1257,6 +1341,15 @@ class EpisodeQcWebApplication:
                 label_set_id=bound_label_set_id,
                 source_uri=str(job.get("source_uri") or job.get("asset_nas_uri") or ""),
                 task_metadata={"flow_job": job},
+                task_kind=task_kind,
+                annotation_mode=str(
+                    job.get("annotation_mode")
+                    or ("open" if task_kind == "ego_omniego" else "library")
+                ),
+                annotation_schema_version=str(
+                    job.get("annotation_schema_version")
+                    or ("ego_open_v1" if task_kind == "ego_omniego" else "")
+                ),
             )
             ready_by_path = {
                 str(Path(item["relative_path"]).as_posix()).strip("./"): item
@@ -1268,7 +1361,16 @@ class EpisodeQcWebApplication:
                 relative_path = str(
                     Path(platform_episode["relative_path"]).as_posix()
                 ).strip("./")
-                local_episode = ready_by_path.get(relative_path)
+                primary_file = str(platform_episode.get("primary_file") or "").strip("./")
+                candidate_paths = [relative_path]
+                if primary_file:
+                    candidate_paths.append(
+                        str((Path(relative_path) / primary_file).as_posix()).strip("./")
+                    )
+                local_episode = next(
+                    (ready_by_path.get(path) for path in candidate_paths if ready_by_path.get(path)),
+                    None,
+                )
                 if local_episode is not None:
                     mappings.append(
                         {
@@ -1343,7 +1445,11 @@ class EpisodeQcWebApplication:
                 "in_progress",
             }:
                 job = client.claim(job_code)
-            installed_label_set = install_flow_label_schema(self.paths.db_path, job)
+            installed_label_set = (
+                {"active": False}
+                if str(job.get("annotation_mode") or "") == "open"
+                else install_flow_label_schema(self.paths.db_path, job)
+            )
             bound_label_set_id = (
                 str(installed_label_set["id"])
                 if installed_label_set.get("id")
@@ -1413,7 +1519,15 @@ class EpisodeQcWebApplication:
         if not isinstance(root_path, str) or not root_path.strip():
             raise ValueError("请输入数据源目录")
         profile_path = self.paths.default_profile if self.paths.default_profile.is_file() else None
-        return scan_data_source(self.paths.db_path, root_path, profile_path=profile_path)
+        task_kind = str(request.get("taskKind") or "robot_teleoperation")
+        return scan_data_source(
+            self.paths.db_path,
+            root_path,
+            profile_path=profile_path,
+            task_kind=task_kind,
+            annotation_mode="open" if task_kind == "ego_omniego" else "library",
+            annotation_schema_version="ego_open_v1" if task_kind == "ego_omniego" else "",
+        )
 
     def rescan_task(self, task_id: str) -> dict[str, object]:
         profile_path = self.paths.default_profile if self.paths.default_profile.is_file() else None

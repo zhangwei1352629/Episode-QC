@@ -28,7 +28,8 @@
             <button class="panel-toggle" id="toggle-episodes" type="button" title="显示或隐藏任务列表" aria-pressed="true"><span>☷</span><b>任务栏</b></button>
             <button class="panel-toggle" id="toggle-labels" type="button" title="显示或隐藏标注面板" aria-pressed="true"><span>◇</span><b>标注栏</b></button>
           </div>
-          <button class="button primary" id="add-source" type="button">导入新任务</button>
+          <button class="button primary" id="add-source" type="button">Import Episode</button>
+          <button class="button secondary" id="add-ego-source" type="button">Import Ego</button>
           <div class="export-control">
             <button class="button secondary" id="export-results" type="button">导出结果</button>
             <select class="export-format" id="export-format" aria-label="标注结果导出格式" title="每个任务导出一个文件"><option value="json">JSON</option><option value="csv">CSV</option></select>
@@ -40,7 +41,8 @@
               <div class="label-set-list" id="label-set-list"><div class="empty-panel">尚未导入标签库</div></div>
               <div class="label-library-actions">
                 <button class="button primary" id="import-labels" type="button">导入标签库</button>
-                <a class="button secondary download-button" href="./label-template-simple.yaml" download="标签库简易模板.yaml" title="下载后填写英文编码、中文名称和判断标准">下载模板</a>
+                <a class="button secondary download-button" href="./label-template-simple.yaml" download="标签库简易模板.yaml" title="下载后填写英文编码、中文名称和判断标准">下载通用模板</a>
+                <a class="button secondary download-button" href="./label-schema-ego-manual.yaml" download="DOHC-Ego人工动作标注.yaml" title="人工动作分片、身体部位、物品、目标、意外与恢复">下载 Ego 模板</a>
               </div>
             </div>
           </details>
@@ -110,7 +112,7 @@
         <section class="viewer-grid">
           <article class="viewer-card motion-card" id="motion-card">
             <div class="viewer-heading">
-              <div><span class="status-dot"></span><strong>宇树 G1 29DOF</strong><span class="model-badge">URDF</span></div>
+              <div><span class="status-dot"></span><strong id="motion-viewer-title">宇树 G1 29DOF</strong><span class="model-badge" id="motion-viewer-badge">URDF</span></div>
               <div class="viewer-actions">
                 <label><input id="joint-labels" type="checkbox" /> 关节名</label>
                 <button id="reset-view" type="button">复位视角</button>
@@ -118,13 +120,14 @@
             </div>
             <div class="motion-stage">
               <canvas id="motion-canvas"></canvas>
-              <div class="motion-control-panel">
+              <button id="motion-controls-toggle" class="motion-controls-toggle" type="button" aria-expanded="false" aria-controls="motion-control-panel" title="展开动作源和标注范围">视图设置 ▾</button>
+              <div class="motion-control-panel" id="motion-control-panel" hidden>
                 <label><span>动作源</span><select id="motion-source" title="选择 G1 动作源" aria-label="选择 G1 动作源"><option value="policy">实际执行姿态（Policy，默认）</option><option value="policy_target">目标姿态（PMG）</option><option value="policy_command">最终控制目标（Policy）</option><option value="soma">重定向姿态（SOMA）</option></select></label>
                 <label><span>标注范围</span><select id="joint-selector" title="选择标注关节" aria-label="选择标注关节"><option value="">全身（默认）</option></select></label>
               </div>
               <div class="joint-label-layer" id="joint-label-layer"></div>
               <div class="viewer-empty" id="motion-empty">选择 Episode 后显示 G1 机器人</div>
-              <div class="motion-hint">G1 关节角直接驱动 · 可切换实际执行/目标/重定向姿态 · 下拉或点击名称选关节 · 拖动旋转 · 滚轮缩放</div>
+              <div class="motion-hint" id="motion-hint">G1 关节角直接驱动 · 可切换实际执行/目标/重定向姿态 · 下拉或点击名称选关节 · 拖动旋转 · 滚轮缩放</div>
               <div class="selected-joint" id="selected-joint" hidden></div>
             </div>
           </article>
@@ -164,7 +167,7 @@
               <span class="eyebrow">人工标注</span>
               <div class="section-title-row"><h2>标签</h2><span class="section-count" id="label-count">0 / 0</span></div>
               <span class="section-meta" id="label-set-meta">正在读取标签库…</span>
-              <span class="label-help">简易模板只要求填写标签名称，其余字段均可省略</span>
+              <span class="label-help" id="label-help">简易模板只要求填写标签名称，其余字段均可省略</span>
             </div>
             <div class="undo-actions"><button id="undo" title="撤销 Ctrl+Z">↶</button><button id="redo" title="恢复 Ctrl+Shift+Z">↷</button></div>
           </div>
@@ -172,6 +175,18 @@
             <button class="active" data-scope="time_range" type="button">区间</button>
             <button data-scope="time_point" type="button">时间点</button>
             <button data-scope="episode" type="button">整条</button>
+          </div>
+          <div class="open-label-editor" id="open-label-editor" hidden>
+            <select id="open-annotation-type" aria-label="开放标注类型">
+              <option value="action">动作</option>
+              <option value="pose_quality">Pose 质量</option>
+              <option value="camera_quality">相机质量</option>
+              <option value="exception">意外与恢复</option>
+              <option value="object_state">物品状态</option>
+              <option value="other">其他</option>
+            </select>
+            <input id="open-label-name" maxlength="120" placeholder="输入自定义标签，如：双手拿起红色咖啡杯" aria-label="自定义标签名称" />
+            <button id="save-open-label" class="button primary" type="button">添加</button>
           </div>
           <div class="label-filter-row">
             <input id="label-search" type="search" placeholder="搜索标签…" aria-label="搜索标签" />
@@ -182,6 +197,18 @@
             <span class="annotation-note-heading"><strong>备注</strong><small>随下一个标签保存 · 可选</small></span>
             <textarea id="annotation-comment" rows="1" placeholder="补充这次标注的说明…"></textarea>
           </label>
+          <section class="ego-annotation-fields" id="ego-annotation-fields" hidden>
+            <div class="ego-fields-heading"><strong>Ego 动作信息</strong><span>人工填写，不使用机器初标</span></div>
+            <div class="ego-fields-grid">
+              <label><span>执行部位</span><select id="ego-body-part"><option value="">请选择</option><option value="left_hand">左手</option><option value="right_hand">右手</option><option value="both_hands">双手</option><option value="whole_body">全身</option><option value="unknown">无法判断</option></select></label>
+              <label><span>物品名称</span><input id="ego-object-name" placeholder="如：咖啡杯" /></label>
+              <label><span>物品颜色</span><input id="ego-object-color" placeholder="如：红色" /></label>
+              <label><span>起始位置</span><input id="ego-source-name" placeholder="如：纸箱内" /></label>
+              <label class="wide"><span>目标位置</span><input id="ego-target-name" placeholder="如：第二层货架左侧" /></label>
+              <label><span>意外类型</span><select id="ego-exception-type"><option value="">无</option><option value="object_dropped">物品掉落</option><option value="object_fell_over">物品倒下</option><option value="retry">重复或重试</option><option value="failed_grasp">抓取失败</option><option value="collision">碰撞</option><option value="person_interruption">人员干扰</option><option value="other">其他</option></select></label>
+              <label class="wide"><span>恢复动作</span><input id="ego-recovery-action" placeholder="如：重新拾起后继续放置" /></label>
+            </div>
+          </section>
           <div class="label-list" id="label-list">
             <div class="empty-panel">请先导入标签库</div>
           </div>
@@ -267,7 +294,8 @@
         </div>
         <div class="task-center-actions">
           <p id="task-center-note">清空历史导入只删除本地索引和派生缓存，不删除原始数据，也不影响 Flow 任务。</p>
-          <button class="button primary" id="task-center-import" type="button">导入新任务</button>
+          <button class="button primary" id="task-center-import" type="button">Import Episode</button>
+          <button class="button secondary" id="task-center-import-ego" type="button">Import Ego</button>
         </div>
       </div>
       <div class="toast-stack task-center-toast-stack" id="task-center-toast-stack" role="status" aria-live="polite" aria-atomic="true"></div>

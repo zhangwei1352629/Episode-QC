@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import struct
 from typing import Iterator
 
 
@@ -18,12 +19,19 @@ class CompressedImage:
 
 
 def decode_compressed_image(payload: bytes) -> CompressedImage:
-    """Decode the foxglove.CompressedImage protobuf fields used by the MCAPs.
+    """Decode Foxglove protobuf or ROS 1 ``sensor_msgs/CompressedImage``.
 
     The project only needs a tiny subset of protobuf wire types here. Keeping
     this local parser avoids generating protobuf classes at runtime.
     """
 
+    try:
+        return _decode_foxglove_compressed_image(payload)
+    except (ProtobufDecodeError, UnicodeDecodeError):
+        return _decode_ros1_compressed_image(payload)
+
+
+def _decode_foxglove_compressed_image(payload: bytes) -> CompressedImage:
     timestamp_seconds: int | None = None
     timestamp_nanos: int | None = None
     frame_id = ""
@@ -46,6 +54,48 @@ def decode_compressed_image(payload: bytes) -> CompressedImage:
     return CompressedImage(
         timestamp_seconds=timestamp_seconds,
         timestamp_nanos=timestamp_nanos,
+        frame_id=frame_id,
+        data=image_data,
+        format=image_format,
+    )
+
+
+def _decode_ros1_compressed_image(payload: bytes) -> CompressedImage:
+    """Decode the ROS 1 wire layout without depending on a ROS runtime."""
+
+    offset = 0
+
+    def uint32() -> int:
+        nonlocal offset
+        _ensure_available(payload, offset, 4)
+        value = struct.unpack_from("<I", payload, offset)[0]
+        offset += 4
+        return value
+
+    def string() -> str:
+        nonlocal offset
+        length = uint32()
+        _ensure_available(payload, offset, length)
+        value = payload[offset : offset + length].decode("utf-8")
+        offset += length
+        return value
+
+    _sequence = uint32()
+    seconds = uint32()
+    nanos = uint32()
+    frame_id = string()
+    image_format = string()
+    data_length = uint32()
+    _ensure_available(payload, offset, data_length)
+    image_data = payload[offset : offset + data_length]
+    offset += data_length
+    if offset != len(payload):
+        raise ProtobufDecodeError("ROS1 CompressedImage payload contains trailing bytes")
+    if not image_data:
+        raise ProtobufDecodeError("ROS1 CompressedImage payload contains no image data")
+    return CompressedImage(
+        timestamp_seconds=seconds,
+        timestamp_nanos=nanos,
         frame_id=frame_id,
         data=image_data,
         format=image_format,

@@ -118,6 +118,44 @@ def test_flow_client_omits_null_optional_annotation_fields_from_submission():
     assert annotation["target_key"] is None
 
 
+def test_flow_client_submits_open_ego_annotations_without_a_label_set():
+    client = FlowClient("http://flow.test")
+    client.request = Mock(return_value={"code": "QCJ-EGO", "status": "completed"})
+
+    client.submit_result(
+        "QCJ-EGO",
+        annotation_mode="open",
+        annotation_schema_version="ego_open_v1",
+        episode_results=[
+            {
+                "episode_id": "EGO-EP0001",
+                "decision": "pass_with_labels",
+                "annotation_count": 1,
+                "annotations": [
+                    {
+                        "id": "ego-ann-1",
+                        "annotation_type": "action",
+                        "label_name": "双手拿起红色咖啡杯",
+                        "label_slug": "custom_cup",
+                        "scope": "time_range",
+                        "start_offset_ns": 1,
+                        "end_offset_ns": 2,
+                        "target_type": "mocap",
+                    }
+                ],
+            }
+        ],
+    )
+
+    payload = client.request.call_args.args[2]
+    assert payload["annotation_mode"] == "open"
+    assert payload["annotation_schema_version"] == "ego_open_v1"
+    assert "label_set" not in payload
+    annotation = payload["episode_results"][0]["annotations"][0]
+    assert annotation["label_name"] == "双手拿起红色咖啡杯"
+    assert annotation["annotation_type"] == "action"
+
+
 def test_flow_client_renews_claim_without_creating_work_heartbeat():
     client = FlowClient("http://flow.test")
     client.request = Mock(return_value={"code": "QCJ-HEARTBEAT", "status": "in_progress"})
@@ -589,6 +627,114 @@ class FakeFlowClient:
         assert job_code == self.job["code"]
         self.results.append(values)
         return {**self.job, "status": "completed", "submitted": values}
+
+
+def test_submit_result_binds_gapped_episode_directories_instead_of_list_positions(
+    tmp_path: Path,
+):
+    asset_root = tmp_path / "nas" / "AST-GAPPED"
+    episode_20 = asset_root / "episodes" / "episode_000020"
+    episode_22 = asset_root / "episodes" / "episode_000022"
+    episode_20.mkdir(parents=True)
+    episode_22.mkdir(parents=True)
+    primary_20 = episode_20 / "motion.bvh"
+    primary_22 = episode_22 / "motion.bvh"
+    primary_20.write_bytes(b"episode twenty")
+    primary_22.write_bytes(b"episode twenty-two")
+    job = {
+        "code": "QCJ-GAPPED",
+        "version": 1,
+        "asset_id": "AST-GAPPED",
+        "asset_size_bytes": 0,
+        "asset_nas_uri": str(asset_root),
+        "source_uri": str(asset_root),
+        "episodes": [
+            {
+                "episode_id": "AST-GAPPED-EP0001",
+                "relative_path": "episodes/episode_000020",
+                "primary_file": "motion.bvh",
+                "checksum_sha256": hashlib.sha256(primary_20.read_bytes()).hexdigest(),
+            },
+            {
+                "episode_id": "AST-GAPPED-EP0002",
+                "relative_path": "episodes/episode_000022",
+                "primary_file": "motion.bvh",
+                "checksum_sha256": hashlib.sha256(primary_22.read_bytes()).hexdigest(),
+            },
+        ],
+    }
+    publish_asset_manifest(
+        asset_root,
+        job,
+        [
+            "episodes/episode_000020/motion.bvh",
+            "episodes/episode_000022/motion.bvh",
+        ],
+    )
+    job["asset_size_bytes"] = sum(
+        path.stat().st_size for path in asset_root.rglob("*") if path.is_file()
+    )
+    client = FakeFlowClient(job)
+    cache = QualityCacheManager(tmp_path / "qc-cache", reserve_bytes=0)
+    cache.cache_job(client, job)
+
+    with pytest.raises(
+        QualityCacheError,
+        match="标注结果与实际数据目录不一致",
+    ):
+        cache.submit_result(
+            client,
+            job,
+            episode_results=[
+                {
+                    "episode_id": "AST-GAPPED-EP0001",
+                    "relative_episode_path": "episodes/episode_000022",
+                    "decision": "pass",
+                    "annotation_count": 0,
+                },
+                {
+                    "episode_id": "AST-GAPPED-EP0002",
+                    "relative_episode_path": "episodes/episode_000020",
+                    "decision": "discard",
+                    "annotation_count": 0,
+                },
+            ],
+        )
+
+    cache.submit_result(
+        client,
+        job,
+        episode_results=[
+            {
+                "episode_id": "AST-GAPPED-EP0002",
+                "decision": "discard",
+                "annotation_count": 0,
+            },
+            {
+                "episode_id": "AST-GAPPED-EP0001",
+                "decision": "pass",
+                "annotation_count": 0,
+            },
+        ],
+    )
+
+    result = json.loads((asset_root / "qc_result.json").read_text(encoding="utf-8"))
+    assert [item["episode_name"] for item in result["episode_results"]] == [
+        "episode_000020",
+        "episode_000022",
+    ]
+    results_by_id = {item["episode_id"]: item for item in result["episode_results"]}
+    assert results_by_id["AST-GAPPED-EP0001"]["relative_episode_path"] == (
+        "episodes/episode_000020"
+    )
+    assert results_by_id["AST-GAPPED-EP0001"]["episode_name"] == "episode_000020"
+    assert results_by_id["AST-GAPPED-EP0001"]["result"][
+        "relative_episode_path"
+    ] == "episodes/episode_000020"
+    assert results_by_id["AST-GAPPED-EP0002"]["relative_episode_path"] == (
+        "episodes/episode_000022"
+    )
+    assert results_by_id["AST-GAPPED-EP0002"]["episode_name"] == "episode_000022"
 
 
 def test_cache_job_verifies_each_cached_file_once_and_reports_file_progress(

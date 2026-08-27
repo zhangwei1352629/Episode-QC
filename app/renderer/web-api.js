@@ -78,17 +78,27 @@ function installWebApi() {
       { method: "POST" },
     ),
     updateWorkspaceSettings: (value) => request("/api/workspace/settings", { method: "POST", body: value }),
-    addSource: async () => {
-      const previous = window.localStorage.getItem("episodeQcSourcePath") || "";
+    addSource: async (taskKind = "robot_teleoperation") => {
+      const ego = taskKind === "ego_omniego";
+      const storageKey = ego ? "episodeQcEgoSourcePath" : "episodeQcSourcePath";
+      const previous = window.localStorage.getItem(storageKey) || "";
       const rootPath = window.prompt(
-        "请输入 QC 服务器可访问的绝对路径或已挂载 NAS 目录",
+        ego
+          ? "请输入 OmniEgo 数据目录（目录内每个 MCAP 文件作为一个 Episode）"
+          : "请输入 QC 服务器可访问的绝对路径或已挂载 NAS 目录",
         previous,
       );
       if (rootPath === null || !rootPath.trim()) return null;
-      window.localStorage.setItem("episodeQcSourcePath", rootPath.trim());
-      return request("/api/tasks/import", { method: "POST", body: { rootPath: rootPath.trim() } });
+      window.localStorage.setItem(storageKey, rootPath.trim());
+      return request("/api/tasks/import", {
+        method: "POST",
+        body: { rootPath: rootPath.trim(), taskKind },
+      });
     },
-    addSourcePath: (rootPath) => request("/api/tasks/import", { method: "POST", body: { rootPath } }),
+    addSourcePath: (rootPath, taskKind = "robot_teleoperation") => request(
+      "/api/tasks/import",
+      { method: "POST", body: { rootPath, taskKind } },
+    ),
     rescanTask: (taskId) => request(`/api/tasks/${encodeURIComponent(taskId)}/rescan`, { method: "POST" }),
     getEpisode: (episodeId) => request(`/api/episodes/${encodeURIComponent(episodeId)}`),
     prepareEpisode: async (episodeId) => {

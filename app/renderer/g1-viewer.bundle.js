@@ -34255,6 +34255,14 @@ var G1Viewer = class {
     this.scene = new Scene();
     this.scene.background = new Color(725012);
     this.scene.add(this.modelRoot);
+    this.skeletonGroup = new Group();
+    this.skeletonGroup.visible = false;
+    this.scene.add(this.skeletonGroup);
+    this.skeletonJoints = [];
+    this.skeletonBones = [];
+    this.skeletonNames = [];
+    this.skeletonParentIndices = [];
+    this.skeletonPositions = [];
     this.camera = new PerspectiveCamera(28, 1, 0.01, 30);
     this.renderer = new WebGLRenderer({ canvas, antialias: true, alpha: false, powerPreference: "high-performance" });
     this.renderer.setClearColor(725012, 1);
@@ -34334,6 +34342,7 @@ var G1Viewer = class {
   render(frame, view) {
     this.resize();
     const hasFrame = Boolean(frame?.positions?.length);
+    const humanPoseMode = view?.viewerProfile === "ego_omniego";
     const robotAction = view?.robotAction;
     const hasRobotAction = Boolean(robotAction?.jointPositions?.length === 29);
     const poseContextKey = `${view?.episodeId || ""}:${hasRobotAction ? robotAction.source_key || "action" : "mocap"}`;
@@ -34344,13 +34353,87 @@ var G1Viewer = class {
       this.rootPlanarOriginRos = null;
       this.supportFoot = null;
     }
-    this.modelRoot.visible = (hasRobotAction || hasFrame) && this.status === "ready";
-    if (hasRobotAction && this.robot) this.applyRobotAction(robotAction);
+    this.modelRoot.visible = !humanPoseMode && (hasRobotAction || hasFrame) && this.status === "ready";
+    this.skeletonGroup.visible = humanPoseMode && hasFrame;
+    if (humanPoseMode && hasFrame) this.applyHumanSkeleton(frame);
+    else if (hasRobotAction && this.robot) this.applyRobotAction(robotAction);
     else if (hasFrame && this.robot) this.applyMocapPose(frame);
     this.updateCamera(view);
-    this.updateSelection(view?.selectedJoint);
+    this.updateSelection(view?.selectedJoint, humanPoseMode);
     this.renderer.render(this.scene, this.camera);
-    return hasFrame && this.robot ? this.projectJoints(frame) : [];
+    if (!hasFrame) return [];
+    return humanPoseMode ? this.projectSkeletonJoints(frame) : this.robot ? this.projectJoints(frame) : [];
+  }
+  ensureSkeleton(frame) {
+    const names = frame.jointNames || [];
+    const parents = frame.parentIndices || [];
+    const topologyKey = `${names.join("|")}:${parents.join(",")}`;
+    if (this.skeletonTopologyKey === topologyKey) return;
+    this.skeletonTopologyKey = topologyKey;
+    this.skeletonGroup.clear();
+    this.skeletonJoints = [];
+    this.skeletonBones = [];
+    this.skeletonNames = [...names];
+    this.skeletonParentIndices = [...parents];
+    this.skeletonPositions = names.map(() => new Vector3());
+    const jointGeometry = new SphereGeometry(0.035, 18, 12);
+    const boneGeometry = new CylinderGeometry(0.018, 0.018, 1, 12);
+    const materials = {
+      center: new MeshStandardMaterial({ color: 14152534, roughness: 0.42, metalness: 0.08 }),
+      left: new MeshStandardMaterial({ color: 5620479, roughness: 0.42, metalness: 0.08 }),
+      right: new MeshStandardMaterial({ color: 16747378, roughness: 0.42, metalness: 0.08 }),
+      bone: new MeshStandardMaterial({ color: 13095126, roughness: 0.5, metalness: 0.06 })
+    };
+    names.forEach((name) => {
+      const side = String(name).startsWith("left_") ? "left" : String(name).startsWith("right_") ? "right" : "center";
+      const joint = new Mesh(jointGeometry, materials[side]);
+      joint.castShadow = true;
+      this.skeletonGroup.add(joint);
+      this.skeletonJoints.push(joint);
+    });
+    parents.forEach((parentIndex, index) => {
+      if (parentIndex < 0) return;
+      const bone = new Mesh(boneGeometry, materials.bone);
+      bone.userData = { index, parentIndex };
+      bone.castShadow = true;
+      this.skeletonGroup.add(bone);
+      this.skeletonBones.push(bone);
+    });
+  }
+  applyHumanSkeleton(frame) {
+    this.ensureSkeleton(frame);
+    const validPoints = [];
+    frame.positions.forEach((position, index) => {
+      let valid = frame.validity?.[index] !== false && position?.length === 3;
+      const target = this.skeletonPositions[index];
+      if (valid) {
+        target.set(-Number(position[1]), Number(position[2]), -Number(position[0]));
+        valid = [target.x, target.y, target.z].every(Number.isFinite);
+        if (valid) validPoints.push(target);
+      }
+      this.skeletonJoints[index].visible = valid;
+    });
+    const pelvis = (this.skeletonPositions[0] || new Vector3()).clone();
+    const floorY = validPoints.length ? Math.min(...validPoints.map((point) => point.y)) : 0;
+    this.skeletonPositions.forEach((position, index) => {
+      if (!this.skeletonJoints[index].visible) return;
+      position.set(position.x - pelvis.x, position.y - floorY, position.z - pelvis.z);
+      this.skeletonJoints[index].position.copy(position);
+    });
+    const up = new Vector3(0, 1, 0);
+    this.skeletonBones.forEach((bone) => {
+      const { index, parentIndex } = bone.userData;
+      const visible = this.skeletonJoints[index]?.visible && this.skeletonJoints[parentIndex]?.visible;
+      bone.visible = Boolean(visible);
+      if (!visible) return;
+      const start = this.skeletonPositions[parentIndex];
+      const end = this.skeletonPositions[index];
+      const direction = new Vector3().subVectors(end, start);
+      const length = direction.length();
+      bone.position.copy(start).add(end).multiplyScalar(0.5);
+      bone.quaternion.setFromUnitVectors(up, direction.normalize());
+      bone.scale.set(1, length, 1);
+    });
   }
   applyRobotAction(frame) {
     frame.jointNames.forEach((name, index) => this.setJoint(name, frame.jointPositions[index]));
@@ -34400,8 +34483,9 @@ var G1Viewer = class {
     const zoom = clamp3(Number(view.cameraZoom) || 1, 0.35, 3);
     const yaw = Number(view.cameraYaw) || 0;
     const pitch = clamp3(Number(view.cameraPitch) || 0, -0.8, 0.8);
-    const target = new Vector3(0, 0.67, 0);
-    const distance = 3.15 / zoom;
+    const humanPoseMode = view.viewerProfile === "ego_omniego";
+    const target = new Vector3(0, humanPoseMode ? 0.9 : 0.67, 0);
+    const distance = (humanPoseMode ? 4.15 : 3.15) / zoom;
     const elevation = clamp3(0.12 + pitch, -0.62, 0.92);
     const horizontal = Math.cos(elevation) * distance;
     this.camera.position.set(Math.cos(yaw) * horizontal, target.y + Math.sin(elevation) * distance, Math.sin(yaw) * horizontal);
@@ -34492,7 +34576,14 @@ var G1Viewer = class {
     }
     return object.getWorldPosition(target);
   }
-  updateSelection(name) {
+  updateSelection(name, humanPoseMode = false) {
+    if (humanPoseMode) {
+      const index = this.skeletonNames.indexOf(name);
+      const joint = index >= 0 ? this.skeletonJoints[index] : null;
+      if (joint?.visible) joint.getWorldPosition(this.selectionMarker.position);
+      this.selectionMarker.visible = Boolean(joint?.visible && this.skeletonGroup.visible);
+      return;
+    }
     const position = name ? this.worldPositionForHumanJoint(name, this.selectionMarker.position) : null;
     this.selectionMarker.visible = Boolean(position && this.modelRoot.visible);
   }
@@ -34501,6 +34592,23 @@ var G1Viewer = class {
     const world = new Vector3();
     return (frame.jointNames || []).map((name, index) => {
       if (!frame.validity?.[index] || !this.worldPositionForHumanJoint(name, world)) return null;
+      const projected = world.clone().project(this.camera);
+      return {
+        x: (projected.x * 0.5 + 0.5) * rectangle.width,
+        y: (-projected.y * 0.5 + 0.5) * rectangle.height,
+        depth: projected.z,
+        index,
+        name
+      };
+    }).filter(Boolean);
+  }
+  projectSkeletonJoints(frame) {
+    const rectangle = this.canvas.getBoundingClientRect();
+    const world = new Vector3();
+    return (frame.jointNames || []).map((name, index) => {
+      const joint = this.skeletonJoints[index];
+      if (!joint?.visible) return null;
+      joint.getWorldPosition(world);
       const projected = world.clone().project(this.camera);
       return {
         x: (projected.x * 0.5 + 0.5) * rectangle.width,

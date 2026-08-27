@@ -19,7 +19,7 @@ from episode_qc.messagepack import decode_messagepack
 from episode_qc.workspace import _json, _now, connect_workspace, episode_detail
 
 
-PLAYBACK_CACHE_VERSION = 6
+PLAYBACK_CACHE_VERSION = 7
 MOTION_FRAME_ENCODING = "episode-qc-motion-f32-le-v1"
 ACTION_FRAME_ENCODING = "episode-qc-action-f32-le-v2"
 ACTION_ROOT_POSITION = 1
@@ -94,6 +94,16 @@ HUMAN_PARENT_NAMES = {
     "RightForeArm": "RightArm",
     "RightHand": "RightForeArm",
 }
+SMPL_24_JOINT_NAMES = [
+    "pelvis", "left_hip", "right_hip", "spine1", "left_knee", "right_knee",
+    "spine2", "left_ankle", "right_ankle", "spine3", "left_foot", "right_foot",
+    "neck", "left_collar", "right_collar", "head", "left_shoulder", "right_shoulder",
+    "left_elbow", "right_elbow", "left_wrist", "right_wrist", "left_hand", "right_hand",
+]
+SMPL_24_PARENT_INDICES = [
+    -1, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8,
+    9, 12, 12, 12, 13, 14, 16, 17, 18, 19, 20, 21,
+]
 
 
 def prepare_episode_cache(
@@ -148,7 +158,7 @@ def prepare_episode_cache(
             all_camera_streams[0] if all_camera_streams else None,
         )
         camera_streams = [preferred_camera] if preferred_camera else []
-        motion_streams = []
+        motion_streams = all_motion_streams if episode.get("task_kind") == "ego_omniego" else []
         policy_stream = next(
             (item for item in all_action_streams if ROBOT_ACTION_SPECS[item["topic"]]["key"] == "policy"),
             all_action_streams[0] if all_action_streams else None,
@@ -298,14 +308,14 @@ def prepare_episode_cache(
             )
         motion = {
             "available": bool(motion_index),
-            "adapter_id": "human_motion_json_v1" if motion_index else None,
+            "adapter_id": motion_streams[0].get("adapter_id") if motion_index and motion_streams else None,
             "frames_file": "mocap/motion.frames" if motion_index else None,
             "frame_encoding": MOTION_FRAME_ENCODING if motion_index else None,
             "message_count": len(motion_index),
             "index": motion_index,
             "joint_names": joint_names,
             "parent_indices": parent_indices,
-            "coordinate_frame": "world",
+            "coordinate_frame": "smpl_local" if joint_names == SMPL_24_JOINT_NAMES else "world",
             "units": "m",
             "first_offset_ns": motion_index[0][0] if motion_index else None,
             "last_offset_ns": motion_index[-1][0] if motion_index else None,
@@ -436,6 +446,11 @@ def _link_manifest_frame_files(source_root: Path, destination_root: Path, manife
 
 def decode_human_motion(payload: bytes) -> tuple[dict[str, object], list[str]]:
     value = json.loads(payload)
+    if isinstance(value, dict):
+        datasets = value.get("datasets")
+        smpl = datasets.get("smpl_joints") if isinstance(datasets, dict) else value.get("smpl_joints")
+        if smpl is not None:
+            return _decode_dohc_smpl_motion(value, smpl)
     if not isinstance(value, dict) or value.get("schema") != "mocap_human_motion.raw_v1":
         raise ValueError("不支持的 Mocap schema")
     motion = value.get("motion")
@@ -468,6 +483,31 @@ def decode_human_motion(payload: bytes) -> tuple[dict[str, object], list[str]]:
         "source_timestamp_ns": value.get("source_timestamp_ns"),
         "sequence": value.get("sequence"),
     }, names
+
+
+def _decode_dohc_smpl_motion(
+    message: dict[str, object],
+    smpl_value: object,
+) -> tuple[dict[str, object], list[str]]:
+    data = smpl_value.get("data") if isinstance(smpl_value, dict) else smpl_value
+    if not isinstance(data, list) or len(data) != len(SMPL_24_JOINT_NAMES):
+        raise ValueError("DOHC skeleton 必须包含 24 个 SMPL 关节")
+    positions: list[list[float]] = []
+    validity: list[bool] = []
+    for index, raw_position in enumerate(data):
+        if not isinstance(raw_position, list) or len(raw_position) != 3:
+            raise ValueError(f"DOHC skeleton 第 {index} 个关节不是三维坐标")
+        position = [float(item) for item in raw_position]
+        valid = all(math.isfinite(item) for item in position)
+        positions.append(position if valid else [0.0, 0.0, 0.0])
+        validity.append(valid)
+    return {
+        "positions": positions,
+        "rotations_wxyz": [[1.0, 0.0, 0.0, 0.0] for _ in positions],
+        "validity": validity,
+        "source_timestamp_ns": message.get("timestamp_ns"),
+        "sequence": message.get("frame_index", message.get("frame_id")),
+    }, list(SMPL_24_JOINT_NAMES)
 
 
 def decode_robot_action(payload: bytes, source_key: str) -> dict[str, object]:
@@ -658,6 +698,8 @@ def decode_robot_action_frame(payload: bytes, source_key: str) -> dict[str, obje
 
 
 def _parent_indices(names: list[str]) -> list[int]:
+    if names == SMPL_24_JOINT_NAMES:
+        return list(SMPL_24_PARENT_INDICES)
     lookup = {name: index for index, name in enumerate(names)}
     return [lookup.get(HUMAN_PARENT_NAMES.get(name, ""), -1) for name in names]
 

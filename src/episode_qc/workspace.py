@@ -18,7 +18,12 @@ from episode_qc.bvh import read_bvh_header
 from episode_qc.source_paths import resolve_source_directory
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 7
+TASK_KINDS = {"robot_teleoperation", "ego_omniego"}
+ANNOTATION_MODES = {"library", "open"}
+OPEN_ANNOTATION_TYPES = {"action", "pose_quality", "camera_quality", "exception", "object_state", "other"}
+EGO_OPEN_SCHEMA_VERSION = "ego_open_v1"
+EPISODE_INDEX_VERSION = 2
 
 
 class WorkspaceConflictError(RuntimeError):
@@ -216,6 +221,9 @@ def _initialize_workspace(
                 source_uri TEXT NOT NULL,
                 local_source_path TEXT NOT NULL,
                 source_type TEXT NOT NULL DEFAULT 'server_path',
+                task_kind TEXT NOT NULL DEFAULT 'robot_teleoperation',
+                annotation_mode TEXT NOT NULL DEFAULT 'library',
+                annotation_schema_version TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL DEFAULT 'importing',
                 import_error TEXT,
                 metadata_json TEXT NOT NULL DEFAULT '{}',
@@ -248,6 +256,7 @@ def _initialize_workspace(
                 summary_path TEXT,
                 config_path TEXT,
                 fingerprint TEXT NOT NULL,
+                index_version INTEGER NOT NULL DEFAULT 1,
                 file_size INTEGER NOT NULL,
                 file_mtime_ns INTEGER NOT NULL,
                 start_time_ns INTEGER,
@@ -327,6 +336,12 @@ def _initialize_workspace(
                 label_set_key TEXT NOT NULL,
                 label_schema_version TEXT NOT NULL,
                 label_code TEXT NOT NULL,
+                annotation_mode TEXT NOT NULL DEFAULT 'library',
+                annotation_schema_version TEXT NOT NULL DEFAULT '',
+                annotation_type TEXT NOT NULL DEFAULT 'quality',
+                label_name TEXT NOT NULL DEFAULT '',
+                label_slug TEXT NOT NULL DEFAULT '',
+                label_snapshot_json TEXT NOT NULL DEFAULT '{}',
                 scope TEXT NOT NULL,
                 start_offset_ns INTEGER NOT NULL,
                 end_offset_ns INTEGER NOT NULL,
@@ -379,10 +394,25 @@ def _initialize_workspace(
     )
     _ensure_column(connection, "data_source", "task_id", "TEXT REFERENCES qc_task(id)")
     _ensure_column(connection, "qc_task", "source_type", "TEXT NOT NULL DEFAULT 'server_path'")
+    _ensure_column(
+        connection,
+        "qc_task",
+        "task_kind",
+        "TEXT NOT NULL DEFAULT 'robot_teleoperation'",
+    )
     _ensure_column(connection, "qc_task", "label_set_id", "TEXT REFERENCES label_set(id)")
+    _ensure_column(connection, "qc_task", "annotation_mode", "TEXT NOT NULL DEFAULT 'library'")
+    _ensure_column(connection, "qc_task", "annotation_schema_version", "TEXT NOT NULL DEFAULT ''")
     _ensure_column(connection, "qc_task", "review_started_at", "TEXT")
     _ensure_column(connection, "qc_task", "review_completed_at", "TEXT")
+    _ensure_column(connection, "episode", "index_version", "INTEGER NOT NULL DEFAULT 1")
     _ensure_column(connection, "episode", "previous_review_json", "TEXT")
+    _ensure_column(connection, "annotation", "annotation_mode", "TEXT NOT NULL DEFAULT 'library'")
+    _ensure_column(connection, "annotation", "annotation_schema_version", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(connection, "annotation", "annotation_type", "TEXT NOT NULL DEFAULT 'quality'")
+    _ensure_column(connection, "annotation", "label_name", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(connection, "annotation", "label_slug", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(connection, "annotation", "label_snapshot_json", "TEXT NOT NULL DEFAULT '{}'")
     _ensure_column(
         connection,
         "episode",
@@ -397,9 +427,24 @@ def _initialize_workspace(
             "INSERT INTO workspace VALUES (?, ?, ?, NULL, '{}', ?, ?, ?)",
             (workspace_id, name, reviewer_name, SCHEMA_VERSION, now, now),
         )
+        previous_schema_version = SCHEMA_VERSION
+    else:
+        previous_schema_version = int(row["schema_version"] or 0)
     _migrate_data_sources_to_tasks(connection)
     _upgrade_inferred_platform_tasks(connection)
     _migrate_last_episode_to_task(connection)
+    if previous_schema_version < 7:
+        connection.execute(
+            """
+            UPDATE qc_task
+            SET annotation_mode = 'open', annotation_schema_version = ?
+            WHERE task_kind = 'ego_omniego' AND annotation_mode = 'library'
+            """,
+            (EGO_OPEN_SCHEMA_VERSION,),
+        )
+    connection.execute(
+        "UPDATE qc_task SET label_set_id = NULL WHERE annotation_mode = 'open' AND label_set_id IS NOT NULL"
+    )
     connection.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_data_source_task ON data_source(task_id) WHERE task_id IS NOT NULL"
     )
@@ -586,8 +631,24 @@ def scan_data_source(
     label_set_id: str | None = None,
     source_uri: str | None = None,
     task_metadata: dict[str, object] | None = None,
+    task_kind: str = "robot_teleoperation",
+    annotation_mode: str | None = None,
+    annotation_schema_version: str | None = None,
 ) -> dict[str, object]:
     initialize_workspace(db_path)
+    if task_kind not in TASK_KINDS:
+        raise ValueError(f"不支持的 QC 任务类型: {task_kind}")
+    effective_annotation_mode = str(
+        annotation_mode or ("open" if task_kind == "ego_omniego" else "library")
+    ).strip()
+    if effective_annotation_mode not in ANNOTATION_MODES:
+        raise ValueError(f"不支持的标注模式: {effective_annotation_mode}")
+    effective_annotation_schema_version = str(
+        annotation_schema_version
+        or (EGO_OPEN_SCHEMA_VERSION if effective_annotation_mode == "open" else "")
+    ).strip()
+    if effective_annotation_mode == "open" and not effective_annotation_schema_version:
+        raise ValueError("开放标注模式必须声明结构版本")
     requested_root_path = str(root_path)
     root = resolve_source_directory(root_path)
     profile = _load_profile(profile_path)
@@ -636,8 +697,9 @@ def scan_data_source(
             INSERT INTO qc_task(
                 id, workspace_id, task_code, task_name, origin, flow_job_code, asset_id,
                 label_set_id, source_uri, local_source_path, status, import_error, metadata_json,
+                task_kind, annotation_mode, annotation_schema_version,
                 last_episode_id, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'importing', NULL, ?, NULL, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'importing', NULL, ?, ?, ?, ?, NULL, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 task_code = excluded.task_code,
                 task_name = excluded.task_name,
@@ -650,6 +712,9 @@ def scan_data_source(
                 status = 'importing',
                 import_error = NULL,
                 metadata_json = excluded.metadata_json,
+                task_kind = excluded.task_kind,
+                annotation_mode = excluded.annotation_mode,
+                annotation_schema_version = excluded.annotation_schema_version,
                 updated_at = excluded.updated_at
             """,
             (
@@ -664,6 +729,9 @@ def scan_data_source(
                 effective_source_uri,
                 str(root),
                 _json(metadata or {}),
+                task_kind,
+                effective_annotation_mode,
+                effective_annotation_schema_version,
                 existing_task["created_at"] if existing_task else now,
                 now,
             ),
@@ -684,12 +752,15 @@ def scan_data_source(
         source = connection.execute("SELECT * FROM data_source WHERE root_path = ?", (str(root),)).fetchone()
         source_id = source["id"]
 
-    candidates = _discover_episode_mcaps(root, profile)
+    candidates = _discover_episode_mcaps(root, profile, task_kind=task_kind)
     indexed: list[dict[str, object]] = []
     seen_paths: set[str] = set()
     with connect_workspace(db_path) as connection:
         for mcap_path in candidates:
-            relative_path = str(mcap_path.parent.relative_to(root)) if mcap_path.parent != root else mcap_path.parent.name
+            if task_kind == "ego_omniego":
+                relative_path = str(mcap_path.relative_to(root))
+            else:
+                relative_path = str(mcap_path.parent.relative_to(root)) if mcap_path.parent != root else mcap_path.parent.name
             seen_paths.add(relative_path)
             indexed.append(
                 _index_episode(
@@ -750,11 +821,21 @@ def scan_data_source(
     }
 
 
-def _discover_episode_mcaps(root: Path, profile: dict[str, object]) -> list[Path]:
+def _discover_episode_mcaps(
+    root: Path,
+    profile: dict[str, object],
+    *,
+    task_kind: str = "robot_teleoperation",
+) -> list[Path]:
     import_config = profile.get("import") if isinstance(profile.get("import"), dict) else {}
     episode_patterns = list(import_config.get("episode_directory_patterns") or ["episode_*"])
     mcap_patterns = list(import_config.get("mcap_file_patterns") or ["episode.mcap", "*.mcap"])
     bvh_patterns = list(import_config.get("bvh_file_patterns") or ["motion.bvh", "*.bvh"])
+    if task_kind == "ego_omniego":
+        return sorted(
+            (path.resolve() for path in root.rglob("*.mcap") if path.is_file()),
+            key=lambda item: _natural_key(str(item.relative_to(root))),
+        )
     paths_by_directory: dict[Path, Path] = {}
     candidates = list(root.rglob("*.mcap")) + list(root.rglob("*.bvh"))
     for path in candidates:
@@ -1118,6 +1199,7 @@ def _index_episode(
         old
         and not force_reindex
         and old["import_status"] == "ready"
+        and int(old["index_version"] or 0) == EPISODE_INDEX_VERSION
         and int(old["file_size"]) == stat.st_size
         and int(old["file_mtime_ns"]) == stat.st_mtime_ns
     ):
@@ -1200,9 +1282,19 @@ def _index_episode(
         error = f"{type(exc).__name__}: {exc}"
 
     fingerprint = hashlib.sha256(
-        _json([source_id, relative_path, stat.st_size, stat.st_mtime_ns, start_ns, end_ns]).encode("utf-8")
+        _json([
+            EPISODE_INDEX_VERSION,
+            source_id,
+            relative_path,
+            stat.st_size,
+            stat.st_mtime_ns,
+            start_ns,
+            end_ns,
+        ]).encode("utf-8")
     ).hexdigest()
-    data_group = root.name if Path(relative_path).parent == Path(".") else Path(relative_path).parts[0]
+    relative = Path(relative_path)
+    data_group = root.name if relative.parent == Path(".") else relative.parts[0]
+    episode_name = mcap_path.stem if relative.suffix.lower() in {".mcap", ".bvh"} else mcap_path.parent.name
     now = _now()
     import_status = "ready" if error is None else "failed"
 
@@ -1211,11 +1303,11 @@ def _index_episode(
             """
             INSERT INTO episode(
                 id, data_source_id, relative_path, episode_name, data_group, mcap_path,
-                summary_path, config_path, fingerprint, file_size, file_mtime_ns,
+                summary_path, config_path, fingerprint, index_version, file_size, file_mtime_ns,
                 start_time_ns, end_time_ns, duration_ns, import_status, import_error,
                 cache_status, review_status, quality_decision, reviewer_name,
                 last_playhead_ns, annotation_count, created_at, updated_at, reviewed_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unreviewed', NULL, NULL, 0, 0, ?, ?, NULL)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unreviewed', NULL, NULL, 0, 0, ?, ?, NULL)
             ON CONFLICT(data_source_id, relative_path) DO UPDATE SET
                 episode_name = excluded.episode_name,
                 data_group = excluded.data_group,
@@ -1223,6 +1315,7 @@ def _index_episode(
                 summary_path = excluded.summary_path,
                 config_path = excluded.config_path,
                 fingerprint = excluded.fingerprint,
+                index_version = excluded.index_version,
                 file_size = excluded.file_size,
                 file_mtime_ns = excluded.file_mtime_ns,
                 start_time_ns = excluded.start_time_ns,
@@ -1237,12 +1330,13 @@ def _index_episode(
                 episode_id,
                 source_id,
                 relative_path,
-                mcap_path.parent.name,
+                episode_name,
                 data_group,
                 str(mcap_path),
                 str(summary_path) if summary_path else None,
                 str(config_path) if config_path else None,
                 fingerprint,
+                EPISODE_INDEX_VERSION,
                 stat.st_size,
                 stat.st_mtime_ns,
                 start_ns,
@@ -1276,7 +1370,7 @@ def _index_episode(
     mocap_available = any(item["stream_type"] == "mocap" and item["available"] for item in streams)
     return {
         "id": episode_id,
-        "episode_name": mcap_path.parent.name,
+        "episode_name": episode_name,
         "relative_path": relative_path,
         "mcap_path": str(mcap_path),
         "duration_ns": duration_ns,
@@ -1375,8 +1469,14 @@ def _classify_stream(
             key = str(definition.get("key") or stream_type)
             display = str(definition.get("display_name") or (_camera_name(topic) if stream_type == "camera" else key))
             return stream_type, key, display, definition.get("adapter"), str(definition.get("encoding") or message_encoding)
-    if schema_name == "foxglove.CompressedImage" or ("camera" in topic and ("image" in topic or topic.endswith("jpeg"))):
-        return "camera", "camera", _camera_name(topic), "foxglove_compressed_image_v1", "jpeg"
+    if (
+        schema_name in {"foxglove.CompressedImage", "sensor_msgs/CompressedImage"}
+        or (("camera" in topic or "/cam" in topic or "/t265_" in topic) and "image" in topic)
+    ):
+        adapter = "ros1_compressed_image_v1" if schema_name == "sensor_msgs/CompressedImage" else "foxglove_compressed_image_v1"
+        return "camera", "camera", _camera_name(topic), adapter, "jpeg"
+    if topic == "/dohc/skeleton":
+        return "mocap", "human_pose", "人体 Pose 骨架", "dohc_smpl_24_v1", message_encoding
     if topic == "/mocap/human_motion" or "mocap" in topic:
         return "mocap", "human_motion", "人体 Mocap", "human_motion_json_v1" if message_encoding == "json" else None, message_encoding
     if "retarget" in topic:
@@ -1390,6 +1490,14 @@ def _classify_stream(
 
 def _camera_name(topic: str) -> str:
     parts = [part for part in topic.split("/") if part]
+    if len(parts) >= 3 and parts[0] == "dohc" and "image" in parts:
+        return {
+            "cam0": "DOHC Cam 0",
+            "cam1": "DOHC Cam 1",
+            "cam2": "DOHC Cam 2",
+            "t265_left": "T265 左目",
+            "t265_right": "T265 右目",
+        }.get(parts[1], parts[1])
     if "camera" in parts:
         index = parts.index("camera")
         middle = parts[index + 1 :]
@@ -1404,7 +1512,7 @@ def _episode_rows(connection: sqlite3.Connection, where: str = "", parameters: t
     query = f"""
         SELECT e.*, ds.root_path AS source_root, ds.task_id,
                t.task_code, t.task_name, t.origin AS task_origin,
-               t.source_type,
+               t.source_type, t.task_kind,
                SUM(CASE WHEN s.stream_type = 'camera' AND s.available = 1 THEN 1 ELSE 0 END) AS camera_count,
                MAX(CASE WHEN s.stream_type = 'mocap' AND s.available = 1 THEN 1 ELSE 0 END) AS mocap_available,
                COALESCE(changes.incremental_added_count, 0) AS incremental_added_count,
@@ -1790,6 +1898,9 @@ def rescan_qc_task(
         label_set_id=str(task["label_set_id"]) if task.get("label_set_id") else None,
         source_uri=str(task["source_uri"]),
         task_metadata=task.get("metadata") if isinstance(task.get("metadata"), dict) else None,
+        task_kind=str(task.get("task_kind") or "robot_teleoperation"),
+        annotation_mode=str(task.get("annotation_mode") or "library"),
+        annotation_schema_version=str(task.get("annotation_schema_version") or ""),
     )
 
 
@@ -2632,7 +2743,10 @@ def import_label_schema(db_path: str | Path, schema_path: str | Path) -> dict[st
                     ),
                 )
         connection.execute("UPDATE workspace SET active_label_set_id = ?, updated_at = ?", (actual, _now()))
-    return {key: value for key, value in preview.items() if key != "schema"} | {"active": True}
+    return {key: value for key, value in preview.items() if key != "schema"} | {
+        "id": actual,
+        "active": True,
+    }
 
 
 def install_flow_label_schema(
@@ -2771,22 +2885,102 @@ def _label_schema_for_task(
     if task_id:
         row = connection.execute(
             """
-            SELECT ls.raw_schema_json
+            SELECT t.annotation_mode, t.annotation_schema_version, ls.raw_schema_json
             FROM qc_task t
             LEFT JOIN label_set ls ON ls.id = t.label_set_id
             WHERE t.id = ?
             """,
             (task_id,),
         ).fetchone()
+        if row and row["annotation_mode"] == "open":
+            return _open_annotation_schema(
+                connection,
+                task_id,
+                str(row["annotation_schema_version"] or EGO_OPEN_SCHEMA_VERSION),
+            )
         if row and row["raw_schema_json"]:
             return _loads(row["raw_schema_json"], None)
     return _active_label_schema(connection)
+
+
+def _open_annotation_schema(
+    connection: sqlite3.Connection, task_id: str, schema_version: str
+) -> dict[str, object]:
+    suggestions = [
+        ("joint_misaligned_2d", "2D 关节未对齐", "pose_quality"),
+        ("joint_jerk", "关节突跳", "pose_quality"),
+        ("joint_jitter", "关节抖动", "pose_quality"),
+        ("occlusion", "遮挡", "pose_quality"),
+        ("foot_float", "脚部悬空或滑移", "pose_quality"),
+        ("left_right_swap", "左右肢体混淆", "pose_quality"),
+        ("calibration_error", "标定误差", "pose_quality"),
+        ("sync_error", "时序不同步", "pose_quality"),
+    ]
+    seen = {item[0] for item in suggestions}
+    rows = connection.execute(
+        """
+        SELECT a.label_slug, a.label_name, a.annotation_type, MAX(a.updated_at) AS last_used_at
+        FROM annotation a
+        JOIN episode e ON e.id = a.episode_id
+        JOIN data_source ds ON ds.id = e.data_source_id
+        WHERE ds.task_id = ? AND a.annotation_mode = 'open' AND a.deleted_at IS NULL
+        GROUP BY a.label_slug, a.label_name, a.annotation_type
+        ORDER BY last_used_at DESC
+        LIMIT 50
+        """,
+        (task_id,),
+    ).fetchall()
+    for row in rows:
+        code = str(row["label_slug"] or "")
+        if not code or code in seen:
+            continue
+        suggestions.append((code, str(row["label_name"] or code), str(row["annotation_type"] or "other")))
+        seen.add(code)
+    labels = [
+        {
+            "code": code,
+            "name": name,
+            "group": annotation_type,
+            "annotation_type": annotation_type,
+            "description": "建议项；也可以直接输入新的自定义标签",
+            "enabled": True,
+            "annotation_scopes": sorted(VALID_SCOPES),
+            "target_types": sorted(VALID_TARGETS),
+            "default_severity": "normal",
+            "default_action": "repair" if annotation_type.endswith("quality") else "keep",
+            "color": "#cfef5a" if annotation_type == "action" else "#f59e68",
+            "fields": [],
+        }
+        for code, name, annotation_type in suggestions
+    ]
+    return {
+        "schema": {
+            "schema_type": "open_annotation_schema",
+            "annotation_mode": "open",
+            "annotation_schema_version": schema_version,
+            "schema_version": schema_version,
+            "label_set_name": "Ego 开放标签",
+            "language": "zh-CN",
+        },
+        "groups": [
+            {"code": "action", "name": "动作"},
+            {"code": "pose_quality", "name": "Pose 质量"},
+            {"code": "camera_quality", "name": "相机质量"},
+            {"code": "exception", "name": "意外与恢复"},
+            {"code": "object_state", "name": "物品状态"},
+            {"code": "other", "name": "其他"},
+        ],
+        "severity_levels": DEFAULT_SEVERITY_LEVELS,
+        "actions": DEFAULT_LABEL_ACTIONS,
+        "labels": labels,
+    }
 
 
 def _annotation_row(row: sqlite3.Row) -> dict[str, object]:
     value = dict(row)
     value["annotation_id"] = value.pop("id")
     value["attributes"] = _loads(value.pop("attributes_json"), {})
+    value["label_snapshot"] = _loads(value.pop("label_snapshot_json", "{}"), {})
     return value
 
 
@@ -2841,7 +3035,8 @@ def save_annotation(
         workspace = connection.execute("SELECT * FROM workspace LIMIT 1").fetchone()
         task_label = connection.execute(
             """
-            SELECT COALESCE(t.label_set_id, w.active_label_set_id) AS label_set_id
+            SELECT t.annotation_mode, t.annotation_schema_version,
+                   COALESCE(t.label_set_id, w.active_label_set_id) AS label_set_id
             FROM episode e
             JOIN data_source ds ON ds.id = e.data_source_id
             JOIN qc_task t ON t.id = ds.task_id
@@ -2851,17 +3046,48 @@ def save_annotation(
             """,
             (episode_id,),
         ).fetchone()
-        active_id = task_label["label_set_id"] if task_label else None
-        if not active_id:
-            raise ValueError("尚未导入并激活标签库")
-        label_set = connection.execute("SELECT * FROM label_set WHERE id = ?", (active_id,)).fetchone()
-        label = connection.execute(
-            "SELECT * FROM label_definition WHERE label_set_id = ? AND code = ? AND enabled = 1",
-            (active_id, payload.get("label_code")),
-        ).fetchone()
-        if not label:
-            raise ValueError(f"标签不存在或已停用: {payload.get('label_code')}")
-        normalized = _validate_annotation_payload(payload, episode, label)
+        annotation_mode = str(task_label["annotation_mode"] or "library") if task_label else "library"
+        schema_version = str(task_label["annotation_schema_version"] or "") if task_label else ""
+        label_set = None
+        label = None
+        if annotation_mode == "open":
+            normalized = _validate_open_annotation_payload(payload, episode)
+            label_set_key = ""
+            label_schema_version = ""
+            label_name = normalized["label_name"]
+            label_slug = normalized["label_slug"]
+            annotation_type = normalized["annotation_type"]
+            label_snapshot = {
+                "label_name": label_name,
+                "label_slug": label_slug,
+                "annotation_type": annotation_type,
+                "captured_at": _now(),
+            }
+        else:
+            active_id = task_label["label_set_id"] if task_label else None
+            if not active_id:
+                raise ValueError("尚未导入并激活标签库")
+            label_set = connection.execute("SELECT * FROM label_set WHERE id = ?", (active_id,)).fetchone()
+            label = connection.execute(
+                "SELECT * FROM label_definition WHERE label_set_id = ? AND code = ? AND enabled = 1",
+                (active_id, payload.get("label_code")),
+            ).fetchone()
+            if not label:
+                raise ValueError(f"标签不存在或已停用: {payload.get('label_code')}")
+            normalized = _validate_annotation_payload(payload, episode, label)
+            label_set_key = str(label_set["label_set_key"])
+            label_schema_version = str(label_set["version"])
+            label_name = str(label["name"])
+            label_slug = str(label["code"])
+            annotation_type = "quality"
+            schema_version = label_schema_version
+            label_snapshot = {
+                "label_name": label_name,
+                "label_slug": label_slug,
+                "annotation_type": annotation_type,
+                "label_set_id": label_set_key,
+                "label_schema_version": label_schema_version,
+            }
         now = _now()
         old_row = connection.execute("SELECT * FROM annotation WHERE id = ?", (annotation_id,)).fetchone() if annotation_id else None
         if annotation_id and not old_row:
@@ -2874,12 +3100,23 @@ def save_annotation(
         connection.execute(
             """
             INSERT INTO annotation(
-                id, episode_id, label_set_key, label_schema_version, label_code, scope,
+                id, episode_id, label_set_key, label_schema_version, label_code,
+                annotation_mode, annotation_schema_version, annotation_type,
+                label_name, label_slug, label_snapshot_json, scope,
                 start_offset_ns, end_offset_ns, target_type, target_key, severity, action,
                 comment, attributes_json, source, status, reviewer_name, created_at, updated_at, deleted_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
             ON CONFLICT(id) DO UPDATE SET
-                label_code = excluded.label_code, scope = excluded.scope,
+                label_set_key = excluded.label_set_key,
+                label_schema_version = excluded.label_schema_version,
+                label_code = excluded.label_code,
+                annotation_mode = excluded.annotation_mode,
+                annotation_schema_version = excluded.annotation_schema_version,
+                annotation_type = excluded.annotation_type,
+                label_name = excluded.label_name,
+                label_slug = excluded.label_slug,
+                label_snapshot_json = excluded.label_snapshot_json,
+                scope = excluded.scope,
                 start_offset_ns = excluded.start_offset_ns, end_offset_ns = excluded.end_offset_ns,
                 target_type = excluded.target_type, target_key = excluded.target_key,
                 severity = excluded.severity, action = excluded.action, comment = excluded.comment,
@@ -2889,16 +3126,22 @@ def save_annotation(
             (
                 actual_id,
                 episode_id,
-                label_set["label_set_key"],
-                label_set["version"],
+                label_set_key,
+                label_schema_version,
                 normalized["label_code"],
+                annotation_mode,
+                schema_version,
+                annotation_type,
+                label_name,
+                label_slug,
+                _json(label_snapshot),
                 normalized["scope"],
                 normalized["start_offset_ns"],
                 normalized["end_offset_ns"],
                 normalized["target_type"],
                 normalized.get("target_key"),
-                normalized.get("severity") or label["default_severity"],
-                normalized.get("action") or label["default_action"],
+                normalized.get("severity") or (label["default_severity"] if label else "normal"),
+                normalized.get("action") or (label["default_action"] if label else ("repair" if annotation_type.endswith("quality") else "keep")),
                 normalized.get("comment", ""),
                 _json(normalized.get("attributes", {})),
                 "manual",
@@ -2949,6 +3192,64 @@ def _validate_annotation_payload(payload: dict[str, object], episode: sqlite3.Ro
         if field.get("required") and not attributes.get(field.get("code")):
             raise ValueError(f"缺少必填字段: {field.get('name') or field.get('code')}")
     value.update({"scope": scope, "target_type": target, "start_offset_ns": start, "end_offset_ns": end, "attributes": attributes})
+    return value
+
+
+def _open_label_slug(label_name: str) -> str:
+    ascii_slug = re.sub(r"[^a-z0-9]+", "_", label_name.lower()).strip("_")[:48]
+    if ascii_slug and re.match(r"^[a-z]", ascii_slug):
+        return ascii_slug
+    return f"custom_{hashlib.sha256(label_name.encode('utf-8')).hexdigest()[:12]}"
+
+
+def _validate_open_annotation_payload(
+    payload: dict[str, object], episode: sqlite3.Row
+) -> dict[str, object]:
+    value = dict(payload)
+    label_name = str(value.get("label_name") or "").strip()
+    if not label_name:
+        raise ValueError("开放标注必须填写标签名称")
+    if len(label_name) > 120:
+        raise ValueError("标签名称不能超过 120 个字符")
+    annotation_type = str(value.get("annotation_type") or "action").strip()
+    if annotation_type not in OPEN_ANNOTATION_TYPES:
+        raise ValueError(f"不支持的开放标注类型: {annotation_type}")
+    scope = str(value.get("scope") or "")
+    target = str(value.get("target_type") or "")
+    if scope not in VALID_SCOPES:
+        raise ValueError(f"不支持的标注范围: {scope}")
+    if target not in VALID_TARGETS:
+        raise ValueError(f"不支持的标注对象: {target}")
+    duration = int(episode["duration_ns"] or 0)
+    start = int(value.get("start_offset_ns") or 0)
+    end = int(value.get("end_offset_ns") or 0)
+    if scope == "episode":
+        start, end = 0, duration
+    if start < 0 or end < start or end > duration:
+        raise ValueError(f"标注时间越界: {start}..{end}, Episode 时长 {duration}")
+    if scope == "time_range" and end <= start:
+        raise ValueError("区间标签要求结束时间大于开始时间")
+    if scope == "time_point" and end != start:
+        raise ValueError("时间点标签要求开始与结束时间相同")
+    attributes = value.get("attributes") or {}
+    if not isinstance(attributes, dict):
+        raise ValueError("attributes 必须是对象")
+    label_slug = str(value.get("label_slug") or "").strip()
+    if not LABEL_CODE_RE.fullmatch(label_slug):
+        label_slug = _open_label_slug(label_name)
+    value.update(
+        {
+            "label_code": label_slug,
+            "label_name": label_name,
+            "label_slug": label_slug,
+            "annotation_type": annotation_type,
+            "scope": scope,
+            "target_type": target,
+            "start_offset_ns": start,
+            "end_offset_ns": end,
+            "attributes": attributes,
+        }
+    )
     return value
 
 
@@ -3017,11 +3318,17 @@ def _restore_annotation_snapshot(connection: sqlite3.Connection, annotation_id: 
     else:
         connection.execute(
             """
-            UPDATE annotation SET label_code=?, scope=?, start_offset_ns=?, end_offset_ns=?, target_type=?, target_key=?,
+            UPDATE annotation SET label_set_key=?, label_schema_version=?, label_code=?,
+                annotation_mode=?, annotation_schema_version=?, annotation_type=?, label_name=?, label_slug=?,
+                label_snapshot_json=?, scope=?, start_offset_ns=?, end_offset_ns=?, target_type=?, target_key=?,
                 severity=?, action=?, comment=?, attributes_json=?, source=?, status=?, reviewer_name=?, updated_at=?, deleted_at=? WHERE id=?
             """,
             (
-                snapshot["label_code"], snapshot["scope"], snapshot["start_offset_ns"], snapshot["end_offset_ns"],
+                snapshot.get("label_set_key", ""), snapshot.get("label_schema_version", ""), snapshot["label_code"],
+                snapshot.get("annotation_mode", "library"), snapshot.get("annotation_schema_version", ""),
+                snapshot.get("annotation_type", "quality"), snapshot.get("label_name", ""),
+                snapshot.get("label_slug", snapshot["label_code"]), _json(snapshot.get("label_snapshot", {})),
+                snapshot["scope"], snapshot["start_offset_ns"], snapshot["end_offset_ns"],
                 snapshot["target_type"], snapshot.get("target_key"), snapshot.get("severity"), snapshot.get("action"),
                 snapshot.get("comment"), _json(snapshot.get("attributes", {})), snapshot.get("source", "manual"),
                 snapshot.get("status", "confirmed"), snapshot.get("reviewer_name", ""), _now(), snapshot.get("deleted_at"), annotation_id,
@@ -3128,7 +3435,7 @@ def export_workspace(
             query = f"""
                 SELECT a.*, e.episode_name, e.start_time_ns AS episode_start_time_ns,
                        e.duration_ns AS episode_duration_ns, e.relative_path,
-                       ds.root_path AS source_root, ld.name AS label_name
+                       ds.root_path AS source_root, COALESCE(NULLIF(a.label_name, ''), ld.name) AS resolved_label_name
                 FROM annotation a
                 JOIN episode e ON e.id = a.episode_id
                 JOIN data_source ds ON ds.id = e.data_source_id
@@ -3277,8 +3584,13 @@ def _export_annotation_row(row: sqlite3.Row) -> dict[str, object]:
         "episode_duration_ns": row["episode_duration_ns"],
         "label_set_id": row["label_set_key"],
         "label_schema_version": row["label_schema_version"],
+        "annotation_mode": row["annotation_mode"],
+        "annotation_schema_version": row["annotation_schema_version"],
+        "annotation_type": row["annotation_type"],
         "label_code": row["label_code"],
-        "label_name": row["label_name"] or row["label_code"],
+        "label_name": row["resolved_label_name"] or row["label_code"],
+        "label_slug": row["label_slug"] or row["label_code"],
+        "label_snapshot_json": row["label_snapshot_json"],
         "scope": row["scope"],
         "start_offset_ns": start,
         "end_offset_ns": end,
@@ -3323,7 +3635,8 @@ def _export_episode_row(row: dict[str, object]) -> dict[str, object]:
 def _single_file_csv_fields() -> list[str]:
     return [
         "task_name", "exported_at", *_episode_export_fields(),
-        "annotation_id", "label_set_id", "label_schema_version", "label_code", "label_name",
+        "annotation_id", "annotation_mode", "annotation_schema_version", "annotation_type",
+        "label_set_id", "label_schema_version", "label_code", "label_name", "label_slug", "label_snapshot_json",
         "scope", "start_offset_ns", "end_offset_ns", "start_sec", "end_sec",
         "absolute_start_time_ns", "absolute_end_time_ns", "target_type", "target_key",
         "severity", "action", "comment", "attributes_json", "annotation_reviewer",
@@ -3343,7 +3656,8 @@ def _single_file_csv_rows(
         annotations_by_episode.setdefault(str(annotation["episode_id"]), []).append(annotation)
 
     annotation_fields = [
-        "annotation_id", "label_set_id", "label_schema_version", "label_code", "label_name",
+        "annotation_id", "annotation_mode", "annotation_schema_version", "annotation_type",
+        "label_set_id", "label_schema_version", "label_code", "label_name", "label_slug", "label_snapshot_json",
         "scope", "start_offset_ns", "end_offset_ns", "start_sec", "end_sec",
         "absolute_start_time_ns", "absolute_end_time_ns", "target_type", "target_key",
         "severity", "action", "comment", "attributes_json",

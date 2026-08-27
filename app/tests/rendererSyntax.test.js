@@ -38,7 +38,7 @@ test("本地任务直接读取 QC 服务器目录且不再包含 Worker 链路",
   const renderer = fs.readFileSync(path.resolve(__dirname, "../renderer/renderer.js"), "utf8");
   const webApi = fs.readFileSync(path.resolve(__dirname, "../renderer/web-api.js"), "utf8");
 
-  assert.match(renderer, /const result = await window\.episodeQc\.addSource\(\)/);
+  assert.match(renderer, /const result = await window\.episodeQc\.addSource\(taskKind\)/);
   assert.match(webApi, /QC 服务器可访问的绝对路径或已挂载 NAS 目录/);
 });
 
@@ -90,8 +90,28 @@ test("单机模式隐藏 Flow 并直接导入 QC 服务器目录", () => {
   assert.match(html, /id="local-task-title"/);
   assert.match(renderer, /platform\.enabled === false/);
   assert.match(renderer, /单机 QC 任务/);
-  assert.match(renderer, /const result = await window\.episodeQc\.addSource\(\)/);
+  assert.match(renderer, /const result = await window\.episodeQc\.addSource\(taskKind\)/);
   assert.match(css, /\.task-center-dialog\.standalone-mode \.task-center-columns/);
+});
+
+test("Ego 任务入口复用五路相机和 SMPL Pose 骨架工作区", () => {
+  const html = fs.readFileSync(path.resolve(__dirname, "../renderer/index.html"), "utf8");
+  const renderer = fs.readFileSync(path.resolve(__dirname, "../renderer/renderer.js"), "utf8");
+  const viewer = fs.readFileSync(path.resolve(__dirname, "../renderer/g1-viewer.js"), "utf8");
+  const webApi = fs.readFileSync(path.resolve(__dirname, "../renderer/web-api.js"), "utf8");
+  const css = fs.readFileSync(path.resolve(__dirname, "../renderer/styles.css"), "utf8");
+
+  assert.match(html, /id="add-ego-source"/);
+  assert.match(html, /id="task-center-import-ego"/);
+  assert.match(html, /id="motion-controls-toggle"[^>]+aria-expanded="false"/);
+  assert.match(html, /id="motion-control-panel" hidden/);
+  assert.match(renderer, /addSource\("ego_omniego"\)/);
+  assert.match(renderer, /人体 Pose 骨架/);
+  assert.match(renderer, /function setMotionControlsExpanded/);
+  assert.match(renderer, /viewerProfile: isEgoTask\(\) \? "ego_omniego"/);
+  assert.match(viewer, /humanPoseMode \? 4\.15 : 3\.15/);
+  assert.match(webApi, /每个 MCAP 文件作为一个 Episode/);
+  assert.match(css, /\.motion-control-panel\[hidden\]\s*\{\s*display:\s*none/);
 });
 
 test("标签库菜单和本地任务历史管理入口完整", () => {

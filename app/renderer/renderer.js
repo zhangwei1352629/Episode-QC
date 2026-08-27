@@ -23,7 +23,7 @@ const els = {
   headerTaskSummary: $("header-task-summary"), headerLabelVersion: $("header-label-version"),
   headerReviewRound: $("header-review-round"),
   nasStatus: $("nas-status"),
-  exportFormat: $("export-format"), exportResults: $("export-results"), addSource: $("add-source"), saveState: $("save-state"),
+  exportFormat: $("export-format"), exportResults: $("export-results"), addSource: $("add-source"), addEgoSource: $("add-ego-source"), saveState: $("save-state"),
   toggleEpisodes: $("toggle-episodes"), toggleLabels: $("toggle-labels"), toolMenu: $("tool-menu"),
   episodeTotal: $("episode-total"), episodeDone: $("episode-done"), episodeErrors: $("episode-errors"),
   episodeSearch: $("episode-search"), statusFilter: $("status-filter"), episodeList: $("episode-list"),
@@ -31,13 +31,20 @@ const els = {
   nextEpisode: $("next-episode"), togglePlay: $("toggle-play"), playbackRate: $("playback-rate"),
   currentTime: $("current-time"), durationTime: $("duration-time"), cacheStatus: $("cache-status"),
   motionCard: $("motion-card"), motionCanvas: $("motion-canvas"), motionEmpty: $("motion-empty"), jointLabelLayer: $("joint-label-layer"),
+  motionViewerTitle: $("motion-viewer-title"), motionViewerBadge: $("motion-viewer-badge"), motionHint: $("motion-hint"),
+  motionControlsToggle: $("motion-controls-toggle"), motionControlPanel: $("motion-control-panel"),
   motionSource: $("motion-source"), jointSelector: $("joint-selector"), jointLabels: $("joint-labels"), resetView: $("reset-view"), selectedJoint: $("selected-joint"),
   cameraGrid: $("camera-grid"), selectionLabel: $("selection-label"), markIn: $("mark-in"), markOut: $("mark-out"),
   loopSelection: $("loop-selection"), coverageTracks: $("coverage-tracks"), annotationTrack: $("annotation-track"),
   timelineViewControls: $("timeline-view-controls"), timelineRange: $("timeline-range"), timelineEnd: $("timeline-end"), scopeTabs: $("scope-tabs"),
   labelSearch: $("label-search"), labelGroupFilter: $("label-group-filter"), labelCount: $("label-count"),
-  labelSetMeta: $("label-set-meta"), targetContext: $("target-context"), labelList: $("label-list"),
+  labelSetMeta: $("label-set-meta"), labelHelp: $("label-help"), targetContext: $("target-context"), labelList: $("label-list"),
+  openLabelEditor: $("open-label-editor"), openAnnotationType: $("open-annotation-type"),
+  openLabelName: $("open-label-name"), saveOpenLabel: $("save-open-label"),
   annotationComment: $("annotation-comment"), undo: $("undo"), redo: $("redo"),
+  egoAnnotationFields: $("ego-annotation-fields"), egoBodyPart: $("ego-body-part"), egoObjectName: $("ego-object-name"),
+  egoObjectColor: $("ego-object-color"), egoSourceName: $("ego-source-name"), egoTargetName: $("ego-target-name"),
+  egoExceptionType: $("ego-exception-type"), egoRecoveryAction: $("ego-recovery-action"),
   annotationCount: $("annotation-count"), annotationList: $("annotation-list"), decisionGrid: $("decision-grid"), decisionCurrent: $("decision-current"),
   annotationsSection: $("current-annotations-section"),
   toggleCurrentAnnotations: $("toggle-current-annotations"),
@@ -48,7 +55,7 @@ const els = {
   currentTaskPath: $("current-task-path"), currentTaskStatus: $("current-task-status"),
   openTaskCenter: $("open-task-center"), rescanTask: $("rescan-task"), taskCenter: $("task-center"),
   closeTaskCenter: $("close-task-center"), taskCenterSummary: $("task-center-summary"),
-  taskList: $("task-list"), taskCenterImport: $("task-center-import"), submitFlowTask: $("submit-flow-task"),
+  taskList: $("task-list"), taskCenterImport: $("task-center-import"), taskCenterImportEgo: $("task-center-import-ego"), submitFlowTask: $("submit-flow-task"),
   confirmCurrentEpisode: $("confirm-current-episode"), reviewSummary: $("review-summary"),
   reviewAddedCount: $("review-added-count"), reviewModifiedCount: $("review-modified-count"),
   reviewRemovedCount: $("review-removed-count"), reviewPreservedCount: $("review-preserved-count"),
@@ -205,8 +212,10 @@ function bindEvents() {
   });
   els.refreshLabelSets.addEventListener("click", () => refreshLabelSets());
   els.labelSetList.addEventListener("click", handleLabelSetAction);
-  els.addSource.addEventListener("click", addSource);
-  els.taskCenterImport.addEventListener("click", addSource);
+  els.addSource.addEventListener("click", () => addSource("robot_teleoperation"));
+  els.addEgoSource.addEventListener("click", () => addSource("ego_omniego"));
+  els.taskCenterImport.addEventListener("click", () => addSource("robot_teleoperation"));
+  els.taskCenterImportEgo.addEventListener("click", () => addSource("ego_omniego"));
   els.openTaskCenter.addEventListener("click", () => { renderTaskContext(); refreshPlatformJobs({ quiet: true }); els.taskCenter.showModal(); });
   els.closeTaskCenter.addEventListener("click", () => els.taskCenter.close());
   els.rescanTask.addEventListener("click", rescanCurrentTask);
@@ -245,6 +254,10 @@ function bindEvents() {
   });
   els.labelSearch.addEventListener("input", renderLabels);
   els.labelGroupFilter.addEventListener("change", renderLabels);
+  els.saveOpenLabel.addEventListener("click", () => createOpenAnnotation());
+  els.openLabelName.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") { event.preventDefault(); createOpenAnnotation(); }
+  });
   els.targetContext.addEventListener("click", (event) => {
     const button = event.target.closest("[data-target-type]");
     if (button) selectAnnotationTarget(button.dataset.targetType, button.dataset.targetKey || null);
@@ -305,6 +318,9 @@ function bindEvents() {
   });
   els.needsRecheck.addEventListener("click", () => setReviewStatus("needs_recheck"));
   els.resetView.addEventListener("click", resetMotionView);
+  els.motionControlsToggle.addEventListener("click", () => {
+    setMotionControlsExpanded(els.motionControlsToggle.getAttribute("aria-expanded") !== "true");
+  });
   els.motionSource.addEventListener("change", () => {
     state.motionSource = els.motionSource.value;
     state.robotActionFrame = null;
@@ -392,6 +408,7 @@ function handleEpisodeCacheReady(payload) {
 
 function renderTaskContext() {
   const task = state.currentTask;
+  renderViewerProfile();
   renderHeaderContext();
   els.currentTaskName.textContent = task?.task_name || "尚未导入任务";
   els.currentTaskCode.textContent = task?.task_code || "—";
@@ -439,7 +456,7 @@ function renderTaskContext() {
       <button class="task-list-item ${item.id === state.currentTaskId ? "active" : ""}" data-task-id="${escapeHtml(item.id)}" type="button">
         <span class="task-list-copy">
           <strong>${escapeHtml(item.task_name)}</strong>
-          <small>${escapeHtml(item.task_code)} · ${escapeHtml(taskStatusName(item.status))}${escapeHtml(issue)}</small>
+          <small>${escapeHtml(taskKindName(item.task_kind))} · ${escapeHtml(item.task_code)} · ${escapeHtml(taskStatusName(item.status))}${escapeHtml(issue)}</small>
           <span title="${escapeHtml(path)}">${escapeHtml(compactSourcePath(path))}</span>
         </span>
         <span class="task-list-progress"><strong>${item.completed_count}/${item.episode_count}</strong><span>${formatBytes(item.source_size_bytes)} · 异常 ${item.error_count}</span></span>
@@ -458,7 +475,9 @@ function renderHeaderContext() {
   const taskName = task?.task_name || "尚未选择 QC 任务";
   els.headerTaskSummary.textContent = task ? `${taskCode} · ${taskName}` : taskName;
   els.headerTaskSummary.title = task ? `${taskCode} · ${taskName}` : taskName;
-  els.headerLabelVersion.textContent = schema.schema_version
+  els.headerLabelVersion.textContent = schema.annotation_mode === "open"
+    ? `开放标签 · ${schema.annotation_schema_version || "ego_open_v1"}`
+    : schema.schema_version
     ? `标签 V${schema.schema_version}`
     : "标签 —";
   els.headerReviewRound.textContent = `当前 R${episode ? currentReviewRound(episode) : 1}`;
@@ -569,7 +588,7 @@ function renderFlowJobItem(job) {
     <div class="flow-task-item">
       <div>
         <strong>${escapeHtml(job.asset_id || job.code)}</strong>
-        <small>${escapeHtml(job.code)} · ${escapeHtml(flowJobStatusName(job.status))}${escapeHtml(progress)}${escapeHtml(blockedReason)}${escapeHtml(ownershipLabel)}</small>
+        <small>${escapeHtml(job.code)} · ${escapeHtml(flowJobAssetTypeName(job))} · ${escapeHtml(flowJobStatusName(job.status))}${escapeHtml(progress)}${escapeHtml(blockedReason)}${escapeHtml(ownershipLabel)}</small>
         <span>${escapeHtml(job.collector || "未知采集员")} · ${job.required_episode_count || job.episodes?.length || 0} Episode · ${formatBytes(job.asset_size_bytes)}</span>
       </div>
       <button type="button" data-flow-job-code="${escapeHtml(job.code)}" data-flow-action="${action.name}" ${action.disabled ? "disabled" : ""}>${escapeHtml(action.label)}</button>
@@ -802,11 +821,14 @@ async function rescanCurrentTask() {
   }
 }
 
-async function addSource() {
-  setBusyButton(els.addSource, true, "导入中…");
-  setBusyButton(els.taskCenterImport, true, "导入中…");
+async function addSource(taskKind = "robot_teleoperation") {
+  const ego = taskKind === "ego_omniego";
+  const sourceButton = ego ? els.addEgoSource : els.addSource;
+  const centerButton = ego ? els.taskCenterImportEgo : els.taskCenterImport;
+  setBusyButton(sourceButton, true, "导入中…");
+  setBusyButton(centerButton, true, "导入中…");
   try {
-    const result = await window.episodeQc.addSource();
+    const result = await window.episodeQc.addSource(taskKind);
     if (!result) return;
     if (!result.ready) {
       const taskPayload = await window.episodeQc.getTasks();
@@ -829,8 +851,8 @@ async function addSource() {
   } catch (error) {
     toast(error.message || String(error), "error", 7000);
   } finally {
-    setBusyButton(els.addSource, false, "导入新任务");
-    setBusyButton(els.taskCenterImport, false, "导入新任务");
+    setBusyButton(sourceButton, false, ego ? "Import Ego" : "Import Episode");
+    setBusyButton(centerButton, false, ego ? "Import Ego" : "Import Episode");
   }
 }
 
@@ -1041,6 +1063,7 @@ async function reloadCurrentEpisode() {
 function renderEpisodeDetail() {
   if (!state.detail) return;
   const episode = state.detail.episode;
+  renderViewerProfile();
   renderHeaderContext();
   els.currentEpisode.textContent = episode.episode_name;
   els.episodeMeta.textContent = `${episode.data_group} · ${episode.camera_count} 路相机 · ${episode.mocap_available ? "Mocap 可解析" : "Mocap 不可用"} · ${episode.relative_path}`;
@@ -1071,7 +1094,7 @@ function clearEpisodeView() {
   els.episodeMeta.textContent = "请选择左侧数据";
   els.cameraGrid.innerHTML = '<div class="empty-panel">当前 Episode 的有效相机会在此动态显示</div>';
   els.motionEmpty.hidden = false;
-  els.motionEmpty.textContent = "选择 Episode 后显示 G1 29DOF 机器人";
+  els.motionEmpty.textContent = isEgoTask() ? "选择 Episode 后显示人体 Pose 骨架" : "选择 Episode 后显示 G1 29DOF 机器人";
   els.coverageTracks.innerHTML = "";
   els.annotationTrack.innerHTML = "";
   els.annotationList.innerHTML = '<div class="empty-panel">暂无标注</div>';
@@ -1151,10 +1174,13 @@ function toggleCameraFullscreen(streamId) {
 }
 
 function renderMotionAvailability() {
+  renderViewerProfile();
   const available = Boolean(state.cache?.robot_actions?.available || state.cache?.motion?.available);
   els.motionCard.classList.toggle("ready", available);
   els.motionEmpty.hidden = available;
-  if (!available) els.motionEmpty.textContent = "当前 Episode 无可用的 G1 动作或 Mocap";
+  if (!available) els.motionEmpty.textContent = isEgoTask()
+    ? "当前 Episode 无可用的 Pose 骨架"
+    : "当前 Episode 无可用的 G1 动作或 Mocap";
   renderMotionSourceOptions();
   renderJointOptions(state.cache?.motion?.available ? state.cache.motion.joint_names || [] : []);
   renderTargetContext();
@@ -1162,6 +1188,12 @@ function renderMotionAvailability() {
 }
 
 function renderMotionSourceOptions() {
+  if (isEgoTask()) {
+    els.motionSource.innerHTML = '<option value="pose">SMPL 24 关节骨架</option>';
+    els.motionSource.value = "pose";
+    els.motionSource.disabled = true;
+    return;
+  }
   const sourceNames = {
     policy: "实际执行姿态（Policy，默认）",
     policy_target: "目标姿态（PMG）",
@@ -1328,6 +1360,17 @@ function renderSelection() {
 
 function renderLabels() {
   const labels = state.labelSchema?.labels || [];
+  const openMode = state.currentTask?.annotation_mode === "open"
+    || state.labelSchema?.schema?.annotation_mode === "open";
+  els.openLabelEditor.hidden = !openMode;
+  els.labelSearch.parentElement.hidden = openMode;
+  els.labelHelp.textContent = openMode
+    ? "标签可现场创建；首次保存后会成为本任务建议项。人工标注，不使用机器初标"
+    : "简易模板只要求填写标签名称，其余字段均可省略";
+  if (openMode) {
+    renderOpenLabels(labels);
+    return;
+  }
   const annotations = state.detail?.annotations || [];
   const groups = new Map((state.labelSchema?.groups || []).map((item) => [item.code, groupDisplayName(item.code, item.name)]));
   const groupCodes = [...new Set(labels.filter((label) => label.enabled !== false).map((label) => label.group).filter(Boolean))];
@@ -1374,6 +1417,28 @@ function renderLabels() {
   }).join("");
 }
 
+function renderOpenLabels(labels) {
+  const annotations = state.detail?.annotations || [];
+  const currentTarget = currentAnnotationTarget();
+  const visible = labels.filter((label) => label.enabled !== false);
+  els.labelSetMeta.textContent = `开放标签 · ${state.labelSchema?.schema?.annotation_schema_version || "ego_open_v1"}`;
+  els.labelSetMeta.title = "无需绑定标签库；保留结构版本和原始标签快照";
+  els.labelCount.textContent = `${visible.length} 个建议`;
+  if (!visible.length) {
+    els.labelList.innerHTML = '<div class="empty-panel">直接在上方输入第一个自定义标签</div>';
+    return;
+  }
+  els.labelList.innerHTML = visible.map((label) => {
+    const related = annotations.filter((annotation) => annotation.label_slug === label.code || annotation.label_code === label.code);
+    const status = labelAnnotationStatus(related);
+    return `<button class="label-button" data-label-code="${escapeHtml(label.code)}" style="--label-color:${escapeHtml(label.color || "#cfef5a")}" title="以建议项创建标注；可先修改上方输入框" type="button"${state.detail ? "" : " disabled"}>
+      <i class="label-color"></i>
+      <span class="label-copy"><strong>${escapeHtml(label.name)}</strong><small>${escapeHtml(groupDisplayName(label.annotation_type || label.group || "other"))} · ${escapeHtml(currentTarget.displayName)}</small></span>
+      <span class="label-button-meta">${status ? `<span class="label-annotation-status ${status.tone}">${escapeHtml(status.text)}</span>` : ""}</span>
+    </button>`;
+  }).join("");
+}
+
 function renderTargetContext() {
   const active = currentAnnotationTarget();
   const cameras = state.cache?.cameras || [];
@@ -1395,6 +1460,11 @@ async function createAnnotation(labelCode) {
   if (!state.detail) return toast("请先选择 Episode", "error");
   const label = state.labelSchema?.labels?.find((item) => item.code === labelCode);
   if (!label) return;
+  if (state.currentTask?.annotation_mode === "open" || state.labelSchema?.schema?.annotation_mode === "open") {
+    els.openAnnotationType.value = label.annotation_type || label.group || "other";
+    els.openLabelName.value = label.name;
+    return createOpenAnnotation(label.code);
+  }
   let start = Math.round(state.playheadNs);
   let end = start;
   if (state.scope === "time_range") {
@@ -1435,11 +1505,84 @@ async function createAnnotation(labelCode) {
   }
 }
 
+async function createOpenAnnotation(labelSlug = "") {
+  if (!state.detail) return toast("请先选择 Episode", "error");
+  const labelName = els.openLabelName.value.trim();
+  if (!labelName) return toast("请输入自定义标签名称", "error");
+  let start = Math.round(state.playheadNs);
+  let end = start;
+  if (state.scope === "time_range") {
+    if (state.selectionStartNs === null || state.selectionEndNs === null || state.selectionEndNs <= state.selectionStartNs) {
+      return toast("请先使用 I / O 设置有效区间", "error");
+    }
+    start = state.selectionStartNs;
+    end = state.selectionEndNs;
+  } else if (state.scope === "episode") {
+    start = 0;
+    end = state.durationNs;
+  }
+  const target = currentAnnotationTarget();
+  const attributes = {};
+  const fieldValues = {
+    body_part: els.egoBodyPart.value.trim(), object_name: els.egoObjectName.value.trim(),
+    object_color: els.egoObjectColor.value.trim(), source_name: els.egoSourceName.value.trim(),
+    target_name: els.egoTargetName.value.trim(), exception_type: els.egoExceptionType.value.trim(),
+    recovery_action: els.egoRecoveryAction.value.trim(),
+  };
+  Object.entries(fieldValues).forEach(([key, value]) => { if (value) attributes[key] = value; });
+  const annotationType = els.openAnnotationType.value;
+  const payload = {
+    episode_id: state.currentEpisodeId, annotation_mode: "open",
+    annotation_schema_version: state.currentTask?.annotation_schema_version || "ego_open_v1",
+    annotation_type: annotationType, label_name: labelName, label_slug: labelSlug,
+    scope: state.scope, start_offset_ns: start, end_offset_ns: end,
+    target_type: target.targetType, target_key: target.targetKey,
+    severity: "normal", action: ["pose_quality", "camera_quality"].includes(annotationType) ? "repair" : "keep",
+    comment: els.annotationComment.value.trim(), attributes,
+    reviewer_name: els.reviewerName.value.trim(), status: "confirmed",
+  };
+  setSaveState("saving", "保存中…");
+  try {
+    const saved = await window.episodeQc.saveAnnotation({ payload });
+    state.detail.annotations.push(saved);
+    if (!state.labelSchema.labels.some((item) => item.code === saved.label_slug)) {
+      state.labelSchema.labels.unshift({
+        code: saved.label_slug,
+        name: saved.label_name,
+        group: saved.annotation_type,
+        annotation_type: saved.annotation_type,
+        enabled: true,
+        color: "#cfef5a",
+      });
+    }
+    state.detail.episode.annotation_count = state.detail.annotations.length;
+    updateEpisodeFromDetail();
+    renderAnnotations();
+    els.openLabelName.value = "";
+    els.annotationComment.value = "";
+    setSaveState("saved", "已保存");
+  } catch (error) {
+    setSaveState("error", "保存失败");
+    toast(error.message || String(error), "error", 7000);
+  }
+}
+
 function collectCustomFields(label, target) {
   const attributes = {};
+  const egoInputs = {
+    body_part: els.egoBodyPart,
+    object_name: els.egoObjectName,
+    object_color: els.egoObjectColor,
+    source_name: els.egoSourceName,
+    target_name: els.egoTargetName,
+    exception_type: els.egoExceptionType,
+    recovery_action: els.egoRecoveryAction,
+  };
   for (const field of label.fields || []) {
     let value = null;
-    if (field.type === "joint_selector") {
+    const egoInput = isEgoTask() ? egoInputs[field.code] : null;
+    if (egoInput) value = egoInput.value.trim();
+    else if (field.type === "joint_selector") {
       const joint = state.selectedJoint || (target.targetType === "mocap" ? WHOLE_BODY_JOINT : null);
       if (joint) value = field.multiple ? [joint] : joint;
     }
@@ -1514,7 +1657,10 @@ function renderAnnotations() {
   els.annotationCount.textContent = annotations.length;
   if (!annotations.length) els.annotationList.innerHTML = '<div class="empty-panel">暂无标注</div>';
   else els.annotationList.innerHTML = annotations.map((annotation) => {
-    const label = labels.get(annotation.label_code) || { name: annotation.label_code, color: "#8c959f" };
+    const label = labels.get(annotation.label_code) || {
+      name: annotation.label_name || annotation.label_code,
+      color: annotation.annotation_mode === "open" ? "#cfef5a" : "#8c959f",
+    };
     const round = annotationRoundMeta(annotation);
     const badgeTitle = round.inherited
       ? `从历史质检结果继承，可修改或删除；首次 R${round.originRound}，最近 R${round.lastRound}`
@@ -1549,7 +1695,11 @@ function renderAnnotationLanes(annotations, labels) {
     return;
   }
   els.annotationTrack.innerHTML = [...grouped.entries()].map(([labelCode, items]) => {
-    const label = labels.get(labelCode) || { name: labelCode, color: "#8c959f" };
+    const first = items[0] || {};
+    const label = labels.get(labelCode) || {
+      name: first.label_name || labelCode,
+      color: first.annotation_mode === "open" ? "#cfef5a" : "#8c959f",
+    };
     const blocks = items.map((annotation) => {
       const round = annotationRoundMeta(annotation);
       const startNs = annotation.scope === "episode" ? 0 : Math.max(0, Number(annotation.start_offset_ns) || 0);
@@ -1852,7 +2002,7 @@ function moveEpisode(direction) {
 function drawMotion() {
   const frame = state.motionFrame;
   const actionFrame = state.robotActionFrame;
-  if ((frame?.positions?.length || actionFrame?.jointPositions?.length) && g1Viewer.status === "loading") {
+  if (!isEgoTask() && (frame?.positions?.length || actionFrame?.jointPositions?.length) && g1Viewer.status === "loading") {
     els.motionEmpty.hidden = false;
     els.motionEmpty.textContent = "正在载入官方 G1 29DOF 模型…";
   }
@@ -1864,6 +2014,7 @@ function drawMotion() {
     selectedJoint: state.selectedJoint,
     robotAction: actionFrame,
     motionSource: state.motionSource,
+    viewerProfile: isEgoTask() ? "ego_omniego" : "robot_g1",
   });
   els.jointLabelLayer.replaceChildren();
   if (els.jointLabels.checked) {
@@ -2168,7 +2319,13 @@ function groupDisplayName(code, configuredName = "") {
     collection: "采集过程问题",
     task_execution: "任务执行",
     clothes_handling: "衣物处理",
-    motion_safety: "动作与安全"
+    motion_safety: "动作与安全",
+    action: "动作",
+    pose_quality: "Pose 质量",
+    camera_quality: "相机质量",
+    exception: "意外与恢复",
+    object_state: "物品状态",
+    other: "其他"
   })[code] || configuredName || code || "其他";
 }
 
@@ -2201,6 +2358,30 @@ function jointDisplayName(name) {
     RightArm: "右肩",
     RightForeArm: "右肘",
     RightHand: "右腕",
+    pelvis: "骨盆",
+    left_hip: "左髋",
+    right_hip: "右髋",
+    spine1: "腰部",
+    left_knee: "左膝",
+    right_knee: "右膝",
+    spine2: "胸腰",
+    left_ankle: "左踝",
+    right_ankle: "右踝",
+    spine3: "胸部",
+    left_foot: "左脚",
+    right_foot: "右脚",
+    neck: "颈部",
+    left_collar: "左锁骨",
+    right_collar: "右锁骨",
+    head: "头部",
+    left_shoulder: "左肩",
+    right_shoulder: "右肩",
+    left_elbow: "左肘",
+    right_elbow: "右肘",
+    left_wrist: "左腕",
+    right_wrist: "右腕",
+    left_hand: "左手",
+    right_hand: "右手",
   })[name] || name || "未命名关节";
 }
 
@@ -2248,6 +2429,36 @@ function taskStatusName(status) {
     archived: "已归档",
     failed: "导入失败",
   })[status] || status || "未知状态";
+}
+function taskKindName(taskKind) {
+  return taskKind === "ego_omniego" ? "Ego" : "Episode";
+}
+function flowJobAssetTypeName(job) {
+  if (job?.viewer_profile === "ego_omniego" || job?.asset_type === "egocentric") return "Ego";
+  if (job?.viewer_profile === "mocap" || job?.asset_type === "mocap") return "动作捕捉";
+  return "Robot Teleoperation";
+}
+function isEgoTask() {
+  return (state.detail?.episode?.task_kind || state.currentTask?.task_kind) === "ego_omniego";
+}
+function setMotionControlsExpanded(expanded) {
+  els.motionControlPanel.hidden = !expanded;
+  els.motionControlsToggle.setAttribute("aria-expanded", String(expanded));
+  els.motionControlsToggle.textContent = expanded ? "收起设置 ▴" : "视图设置 ▾";
+  els.motionControlsToggle.title = expanded ? "收起动作源和标注范围" : "展开动作源和标注范围";
+}
+function renderViewerProfile() {
+  const ego = isEgoTask();
+  els.motionViewerTitle.textContent = ego ? "人体 Pose 骨架" : "宇树 G1 29DOF";
+  els.motionViewerBadge.textContent = ego ? "SMPL 24" : "URDF";
+  els.motionHint.textContent = ego
+    ? "读取 /dohc/skeleton · 24 关节全身 Pose · 下拉或点击名称选关节 · 拖动旋转 · 滚轮缩放"
+    : "G1 关节角直接驱动 · 可切换实际执行/目标/重定向姿态 · 下拉或点击名称选关节 · 拖动旋转 · 滚轮缩放";
+  els.motionSource.closest("label")?.classList.toggle("ego-pose-source", ego);
+  els.motionCard.classList.toggle("ego-profile", ego);
+  els.egoAnnotationFields.hidden = !ego;
+  els.motionSource.title = ego ? "人体 Pose 来源" : "选择 G1 动作源";
+  els.motionSource.setAttribute("aria-label", els.motionSource.title);
 }
 function flowJobStatusName(status) {
   return ({

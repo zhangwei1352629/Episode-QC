@@ -192,8 +192,12 @@ body.episodes-collapsed .episode-sidebar, body.labels-collapsed .label-sidebar {
 .viewer-actions button { font-size: 9px; padding: 4px 7px; }
 .motion-stage { min-height: 0; position: relative; background: radial-gradient(circle at 50% 39%, #263038 0, #13191e 38%, #080b0e 76%); }
 .motion-stage::after { content: "G1 DIGITAL TWIN"; position: absolute; top: 9px; right: 9px; color: rgba(180,194,202,.24); font-size: 8px; font-weight: 800; letter-spacing: .16em; pointer-events: none; }
+.motion-card.ego-profile .motion-stage::after { content: "HUMAN POSE"; }
 #motion-canvas { width: 100%; height: 100%; display: block; }
-.motion-control-panel { position: absolute; z-index: 3; top: 8px; left: 8px; display: grid; gap: 5px; padding: 7px; border: 1px solid rgba(207,244,90,.25); border-radius: 7px; color: #aeb9bf; background: rgba(8,12,15,.9); box-shadow: 0 5px 14px rgba(0,0,0,.22); font-size: 9px; }
+.motion-controls-toggle { position: absolute; z-index: 4; top: 8px; left: 8px; min-height: 24px; padding: 3px 7px; border: 1px solid rgba(207,244,90,.32); border-radius: 6px; color: #c7d0d5; background: rgba(8,12,15,.78); box-shadow: 0 3px 10px rgba(0,0,0,.18); font-size: 8px; cursor: pointer; }
+.motion-controls-toggle:hover, .motion-controls-toggle[aria-expanded="true"] { border-color: rgba(207,244,90,.62); color: var(--accent); background: rgba(8,12,15,.94); }
+.motion-control-panel { position: absolute; z-index: 3; top: 38px; left: 8px; display: grid; gap: 5px; padding: 7px; border: 1px solid rgba(207,244,90,.25); border-radius: 7px; color: #aeb9bf; background: rgba(8,12,15,.9); box-shadow: 0 5px 14px rgba(0,0,0,.22); font-size: 9px; }
+.motion-control-panel[hidden] { display: none; }
 .motion-control-panel label { display: grid; grid-template-columns: 46px 142px; gap: 6px; align-items: center; }
 .motion-control-panel select { width: 142px; height: 27px; padding: 0 6px; font-size: 9px; }
 .joint-label-layer { position: absolute; inset: 0; overflow: hidden; pointer-events: none; }
@@ -276,6 +280,10 @@ body.episodes-collapsed .episode-sidebar, body.labels-collapsed .label-sidebar {
 .scope-tabs button { height: 27px; border: 0; background: transparent; font-size: 10px; color: var(--muted); }
 .scope-tabs button.active { color: #14170d; background: var(--accent); }
 .label-filter-row { display: grid; grid-template-columns: minmax(0, 1fr) 94px; gap: 5px; margin-bottom: 6px; }
+.open-label-editor { display: grid; grid-template-columns: 100px minmax(0, 1fr) auto; gap: 5px; margin-bottom: 6px; padding: 7px; border: 1px solid rgba(207,244,90,.3); border-radius: 7px; background: rgba(207,244,90,.05); }
+.open-label-editor[hidden] { display: none; }
+.open-label-editor input, .open-label-editor select { min-width: 0; }
+.open-label-editor .button { min-height: 30px; padding: 5px 11px; }
 #label-search, #label-group-filter { width: 100%; height: 30px; font-size: 10px; }
 #label-group-filter { padding-left: 7px; }
 .target-context { border: 1px solid #344049; border-radius: 7px; padding: 6px; background: rgba(207,244,90,.025); margin-bottom: 6px; }
@@ -294,6 +302,14 @@ body.episodes-collapsed .episode-sidebar, body.labels-collapsed .label-sidebar {
 .annotation-note-heading small { color: var(--muted); font-size: 8px; white-space: nowrap; }
 .annotation-note textarea { width: 100%; min-height: 31px; max-height: 70px; padding: 7px 8px; resize: vertical; font-size: 10px; line-height: 1.35; transition: min-height .16s ease; }
 .annotation-note textarea:focus { min-height: 52px; }
+.ego-annotation-fields { flex: 0 0 auto; margin-bottom: 7px; border: 1px solid rgba(207,244,90,.22); border-radius: 7px; background: rgba(207,244,90,.035); padding: 7px; }
+.ego-fields-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; margin-bottom: 6px; }
+.ego-fields-heading strong { font-size: 10px; }
+.ego-fields-heading span { color: var(--muted); font-size: 8px; }
+.ego-fields-grid { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 5px; }
+.ego-fields-grid label { display: grid; gap: 2px; color: var(--muted); font-size: 8px; }
+.ego-fields-grid label.wide { grid-column: 1 / -1; }
+.ego-fields-grid input, .ego-fields-grid select { min-width: 0; height: 27px; padding: 0 6px; border: 1px solid var(--line); border-radius: 5px; background: var(--surface-strong); color: var(--text); font: inherit; }
 .label-list { min-height: 0; flex: 1 1 auto; display: grid; grid-template-columns: repeat(auto-fit, minmax(126px, 1fr)); grid-auto-rows: minmax(44px, auto); align-content: start; gap: 5px; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; padding-right: 2px; }
 .label-list > .empty-panel { grid-column: 1 / -1; }
 .label-button { width: 100%; min-width: 0; min-height: 44px; height: auto; align-self: start; display: grid; grid-template-columns: 4px minmax(0, 1fr) auto; align-items: center; gap: 6px; text-align: left; border: 1px solid var(--line-soft); background: linear-gradient(145deg, #171d23, #14191f); border-radius: 7px; padding: 5px 6px 5px 5px; cursor: pointer; }

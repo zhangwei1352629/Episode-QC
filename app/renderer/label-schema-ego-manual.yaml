@@ -1,0 +1,154 @@
+schema:
+  schema_type: annotation_label_schema
+  schema_version: "1.0.0"
+  label_set_id: dohc_ego_manual_v1
+  label_set_name: DOHC Ego 人工动作标注
+  language: zh-CN
+
+severity_levels:
+  - {code: minor, name: 轻微, order: 1}
+  - {code: normal, name: 一般, order: 2}
+  - {code: critical, name: 严重, order: 3}
+
+actions:
+  - {code: keep, name: 保留}
+  - {code: keep_with_label, name: 保留但标记}
+  - {code: trim, name: 裁剪区间}
+  - {code: repair, name: 需要修复}
+  - {code: recollect, name: 需要重采}
+  - {code: reject, name: 整条废弃}
+  - {code: review, name: 待复核}
+
+groups:
+  - {code: action_segment, name: 动作分片, order: 1}
+  - {code: exception, name: 意外与恢复, order: 2}
+  - {code: pose_quality, name: Pose 质量, order: 3}
+  - {code: camera_quality, name: 画面质量, order: 4}
+
+labels:
+  - code: transport_object
+    name: 搬运物品到目标附近
+    group: action_segment
+    description: 从起始位置将物品搬运到货架、桌面、收纳区或垃圾桶附近
+    enabled: true
+    annotation_scopes: [time_range]
+    target_types: [global, mocap]
+    default_severity: normal
+    default_action: keep
+    color: "#3B82F6"
+    fields: &action_fields
+      - code: body_part
+        name: 执行身体部位
+        type: select
+        required: true
+        options:
+          - {code: left_hand, name: 左手}
+          - {code: right_hand, name: 右手}
+          - {code: both_hands, name: 双手}
+          - {code: whole_body, name: 全身}
+          - {code: unknown, name: 无法判断}
+      - {code: object_name, name: 物品名称, type: text, required: true}
+      - {code: object_color, name: 物品颜色, type: text, required: false}
+      - {code: source_name, name: 起始位置, type: text, required: false}
+      - {code: target_name, name: 放置或移动目标, type: text, required: true}
+
+  - code: pick_object
+    name: 拿取物品
+    group: action_segment
+    description: 手接近物品并建立稳定抓持
+    enabled: true
+    annotation_scopes: [time_range]
+    target_types: [global, mocap, joint]
+    default_severity: normal
+    default_action: keep
+    color: "#10B981"
+    fields: *action_fields
+
+  - code: place_object
+    name: 放置物品到目标
+    group: action_segment
+    description: 将物品移动到目标位置并松手完成放置
+    enabled: true
+    annotation_scopes: [time_range]
+    target_types: [global, mocap, joint]
+    default_severity: normal
+    default_action: keep
+    color: "#8B5CF6"
+    fields: *action_fields
+
+  - code: arrange_object
+    name: 整理或调整物品
+    group: action_segment
+    description: 对货物、衣服、咖啡用品或其他物品的位置和朝向进行调整
+    enabled: true
+    annotation_scopes: [time_range]
+    target_types: [global, mocap, joint]
+    default_severity: normal
+    default_action: keep
+    color: "#F59E0B"
+    fields: *action_fields
+
+  - code: unexpected_event
+    name: 意外情况
+    group: exception
+    description: 物品掉落、倒下、碰撞、重复整理、抓取失败或人员干扰
+    enabled: true
+    annotation_scopes: [time_point, time_range]
+    target_types: [global, camera, mocap]
+    default_severity: normal
+    default_action: keep_with_label
+    color: "#EF4444"
+    fields:
+      - code: exception_type
+        name: 意外类型
+        type: select
+        required: true
+        options:
+          - {code: object_dropped, name: 物品掉落}
+          - {code: object_fell_over, name: 物品倒下}
+          - {code: retry, name: 重复或重试}
+          - {code: failed_grasp, name: 抓取失败}
+          - {code: collision, name: 碰撞}
+          - {code: person_interruption, name: 人员干扰}
+          - {code: other, name: 其他}
+      - {code: object_name, name: 涉及物品, type: text, required: false}
+      - {code: recovery_action, name: 恢复动作, type: textarea, required: true}
+
+  - code: pose_misaligned
+    name: Pose 与画面不对齐
+    group: pose_quality
+    description: 全身或局部骨架与视频中的人体明显不一致
+    enabled: true
+    annotation_scopes: [time_point, time_range]
+    target_types: [mocap, joint]
+    default_severity: critical
+    default_action: repair
+    color: "#F97316"
+    fields:
+      - code: affected_joint
+        name: 异常关节
+        type: joint_selector
+        required: true
+        multiple: true
+
+  - code: camera_unusable
+    name: 画面不可用
+    group: camera_quality
+    description: 画面模糊、遮挡、冻结、过曝或关键动作出画
+    enabled: true
+    annotation_scopes: [time_point, time_range, episode]
+    target_types: [camera]
+    default_severity: critical
+    default_action: recollect
+    color: "#64748B"
+    fields:
+      - code: camera_issue
+        name: 画面问题
+        type: select
+        required: true
+        options:
+          - {code: blur, name: 模糊}
+          - {code: occlusion, name: 遮挡}
+          - {code: freeze, name: 冻结或卡顿}
+          - {code: exposure, name: 曝光异常}
+          - {code: out_of_view, name: 关键动作出画}

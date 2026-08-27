@@ -74,6 +74,9 @@ _FLOW_LABEL_REFERENCE_FIELDS = (
 )
 _FLOW_ANNOTATION_FIELDS = (
     "label_code",
+    "annotation_type",
+    "label_name",
+    "label_slug",
     "scope",
     "start_offset_ns",
     "end_offset_ns",
@@ -85,7 +88,7 @@ _FLOW_ANNOTATION_FIELDS = (
     "attributes",
 )
 _FLOW_OPTIONAL_ANNOTATION_FIELDS = frozenset(
-    {"id", "target_key", "severity", "action", "comment", "attributes"}
+    {"id", "label_code", "label_slug", "target_key", "severity", "action", "comment", "attributes"}
 )
 
 
@@ -100,16 +103,22 @@ def _flow_label_set_reference(job: dict) -> dict | None:
     return values
 
 
-def _flow_annotations(value: object) -> list[dict]:
+def _flow_annotations(value: object, *, open_mode: bool | None = None) -> list[dict]:
     """Keep only Flow fact fields and rename QC-local annotation IDs."""
     if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
         raise QualityCacheError("annotations 必须是对象列表")
     normalized_annotations = []
     for annotation in value:
+        open_annotation = (
+            annotation.get("annotation_mode") == "open"
+            if open_mode is None
+            else open_mode
+        )
         normalized = {
             field: annotation[field]
             for field in _FLOW_ANNOTATION_FIELDS
             if field in annotation
+            and (open_annotation or field not in {"annotation_type", "label_name", "label_slug"})
         }
         if "annotation_id" in annotation:
             normalized["id"] = annotation["annotation_id"]
@@ -119,7 +128,7 @@ def _flow_annotations(value: object) -> list[dict]:
     return normalized_annotations
 
 
-def _flow_submission_annotations(value: object) -> list[dict]:
+def _flow_submission_annotations(value: object, *, open_mode: bool = False) -> list[dict]:
     """Omit nullable optional fields from the Flow wire payload.
 
     Existing pending result documents may already contain JSON null values.
@@ -133,7 +142,7 @@ def _flow_submission_annotations(value: object) -> list[dict]:
             for field, item in annotation.items()
             if item is not None or field not in _FLOW_OPTIONAL_ANNOTATION_FIELDS
         }
-        for annotation in _flow_annotations(value)
+        for annotation in _flow_annotations(value, open_mode=open_mode)
     ]
 
 
@@ -269,6 +278,8 @@ class FlowClient:
         episode_results: list[dict],
         result: dict | None = None,
         label_set: dict | None = None,
+        annotation_mode: str | None = None,
+        annotation_schema_version: str | None = None,
         result_nas_path: str = "",
         result_id: str = "",
         result_sha256: str = "",
@@ -293,7 +304,8 @@ class FlowClient:
                 normalized["quality_grade"] = episode_result["quality_grade"]
             if "annotations" in episode_result:
                 normalized["annotations"] = _flow_submission_annotations(
-                    episode_result["annotations"]
+                    episode_result["annotations"],
+                    open_mode=annotation_mode == "open",
                 )
             if episode_result.get("completed_at"):
                 normalized["completed_at"] = episode_result["completed_at"]
@@ -313,6 +325,10 @@ class FlowClient:
             )
         if label_set is not None:
             payload["label_set"] = label_set
+        if annotation_mode:
+            payload["annotation_mode"] = annotation_mode
+        if annotation_schema_version:
+            payload["annotation_schema_version"] = annotation_schema_version
         return self.request("POST", f"/api/v1/qc/jobs/{job_code}/result", payload)
 
 
@@ -752,6 +768,18 @@ class QualityCacheManager:
         if not state.get("cache_complete"):
             raise QualityCacheError("质检任务尚未完整缓存到本地，不能提交整批结果")
         expected_ids = {item["episode_id"] for item in job.get("episodes", [])}
+        expected_episode_paths: dict[str, str] = {}
+        for item in job.get("episodes", []):
+            episode_id = str(item.get("episode_id") or "")
+            if not item.get("relative_path"):
+                continue
+            relative_path = self._safe_relative_path(
+                item.get("relative_path"),
+                f"Episode {episode_id} 相对目录",
+            ).as_posix()
+            if relative_path in expected_episode_paths.values():
+                raise QualityCacheError("Flow 质检任务包含重复的 Episode 相对目录")
+            expected_episode_paths[episode_id] = relative_path
         cached_episodes = {
             str(item.get("episode_id") or ""): item
             for item in state.get("episodes") or []
@@ -762,12 +790,46 @@ class QualityCacheManager:
             or any(item.get("status") != "ready" for item in cached_episodes.values())
         ):
             raise QualityCacheError("质检任务尚未完整缓存到本地，不能提交整批结果")
+        for episode_id, expected_path in expected_episode_paths.items():
+            if not cached_episodes[episode_id].get("relative_path"):
+                raise QualityCacheError(
+                    f"Episode {episode_id} 的本地缓存缺少实际数据目录"
+                )
+            cached_path = self._safe_relative_path(
+                cached_episodes[episode_id].get("relative_path"),
+                f"缓存 Episode {episode_id} 相对目录",
+            ).as_posix()
+            if cached_path != expected_path:
+                raise QualityCacheError(
+                    f"Episode {episode_id} 的 Flow 目录与本地缓存目录不一致"
+                )
         submitted_ids = {item.get("episode_id") for item in episode_results}
         if len(submitted_ids) != len(episode_results) or submitted_ids != expected_ids:
             raise QualityCacheError("必须一次提交资产内全部且不重复的 Episode 质检结论")
         label_set = _flow_label_set_reference(job)
+        annotation_mode = str(job.get("annotation_mode") or "library")
+        annotation_schema_version = str(job.get("annotation_schema_version") or "")
+        open_mode = annotation_mode == "open"
+        if open_mode and not annotation_schema_version:
+            raise QualityCacheError("开放标注任务缺少结构版本")
         normalized_results = []
         for episode_result in episode_results:
+            episode_id = str(episode_result.get("episode_id") or "")
+            relative_episode_path = expected_episode_paths.get(episode_id, "")
+            submitted_relative_path = episode_result.get("relative_episode_path")
+            if submitted_relative_path:
+                if not relative_episode_path:
+                    raise QualityCacheError(
+                        f"Episode {episode_id} 缺少可核验的 Flow 相对目录"
+                    )
+                submitted_relative_path = self._safe_relative_path(
+                    submitted_relative_path,
+                    f"Episode {episode_id} 结果相对目录",
+                ).as_posix()
+                if submitted_relative_path != relative_episode_path:
+                    raise QualityCacheError(
+                        f"Episode {episode_id} 的标注结果与实际数据目录不一致"
+                    )
             decision = episode_result.get("decision")
             quality_grade = episode_result.get("quality_grade")
             if decision not in DECISION_MAP:
@@ -778,26 +840,79 @@ class QualityCacheManager:
                 raise QualityCacheError("标注数量不能为负数")
             has_direct_annotations = "annotations" in episode_result
             annotations = (
-                _flow_annotations(episode_result["annotations"])
+                _flow_annotations(episode_result["annotations"], open_mode=open_mode)
                 if has_direct_annotations
                 else []
             )
             annotation_count = int(episode_result.get("annotation_count") or 0)
-            if label_set is None and annotation_count > 0:
+            if label_set is None and not open_mode and annotation_count > 0:
                 raise QualityCacheError("无 Flow 标签库引用的质检结果只允许零标注")
             if label_set is not None or has_direct_annotations:
                 if annotation_count != len(annotations):
                     raise QualityCacheError("annotation_count 必须等于 annotations 数量")
-            if label_set is None and annotations:
+            if label_set is None and not open_mode and annotations:
                 raise QualityCacheError("带有标注的质检结果需要完整的 Flow 标签库引用")
+            if open_mode:
+                for annotation in annotations:
+                    if not str(annotation.get("label_name") or "").strip():
+                        raise QualityCacheError("开放标注必须填写标签名称")
+                    if not str(annotation.get("annotation_type") or "").strip():
+                        raise QualityCacheError("开放标注必须填写标注类型")
+            result_details = episode_result.get("result") or {}
+            if not isinstance(result_details, dict):
+                raise QualityCacheError("Episode result 必须是对象")
+            existing_result_path = result_details.get("relative_episode_path")
+            if existing_result_path:
+                if not relative_episode_path:
+                    raise QualityCacheError(
+                        f"Episode {episode_id} 缺少可核验的 Flow 相对目录"
+                    )
+                existing_result_path = self._safe_relative_path(
+                    existing_result_path,
+                    f"Episode {episode_id} result 相对目录",
+                ).as_posix()
+                if existing_result_path != relative_episode_path:
+                    raise QualityCacheError(
+                        f"Episode {episode_id} 的标注结果元数据与实际数据目录不一致"
+                    )
+            episode_name = (
+                PurePosixPath(relative_episode_path).name
+                if relative_episode_path
+                else ""
+            )
             normalized = {
                 **episode_result,
                 "decision": DECISION_MAP[episode_result["decision"]],
                 "annotation_count": annotation_count,
+                "result": {
+                    **result_details,
+                    **(
+                        {
+                            "relative_episode_path": relative_episode_path,
+                            "episode_name": episode_name,
+                        }
+                        if relative_episode_path
+                        else {}
+                    ),
+                },
+                **(
+                    {
+                        "relative_episode_path": relative_episode_path,
+                        "episode_name": episode_name,
+                    }
+                    if relative_episode_path
+                    else {}
+                ),
             }
             if label_set is not None or has_direct_annotations:
                 normalized["annotations"] = annotations
             normalized_results.append(normalized)
+        normalized_results.sort(
+            key=lambda item: (
+                str(item.get("relative_episode_path") or ""),
+                str(item["episode_id"]),
+            )
+        )
         pending_result = state.get("pending_result") or {}
         result_id = str(pending_result.get("result_id") or f"QCR-{uuid.uuid4().hex}")
         attempt = int(state.get("next_attempt") or job.get("next_attempt") or 1)
@@ -835,6 +950,10 @@ class QualityCacheManager:
             "source_manifest_sha256": state.get("asset_manifest_sha256", ""),
             "episode_results": normalized_results,
             "result": result or {},
+            **({
+                "annotation_mode": "open",
+                "annotation_schema_version": annotation_schema_version,
+            } if open_mode else {}),
             **({"review_timing": review_timing} if review_timing else {}),
         }
         local_results = self.cache_root / "results-pending" / job_code
@@ -898,6 +1017,8 @@ class QualityCacheManager:
             episode_results=normalized_results,
             result=result or {},
             label_set=label_set,
+            annotation_mode=annotation_mode if open_mode else None,
+            annotation_schema_version=annotation_schema_version if open_mode else None,
             result_nas_path=result_nas_path,
             result_id=result_id,
             result_sha256=result_sha256,

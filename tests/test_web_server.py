@@ -104,6 +104,7 @@ def running_server(
         static_root=project_root / "app" / "renderer",
         default_profile=tmp_path / "missing-profile.yaml",
         default_label_schema=tmp_path / "missing-labels.yaml",
+        ego_label_schema=project_root / "app" / "renderer" / "label-schema-ego-manual.yaml",
     )
     server = create_web_server(
         paths,
@@ -1214,6 +1215,132 @@ def test_web_flow_label_schema_submit_uses_direct_annotations(tmp_path: Path, mo
         "deleted_annotation_lineages": ["QCJ-V1:legacy-ann"],
     }
 
+
+def test_web_submit_repairs_order_based_mapping_with_actual_gapped_paths(
+    tmp_path: Path,
+    monkeypatch,
+):
+    job = {
+        "code": "QCJ-WEB-GAPPED-EPISODES",
+        "status": "in_progress",
+        "episodes": [
+            {
+                "episode_id": "AST-GAPPED-EP0002",
+                "relative_path": "episodes/episode_000022",
+            },
+            {
+                "episode_id": "AST-GAPPED-EP0001",
+                "relative_path": "episodes/episode_000020",
+            },
+        ],
+    }
+    submitted = {}
+    repaired_mappings = []
+
+    class FakeFlowClient:
+        def jobs(self):
+            return [dict(job)]
+
+    class FakeCache:
+        def local_episode_mappings(self, _job_code):
+            return [
+                {
+                    "episode_id": "AST-GAPPED-EP0002",
+                    "local_episode_id": "local-20",
+                    "relative_path": "episodes/episode_000022",
+                },
+                {
+                    "episode_id": "AST-GAPPED-EP0001",
+                    "local_episode_id": "local-22",
+                    "relative_path": "episodes/episode_000020",
+                },
+            ]
+
+        def record_local_episodes(self, _job_code, mappings):
+            repaired_mappings.extend(mappings)
+
+        def start_review(self, _client, _job_code):
+            return dict(job)
+
+        def submit_result(self, _client, _job, *, episode_results, result):
+            submitted["episode_results"] = episode_results
+            return {"status": "completed"}
+
+    monkeypatch.setattr(
+        web_server,
+        "workspace_state",
+        lambda *_args, **_kwargs: {
+            "episodes": [
+                {
+                    "id": "local-20",
+                    "relative_path": "episodes/episode_000020",
+                },
+                {
+                    "id": "local-22",
+                    "relative_path": "episodes/episode_000022",
+                },
+            ]
+        },
+    )
+    monkeypatch.setattr(
+        web_server,
+        "episode_detail",
+        lambda _db_path, episode_id: {
+            "episode": {
+                "quality_decision": "pass" if episode_id == "local-20" else "discard",
+                "review_status": "completed",
+                "reviewer_name": "跳号测试员",
+                "annotation_count": 0,
+                "reviewed_at": "2026-08-27T01:00:00+00:00",
+            },
+            "annotations": [],
+            "deleted_annotation_lineages": [],
+        },
+    )
+
+    with running_server(tmp_path) as (server, _base_url):
+        server.application._flow_client = FakeFlowClient()
+        server.application._quality_cache_manager = lambda: FakeCache()
+        monkeypatch.setattr(
+            server.application,
+            "_local_task_for_job",
+            lambda _job_code: {"id": "task-gapped", "status": "completed"},
+        )
+        monkeypatch.setattr(
+            web_server,
+            "mark_qc_task_submitted",
+            lambda *_args: {"status": "submitted"},
+        )
+
+        response = server.application.submit_platform_job(job["code"])
+
+    assert response["job"]["status"] == "completed"
+    assert repaired_mappings == [
+        {
+            "episode_id": "AST-GAPPED-EP0002",
+            "local_episode_id": "local-22",
+            "relative_path": "episodes/episode_000022",
+        },
+        {
+            "episode_id": "AST-GAPPED-EP0001",
+            "local_episode_id": "local-20",
+            "relative_path": "episodes/episode_000020",
+        },
+    ]
+    results_by_id = {
+        item["episode_id"]: item for item in submitted["episode_results"]
+    }
+    assert results_by_id["AST-GAPPED-EP0001"]["decision"] == "pass"
+    assert results_by_id["AST-GAPPED-EP0001"]["relative_episode_path"] == (
+        "episodes/episode_000020"
+    )
+    assert results_by_id["AST-GAPPED-EP0001"]["episode_name"] == "episode_000020"
+    assert results_by_id["AST-GAPPED-EP0002"]["decision"] == "discard"
+    assert results_by_id["AST-GAPPED-EP0002"]["relative_episode_path"] == (
+        "episodes/episode_000022"
+    )
+
+
 def request_json(url: str, *, method: str = "GET", payload: dict[str, object] | None = None):
     body = None if payload is None else json.dumps(payload).encode("utf-8")
     request = Request(
@@ -2142,6 +2269,7 @@ def test_web_server_requires_public_host_for_wildcard_bind(tmp_path: Path):
         static_root=project_root / "app" / "renderer",
         default_profile=tmp_path / "missing-profile.yaml",
         default_label_schema=tmp_path / "missing-labels.yaml",
+        ego_label_schema=project_root / "app" / "renderer" / "label-schema-ego-manual.yaml",
     )
     with pytest.raises(ValueError, match="public-host"):
         create_web_server(paths, host="0.0.0.0")

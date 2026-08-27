@@ -71,6 +71,14 @@ export class G1Viewer {
     this.scene = new THREE.Scene();
     this.scene.background = new THREE.Color(0x0b1014);
     this.scene.add(this.modelRoot);
+    this.skeletonGroup = new THREE.Group();
+    this.skeletonGroup.visible = false;
+    this.scene.add(this.skeletonGroup);
+    this.skeletonJoints = [];
+    this.skeletonBones = [];
+    this.skeletonNames = [];
+    this.skeletonParentIndices = [];
+    this.skeletonPositions = [];
     this.camera = new THREE.PerspectiveCamera(28, 1, 0.01, 30);
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: false, powerPreference: "high-performance" });
     this.renderer.setClearColor(0x0b1014, 1);
@@ -155,6 +163,7 @@ export class G1Viewer {
   render(frame, view) {
     this.resize();
     const hasFrame = Boolean(frame?.positions?.length);
+    const humanPoseMode = view?.viewerProfile === "ego_omniego";
     const robotAction = view?.robotAction;
     const hasRobotAction = Boolean(robotAction?.jointPositions?.length === 29);
     const poseContextKey = `${view?.episodeId || ""}:${hasRobotAction ? robotAction.source_key || "action" : "mocap"}`;
@@ -165,13 +174,89 @@ export class G1Viewer {
       this.rootPlanarOriginRos = null;
       this.supportFoot = null;
     }
-    this.modelRoot.visible = (hasRobotAction || hasFrame) && this.status === "ready";
-    if (hasRobotAction && this.robot) this.applyRobotAction(robotAction);
+    this.modelRoot.visible = !humanPoseMode && (hasRobotAction || hasFrame) && this.status === "ready";
+    this.skeletonGroup.visible = humanPoseMode && hasFrame;
+    if (humanPoseMode && hasFrame) this.applyHumanSkeleton(frame);
+    else if (hasRobotAction && this.robot) this.applyRobotAction(robotAction);
     else if (hasFrame && this.robot) this.applyMocapPose(frame);
     this.updateCamera(view);
-    this.updateSelection(view?.selectedJoint);
+    this.updateSelection(view?.selectedJoint, humanPoseMode);
     this.renderer.render(this.scene, this.camera);
-    return hasFrame && this.robot ? this.projectJoints(frame) : [];
+    if (!hasFrame) return [];
+    return humanPoseMode ? this.projectSkeletonJoints(frame) : (this.robot ? this.projectJoints(frame) : []);
+  }
+
+  ensureSkeleton(frame) {
+    const names = frame.jointNames || [];
+    const parents = frame.parentIndices || [];
+    const topologyKey = `${names.join("|")}:${parents.join(",")}`;
+    if (this.skeletonTopologyKey === topologyKey) return;
+    this.skeletonTopologyKey = topologyKey;
+    this.skeletonGroup.clear();
+    this.skeletonJoints = [];
+    this.skeletonBones = [];
+    this.skeletonNames = [...names];
+    this.skeletonParentIndices = [...parents];
+    this.skeletonPositions = names.map(() => new THREE.Vector3());
+    const jointGeometry = new THREE.SphereGeometry(0.035, 18, 12);
+    const boneGeometry = new THREE.CylinderGeometry(0.018, 0.018, 1, 12);
+    const materials = {
+      center: new THREE.MeshStandardMaterial({ color: 0xd7f356, roughness: 0.42, metalness: 0.08 }),
+      left: new THREE.MeshStandardMaterial({ color: 0x55c2ff, roughness: 0.42, metalness: 0.08 }),
+      right: new THREE.MeshStandardMaterial({ color: 0xff8b72, roughness: 0.42, metalness: 0.08 }),
+      bone: new THREE.MeshStandardMaterial({ color: 0xc7d0d6, roughness: 0.5, metalness: 0.06 }),
+    };
+    names.forEach((name) => {
+      const side = String(name).startsWith("left_") ? "left" : String(name).startsWith("right_") ? "right" : "center";
+      const joint = new THREE.Mesh(jointGeometry, materials[side]);
+      joint.castShadow = true;
+      this.skeletonGroup.add(joint);
+      this.skeletonJoints.push(joint);
+    });
+    parents.forEach((parentIndex, index) => {
+      if (parentIndex < 0) return;
+      const bone = new THREE.Mesh(boneGeometry, materials.bone);
+      bone.userData = { index, parentIndex };
+      bone.castShadow = true;
+      this.skeletonGroup.add(bone);
+      this.skeletonBones.push(bone);
+    });
+  }
+
+  applyHumanSkeleton(frame) {
+    this.ensureSkeleton(frame);
+    const validPoints = [];
+    frame.positions.forEach((position, index) => {
+      let valid = frame.validity?.[index] !== false && position?.length === 3;
+      const target = this.skeletonPositions[index];
+      if (valid) {
+        target.set(-Number(position[1]), Number(position[2]), -Number(position[0]));
+        valid = [target.x, target.y, target.z].every(Number.isFinite);
+        if (valid) validPoints.push(target);
+      }
+      this.skeletonJoints[index].visible = valid;
+    });
+    const pelvis = (this.skeletonPositions[0] || new THREE.Vector3()).clone();
+    const floorY = validPoints.length ? Math.min(...validPoints.map((point) => point.y)) : 0;
+    this.skeletonPositions.forEach((position, index) => {
+      if (!this.skeletonJoints[index].visible) return;
+      position.set(position.x - pelvis.x, position.y - floorY, position.z - pelvis.z);
+      this.skeletonJoints[index].position.copy(position);
+    });
+    const up = new THREE.Vector3(0, 1, 0);
+    this.skeletonBones.forEach((bone) => {
+      const { index, parentIndex } = bone.userData;
+      const visible = this.skeletonJoints[index]?.visible && this.skeletonJoints[parentIndex]?.visible;
+      bone.visible = Boolean(visible);
+      if (!visible) return;
+      const start = this.skeletonPositions[parentIndex];
+      const end = this.skeletonPositions[index];
+      const direction = new THREE.Vector3().subVectors(end, start);
+      const length = direction.length();
+      bone.position.copy(start).add(end).multiplyScalar(0.5);
+      bone.quaternion.setFromUnitVectors(up, direction.normalize());
+      bone.scale.set(1, length, 1);
+    });
   }
 
   applyRobotAction(frame) {
@@ -225,8 +310,9 @@ export class G1Viewer {
     const zoom = clamp(Number(view.cameraZoom) || 1, 0.35, 3);
     const yaw = Number(view.cameraYaw) || 0;
     const pitch = clamp(Number(view.cameraPitch) || 0, -0.8, 0.8);
-    const target = new THREE.Vector3(0, 0.67, 0);
-    const distance = 3.15 / zoom;
+    const humanPoseMode = view.viewerProfile === "ego_omniego";
+    const target = new THREE.Vector3(0, humanPoseMode ? 0.9 : 0.67, 0);
+    const distance = (humanPoseMode ? 4.15 : 3.15) / zoom;
     const elevation = clamp(0.12 + pitch, -0.62, 0.92);
     const horizontal = Math.cos(elevation) * distance;
     this.camera.position.set(Math.cos(yaw) * horizontal, target.y + Math.sin(elevation) * distance, Math.sin(yaw) * horizontal);
@@ -329,7 +415,14 @@ export class G1Viewer {
     return object.getWorldPosition(target);
   }
 
-  updateSelection(name) {
+  updateSelection(name, humanPoseMode = false) {
+    if (humanPoseMode) {
+      const index = this.skeletonNames.indexOf(name);
+      const joint = index >= 0 ? this.skeletonJoints[index] : null;
+      if (joint?.visible) joint.getWorldPosition(this.selectionMarker.position);
+      this.selectionMarker.visible = Boolean(joint?.visible && this.skeletonGroup.visible);
+      return;
+    }
     const position = name ? this.worldPositionForHumanJoint(name, this.selectionMarker.position) : null;
     this.selectionMarker.visible = Boolean(position && this.modelRoot.visible);
   }
@@ -339,6 +432,24 @@ export class G1Viewer {
     const world = new THREE.Vector3();
     return (frame.jointNames || []).map((name, index) => {
       if (!frame.validity?.[index] || !this.worldPositionForHumanJoint(name, world)) return null;
+      const projected = world.clone().project(this.camera);
+      return {
+        x: (projected.x * 0.5 + 0.5) * rectangle.width,
+        y: (-projected.y * 0.5 + 0.5) * rectangle.height,
+        depth: projected.z,
+        index,
+        name,
+      };
+    }).filter(Boolean);
+  }
+
+  projectSkeletonJoints(frame) {
+    const rectangle = this.canvas.getBoundingClientRect();
+    const world = new THREE.Vector3();
+    return (frame.jointNames || []).map((name, index) => {
+      const joint = this.skeletonJoints[index];
+      if (!joint?.visible) return null;
+      joint.getWorldPosition(world);
       const projected = world.clone().project(this.camera);
       return {
         x: (projected.x * 0.5 + 0.5) * rectangle.width,

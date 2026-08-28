@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 import hmac
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -78,6 +79,87 @@ NAS_UNAVAILABLE_MESSAGE = (
     "NAS 当前不可用；可继续查看本机已有任务，依赖 NAS 的领取、缓存、导入和提交操作将在恢复后可用。"
 )
 LOGGER = logging.getLogger(__name__)
+
+
+def _positive_duration_ns(value: object) -> int | None:
+    """Convert a Flow duration to nanoseconds without binary-float drift."""
+
+    try:
+        seconds = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if not seconds.is_finite() or seconds <= 0:
+        return None
+    duration_ns = int(seconds * Decimal(1_000_000_000))
+    return duration_ns if duration_ns > 0 else None
+
+
+def _flow_episode_durations_ns(job: dict[str, object]) -> dict[str, int]:
+    episodes = job.get("episodes")
+    if not isinstance(episodes, list):
+        return {}
+    durations: dict[str, int] = {}
+    for item in episodes:
+        if not isinstance(item, dict):
+            continue
+        episode_id = str(item.get("episode_id") or "").strip()
+        duration_ns = _positive_duration_ns(item.get("duration_seconds"))
+        if not episode_id or duration_ns is None:
+            continue
+        previous = durations.get(episode_id)
+        if previous is not None and previous != duration_ns:
+            raise ValueError(f"Flow Episode {episode_id} 存在冲突的时长")
+        durations[episode_id] = duration_ns
+    return durations
+
+
+def _annotations_for_flow_submission(
+    annotations: list[dict[str, object]],
+    *,
+    episode_id: str,
+    local_duration_ns: int,
+    flow_duration_ns: int | None,
+) -> list[dict[str, object]]:
+    """Align safe whole-episode annotations and reject actual overruns."""
+
+    submitted = [dict(annotation) for annotation in annotations]
+    if flow_duration_ns is None:
+        return submitted
+    for annotation in submitted:
+        start_offset_ns = int(annotation.get("start_offset_ns") or 0)
+        end_offset_ns = int(annotation.get("end_offset_ns") or 0)
+        if start_offset_ns <= flow_duration_ns and end_offset_ns <= flow_duration_ns:
+            continue
+        is_local_whole_episode = (
+            annotation.get("scope") == "episode"
+            and start_offset_ns == 0
+            and local_duration_ns > 0
+            and end_offset_ns == local_duration_ns
+            and flow_duration_ns < local_duration_ns
+        )
+        if is_local_whole_episode:
+            annotation["end_offset_ns"] = flow_duration_ns
+            LOGGER.info(
+                "Aligned full-episode annotation %s for %s from local duration %dns to Flow duration %dns",
+                annotation.get("annotation_id") or annotation.get("id") or "",
+                episode_id,
+                local_duration_ns,
+                flow_duration_ns,
+            )
+            continue
+        annotation_name = (
+            annotation.get("label_code")
+            or annotation.get("label_slug")
+            or annotation.get("annotation_id")
+            or annotation.get("id")
+            or "未命名标注"
+        )
+        raise ValueError(
+            f"Episode {episode_id} 的标注 {annotation_name} 存在真实越界："
+            f"{start_offset_ns}..{end_offset_ns}ns，Flow 时长 {flow_duration_ns}ns；"
+            "请修正标注范围后再提交"
+        )
+    return submitted
 
 
 def _retry_sqlite_locked(
@@ -1021,6 +1103,7 @@ class EpisodeQcWebApplication:
             mappings = manager.local_episode_mappings(job_code)
         if not mappings:
             raise ValueError("质检任务缺少本地 Episode 映射")
+        flow_durations_ns = _flow_episode_durations_ns(job)
         episode_results = []
         for mapping in mappings:
             detail = episode_detail(self.paths.db_path, mapping["local_episode_id"])
@@ -1028,12 +1111,19 @@ class EpisodeQcWebApplication:
             decision = episode.get("quality_decision")
             if not decision or episode.get("review_status") not in {"completed", "reviewed"}:
                 raise ValueError(f"Episode {mapping['episode_id']} 尚未完成质检")
+            platform_episode_id = str(mapping["episode_id"])
+            submitted_annotations = _annotations_for_flow_submission(
+                detail["annotations"],
+                episode_id=platform_episode_id,
+                local_duration_ns=int(episode.get("duration_ns") or 0),
+                flow_duration_ns=flow_durations_ns.get(platform_episode_id),
+            )
             episode_results.append(
                 {
-                    "episode_id": mapping["episode_id"],
+                    "episode_id": platform_episode_id,
                     "decision": decision,
                     "annotation_count": int(episode.get("annotation_count") or 0),
-                    "annotations": detail["annotations"],
+                    "annotations": submitted_annotations,
                     "completed_at": episode.get("reviewed_at"),
                     **(
                         {

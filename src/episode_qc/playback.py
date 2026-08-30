@@ -18,6 +18,11 @@ from mcap.reader import make_reader
 from episode_qc.bvh import iter_bvh_motion, read_bvh_header
 from episode_qc.compressed_image import _iter_fields, decode_compressed_image
 from episode_qc.compressed_video import decode_compressed_video
+from episode_qc.dohc_recording import (
+    is_dohc_primary_file,
+    iter_segment_jpegs,
+    load_smpl_frames,
+)
 from episode_qc.messagepack import decode_messagepack
 from episode_qc.workspace import _json, _now, connect_workspace, episode_detail
 
@@ -224,7 +229,105 @@ def prepare_episode_cache(
 
         start_ns = int(episode["start_time_ns"] or 0)
         episode_path = Path(str(episode["mcap_path"]))
-        if episode_path.suffix.lower() == ".bvh":
+        if is_dohc_primary_file(episode_path):
+            episode_directory = episode_path.parent
+            for stream in camera_streams:
+                stream_id = str(stream["id"])
+                output = camera_files[stream_id]
+                metadata = stream.get("metadata") or {}
+                fps = float(metadata.get("fps") or stream.get("nominal_hz") or 30)
+                try:
+                    if stream.get("adapter_id") == "dohc_jpeg_directory_v1":
+                        for frame_index, relative_path in enumerate(metadata.get("paths") or []):
+                            jpeg = (episode_directory / str(relative_path)).read_bytes()
+                            if not jpeg.startswith(b"\xff\xd8") or not jpeg.endswith(b"\xff\xd9"):
+                                raise ValueError(f"不是完整 JPEG: {relative_path}")
+                            offset_ns = round(frame_index * 1_000_000_000 / fps)
+                            byte_offset = output.tell()
+                            output.write(jpeg)
+                            camera_indices[stream_id].append(
+                                [offset_ns, byte_offset, len(jpeg), frame_index]
+                            )
+                    elif stream.get("adapter_id") == "dohc_segment_jpeg_v1":
+                        for frame_index, (offset_ns, _batch_id, jpeg) in enumerate(
+                            iter_segment_jpegs(
+                                episode_directory,
+                                [str(item) for item in metadata.get("paths") or []],
+                                int(metadata["stream_id"]),
+                            )
+                        ):
+                            byte_offset = output.tell()
+                            output.write(jpeg)
+                            camera_indices[stream_id].append(
+                                [offset_ns, byte_offset, len(jpeg), frame_index]
+                            )
+                    elif stream.get("adapter_id") == "dohc_mp4_v1":
+                        frame_index = 0
+                        for segment_index, relative_path in enumerate(metadata.get("paths") or []):
+                            mjpeg_path = temp_dir / f"{stream_id}-{segment_index}.mjpeg"
+                            _transcode_media_to_mjpeg(
+                                episode_directory / str(relative_path),
+                                mjpeg_path,
+                            )
+                            try:
+                                for jpeg in _iter_mjpeg_frames(mjpeg_path):
+                                    offset_ns = round(frame_index * 1_000_000_000 / fps)
+                                    byte_offset = output.tell()
+                                    output.write(jpeg)
+                                    camera_indices[stream_id].append(
+                                        [offset_ns, byte_offset, len(jpeg), frame_index]
+                                    )
+                                    frame_index += 1
+                            finally:
+                                mjpeg_path.unlink(missing_ok=True)
+                    else:
+                        raise ValueError(f"不支持的 DOHC 相机适配器: {stream.get('adapter_id')}")
+                    expected_count = int(stream.get("message_count") or 0)
+                    actual_count = len(camera_indices[stream_id])
+                    if actual_count != expected_count and len(decode_errors) < 100:
+                        decode_errors.append(
+                            f"{stream['topic']}: 解码帧数 {actual_count}/{expected_count}"
+                        )
+                except Exception as exc:
+                    if len(decode_errors) < 100:
+                        decode_errors.append(
+                            f"{stream['topic']}: {type(exc).__name__}: {exc}"
+                        )
+            if motion_file is not None and motion_streams:
+                motion_stream = motion_streams[0]
+                try:
+                    joint_names, parent_indices, frames = load_smpl_frames(
+                        episode_directory,
+                        motion_stream.get("metadata") or {},
+                        float(motion_stream.get("nominal_hz") or 30),
+                    )
+                    for offset_ns, sequence, positions, validity in frames:
+                        frame = {
+                            "positions": positions,
+                            "rotations_wxyz": [
+                                [1.0, 0.0, 0.0, 0.0] for _ in positions
+                            ],
+                            "validity": validity,
+                            "source_timestamp_ns": offset_ns,
+                            "sequence": sequence,
+                        }
+                        encoded = encode_motion_frame(frame, len(joint_names))
+                        byte_offset = motion_file.tell()
+                        motion_file.write(encoded)
+                        motion_index.append(
+                            [offset_ns, byte_offset, len(encoded), len(motion_index)]
+                        )
+                    expected_count = int(motion_stream.get("message_count") or 0)
+                    if len(motion_index) != expected_count and len(decode_errors) < 100:
+                        decode_errors.append(
+                            f"{motion_stream['topic']}: 骨架帧数 {len(motion_index)}/{expected_count}"
+                        )
+                except Exception as exc:
+                    if len(decode_errors) < 100:
+                        decode_errors.append(
+                            f"{motion_stream['topic']}: {type(exc).__name__}: {exc}"
+                        )
+        elif episode_path.suffix.lower() == ".bvh":
             if motion_file is not None and motion_streams:
                 header = read_bvh_header(episode_path)
                 joint_names = [joint.name for joint in header.joints]
@@ -616,15 +719,26 @@ def _protobuf_doubles(payload: bytes | None, expected: int) -> list[float]:
 
 def _ffmpeg_executable() -> Path:
     configured = str(os.environ.get("EPISODE_QC_FFMPEG") or "").strip()
+    bundled = None
+    try:
+        import imageio_ffmpeg
+
+        bundled = Path(imageio_ffmpeg.get_ffmpeg_exe())
+    except (ImportError, OSError, RuntimeError):
+        bundled = None
     candidates = [
         Path(configured) if configured else None,
         Path(found) if (found := shutil.which("ffmpeg")) else None,
+        bundled,
+        Path(sys.prefix) / ("Scripts" if os.name == "nt" else "bin") / (
+            "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
+        ),
         Path(sys.prefix).parent / "bin" / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg"),
     ]
     for candidate in candidates:
         if candidate and candidate.is_file():
             return candidate
-    raise ValueError("未找到 FFmpeg，无法解码 OmniEgo H264 视频")
+    raise ValueError("未找到 FFmpeg，无法解码 OmniEgo/DOHC 视频")
 
 
 def _transcode_h264_to_mjpeg(source: Path, destination: Path) -> None:
@@ -657,6 +771,36 @@ def _transcode_h264_to_mjpeg(source: Path, destination: Path) -> None:
     if result.returncode != 0:
         error = result.stderr.decode("utf-8", errors="replace").strip()
         raise ValueError(f"FFmpeg 解码 OmniEgo H264 失败：{error[-500:]}")
+
+
+def _transcode_media_to_mjpeg(source: Path, destination: Path) -> None:
+    if not source.is_file() or source.stat().st_size == 0:
+        raise ValueError("DOHC 视频文件为空")
+    result = subprocess.run(
+        [
+            str(_ffmpeg_executable()),
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(source),
+            "-an",
+            "-fps_mode",
+            "passthrough",
+            "-q:v",
+            "3",
+            "-f",
+            "mjpeg",
+            str(destination),
+        ],
+        capture_output=True,
+        check=False,
+        timeout=600,
+    )
+    if result.returncode != 0:
+        error = result.stderr.decode("utf-8", errors="replace").strip()
+        raise ValueError(f"FFmpeg 解码 DOHC 视频失败：{error[-500:]}")
 
 
 def _iter_mjpeg_frames(path: Path):

@@ -589,6 +589,9 @@ class QualityCacheManager:
                                 total_bytes=total_bytes,
                                 callback=copy_episode_progress,
                                 expected_size=int(file_spec["size_bytes"]),
+                                expected_modified_time_ms=file_spec.get(
+                                    "modified_time_ms"
+                                ),
                             )
                             percent = (
                                 min(99, int(copied_bytes * 100 / total_bytes))
@@ -1896,7 +1899,25 @@ class QualityCacheManager:
         for episode in (
             manifest_episodes[episode_id] for episode_id in platform_episodes
         ):
-            files = (episode.get("manifest") or {}).get("files") or []
+            episode_manifest = episode.get("manifest") or {}
+            integrity_mode = str(
+                episode.get("integrity_mode")
+                or episode_manifest.get("integrity_mode")
+                or manifest.get("integrity_mode")
+                or "sha256"
+            ).lower()
+            if integrity_mode not in {"sha256", "metadata"}:
+                raise QualityCacheError(
+                    f"Episode {episode.get('episode_id') or '?'} 的完整性模式无效"
+                )
+            if integrity_mode == "metadata" and str(
+                episode.get("data_format")
+                or platform_episodes[str(episode.get("episode_id") or "")].get("data_format")
+                or manifest.get("data_format")
+                or ""
+            ) != "dohc_jpeg_v1":
+                raise QualityCacheError("metadata 完整性模式仅允许 DOHC Episode")
+            files = episode_manifest.get("files") or []
             if not files:
                 raise QualityCacheError(
                     f"Episode {episode.get('episode_id') or '?'} 缺少逐文件清单"
@@ -1914,8 +1935,20 @@ class QualityCacheManager:
                 except (KeyError, TypeError, ValueError) as exc:
                     raise QualityCacheError(f"资产清单文件大小无效：{normalized}") from exc
                 expected_sha256 = str(item.get("sha256") or "").lower()
-                if expected_size < 0 or not re.fullmatch(r"[a-f0-9]{64}", expected_sha256):
-                    raise QualityCacheError(f"资产清单文件校验信息无效：{normalized}")
+                expected_modified_time_ms = item.get("modified_time_ms")
+                if expected_size < 0:
+                    raise QualityCacheError(f"资产清单文件大小无效：{normalized}")
+                if integrity_mode == "sha256":
+                    if not re.fullmatch(r"[a-f0-9]{64}", expected_sha256):
+                        raise QualityCacheError(f"资产清单文件校验信息无效：{normalized}")
+                    expected_modified_time_ms = None
+                elif (
+                    expected_sha256
+                    or not isinstance(expected_modified_time_ms, int)
+                    or isinstance(expected_modified_time_ms, bool)
+                    or expected_modified_time_ms < 0
+                ):
+                    raise QualityCacheError(f"资产清单文件元数据无效：{normalized}")
                 source = source_root / relative
                 try:
                     source.resolve().relative_to(source_root.resolve())
@@ -1923,13 +1956,25 @@ class QualityCacheManager:
                     raise QualityCacheError(f"NAS 清单文件超出资产根目录：{normalized}") from exc
                 if not source.is_file():
                     raise QualityCacheError(f"NAS 缺少清单文件：{normalized}")
-                if source.stat().st_size != expected_size:
+                source_stat = source.stat()
+                if source_stat.st_size != expected_size:
                     raise QualityCacheError(f"NAS 文件大小与清单不一致：{normalized}")
+                if (
+                    expected_modified_time_ms is not None
+                    and source_stat.st_mtime_ns // 1_000_000 != expected_modified_time_ms
+                ):
+                    raise QualityCacheError(f"NAS 文件修改时间与清单不一致：{normalized}")
                 specs.append(
                     {
                         "relative_path": normalized,
                         "size_bytes": expected_size,
                         "sha256": expected_sha256,
+                        "integrity_mode": integrity_mode,
+                        **(
+                            {"modified_time_ms": expected_modified_time_ms}
+                            if expected_modified_time_ms is not None
+                            else {}
+                        ),
                     }
                 )
 
@@ -1979,8 +2024,9 @@ class QualityCacheManager:
             target = asset_root / relative
             if not target.is_file() or target.stat().st_size != int(item["size_bytes"]):
                 raise QualityCacheError(f"缓存文件大小校验失败：{relative}")
-            digest = sha256_file(target)
-            if digest != item["sha256"]:
+            expected_sha256 = str(item.get("sha256") or "")
+            digest = sha256_file(target) if expected_sha256 else ""
+            if expected_sha256 and digest != expected_sha256:
                 target.unlink(missing_ok=True)
                 raise QualityCacheError(f"缓存文件 SHA-256 校验失败：{relative}")
             relative_path = relative.as_posix()
@@ -2166,7 +2212,8 @@ class QualityCacheManager:
             partial = target.with_name(target.name + ".partial")
             expected_size = int(item["size_bytes"])
             if target.is_file() and target.stat().st_size == expected_size:
-                if sha256_file(target) == item["sha256"]:
+                expected_sha256 = str(item.get("sha256") or "")
+                if not expected_sha256 or sha256_file(target) == expected_sha256:
                     copied += target.stat().st_size
                 else:
                     target.unlink()
@@ -2183,9 +2230,16 @@ class QualityCacheManager:
         total_bytes: int,
         callback: ProgressCallback,
         expected_size: int,
+        expected_modified_time_ms: int | None = None,
     ) -> int:
-        source_size = source.stat().st_size
+        source_stat = source.stat()
+        source_size = source_stat.st_size
         if source_size != expected_size:
+            raise QualityCacheError(f"NAS 文件在下载前发生变化：{source.name}")
+        if (
+            expected_modified_time_ms is not None
+            and source_stat.st_mtime_ns // 1_000_000 != expected_modified_time_ms
+        ):
             raise QualityCacheError(f"NAS 文件在下载前发生变化：{source.name}")
         if target.is_file() and target.stat().st_size == source_size:
             return copied_bytes
@@ -2213,6 +2267,16 @@ class QualityCacheManager:
                 )
         if partial.stat().st_size != source_size:
             raise QualityCacheError(f"缓存文件大小校验失败：{source.name}")
+        final_source_stat = source.stat()
+        if (
+            final_source_stat.st_size != expected_size
+            or (
+                expected_modified_time_ms is not None
+                and final_source_stat.st_mtime_ns // 1_000_000
+                != expected_modified_time_ms
+            )
+        ):
+            raise QualityCacheError(f"NAS 文件在下载过程中发生变化：{source.name}")
         os.replace(partial, target)
         return copied_bytes
 

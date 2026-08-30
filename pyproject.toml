@@ -5,6 +5,7 @@ description = "Quality-control tools for episode MCAP datasets."
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
 dependencies = [
+  "imageio-ffmpeg>=0.6.0",
   "mcap>=1.4.0",
   "msgpack>=1.1.0",
   "numpy>=2.0",

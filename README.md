@@ -38,6 +38,10 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 uv sync --dev
 ```
 
+`imageio-ffmpeg` 会随运行环境安装可执行的 FFmpeg，用于解码 OmniEgo H264 和
+DOHC hybrid 采集中的 MP4。生产构建安装 wheel 时也必须安装锁文件中的运行依赖；
+若使用 `pip install --no-deps` 更新应用 wheel，目标 `.venv` 必须已预装同版本依赖。
+
 如需修改或测试 Three.js Web 页面，再安装前端依赖：
 
 ```bash

@@ -15,6 +15,11 @@ import yaml
 from mcap.reader import make_reader
 
 from episode_qc.bvh import read_bvh_header
+from episode_qc.dohc_recording import (
+    discover_dohc_episode_files,
+    inspect_dohc_recording,
+    is_dohc_primary_file,
+)
 from episode_qc.source_paths import resolve_source_directory
 
 
@@ -23,7 +28,7 @@ TASK_KINDS = {"robot_teleoperation", "ego_omniego"}
 ANNOTATION_MODES = {"library", "open"}
 OPEN_ANNOTATION_TYPES = {"action", "pose_quality", "camera_quality", "exception", "object_state", "other"}
 EGO_OPEN_SCHEMA_VERSION = "ego_open_v1"
-EPISODE_INDEX_VERSION = 3
+EPISODE_INDEX_VERSION = 4
 
 
 class WorkspaceConflictError(RuntimeError):
@@ -758,7 +763,11 @@ def scan_data_source(
     with connect_workspace(db_path) as connection:
         for mcap_path in candidates:
             if task_kind == "ego_omniego":
-                relative_path = str(mcap_path.relative_to(root))
+                relative_path = (
+                    str(mcap_path.parent.relative_to(root))
+                    if is_dohc_primary_file(mcap_path)
+                    else str(mcap_path.relative_to(root))
+                )
             else:
                 relative_path = str(mcap_path.parent.relative_to(root)) if mcap_path.parent != root else mcap_path.parent.name
             seen_paths.add(relative_path)
@@ -832,8 +841,12 @@ def _discover_episode_mcaps(
     mcap_patterns = list(import_config.get("mcap_file_patterns") or ["episode.mcap", "*.mcap"])
     bvh_patterns = list(import_config.get("bvh_file_patterns") or ["motion.bvh", "*.bvh"])
     if task_kind == "ego_omniego":
+        candidates = [
+            path.resolve() for path in root.rglob("*.mcap") if path.is_file()
+        ]
+        candidates.extend(discover_dohc_episode_files(root))
         return sorted(
-            (path.resolve() for path in root.rglob("*.mcap") if path.is_file()),
+            set(candidates),
             key=lambda item: _natural_key(str(item.relative_to(root))),
         )
     paths_by_directory: dict[Path, Path] = {}
@@ -1195,8 +1208,10 @@ def _index_episode(
     episode_id = _stable_id("ep", source_id, relative_path)
     stat = mcap_path.stat()
     old = connection.execute("SELECT * FROM episode WHERE id = ?", (episode_id,)).fetchone()
+    dohc_primary = is_dohc_primary_file(mcap_path)
     if (
         old
+        and not dohc_primary
         and not force_reindex
         and old["import_status"] == "ready"
         and int(old["index_version"] or 0) == EPISODE_INDEX_VERSION
@@ -1214,9 +1229,37 @@ def _index_episode(
     start_ns: int | None = None
     end_ns: int | None = None
     error: str | None = None
+    dohc_fingerprint_facts: list[object] = []
 
     try:
-        if mcap_path.suffix.lower() == ".bvh":
+        if dohc_primary:
+            dohc = inspect_dohc_recording(mcap_path)
+            dohc_fingerprint_facts = list(dohc.get("fingerprint_facts") or [])
+            start_ns = 0
+            duration_ns = int(dohc["duration_ns"])
+            end_ns = duration_ns
+            for spec in dohc["streams"]:
+                topic = str(spec["topic"])
+                streams.append(
+                    {
+                        "id": _stable_id("str", episode_id, topic),
+                        "episode_id": episode_id,
+                        "topic": topic,
+                        "stream_key": spec["stream_key"],
+                        "stream_type": spec["stream_type"],
+                        "display_name": spec["display_name"],
+                        "encoding": spec["encoding"],
+                        "schema_name": spec["schema_name"],
+                        "adapter_id": spec["adapter_id"],
+                        "message_count": spec["message_count"],
+                        "first_time_ns": spec["first_time_ns"],
+                        "last_time_ns": spec["last_time_ns"],
+                        "nominal_hz": spec["nominal_hz"],
+                        "available": spec["available"],
+                        "metadata_json": _json(spec["metadata"]),
+                    }
+                )
+        elif mcap_path.suffix.lower() == ".bvh":
             header = read_bvh_header(mcap_path)
             start_ns = 0
             frame_time_ns = round(header.frame_time_sec * 1_000_000_000)
@@ -1290,11 +1333,16 @@ def _index_episode(
             stat.st_mtime_ns,
             start_ns,
             end_ns,
+            dohc_fingerprint_facts,
         ]).encode("utf-8")
     ).hexdigest()
     relative = Path(relative_path)
     data_group = root.name if relative.parent == Path(".") else relative.parts[0]
-    episode_name = mcap_path.stem if relative.suffix.lower() in {".mcap", ".bvh"} else mcap_path.parent.name
+    episode_name = (
+        mcap_path.parent.name
+        if dohc_primary
+        else (mcap_path.stem if relative.suffix.lower() in {".mcap", ".bvh"} else mcap_path.parent.name)
+    )
     now = _now()
     import_status = "ready" if error is None else "failed"
 

@@ -2142,6 +2142,112 @@ def test_cache_rejects_wrong_manifest_checksum(tmp_path: Path):
         )
 
 
+def test_cache_accepts_dohc_metadata_manifest_without_hashing_source_files(
+    tmp_path: Path, monkeypatch
+):
+    asset_root = tmp_path / "nas" / "AST-DOHC-METADATA"
+    episode_root = asset_root / "Cafe-Refill-17"
+    episode_root.mkdir(parents=True)
+    primary = episode_root / "manifest.json"
+    media = episode_root / "camera.bin"
+    primary.write_text('{"storage_format":"jpeg-stream-v1"}', encoding="utf-8")
+    media.write_bytes(b"camera-payload")
+    files = []
+    for source in (primary, media):
+        files.append(
+            {
+                "relative_path": source.relative_to(asset_root).as_posix(),
+                "size_bytes": source.stat().st_size,
+                "modified_time_ms": source.stat().st_mtime_ns // 1_000_000,
+            }
+        )
+    episode = {
+        "episode_id": "AST-DOHC-METADATA-EP0001",
+        "relative_path": "Cafe-Refill-17",
+        "primary_file": "manifest.json",
+        "data_format": "dohc_jpeg_v1",
+        "integrity_mode": "metadata",
+        "checksum_sha256": "",
+        "manifest": {"integrity_mode": "metadata", "files": files},
+    }
+    manifest = {
+        "schema_version": 2,
+        "asset_id": "AST-DOHC-METADATA",
+        "data_format": "dohc_jpeg_v1",
+        "integrity_mode": "metadata",
+        "episodes": [episode],
+    }
+    job = {
+        "code": "QCJ-DOHC-METADATA",
+        "asset_id": "AST-DOHC-METADATA",
+        "asset_type": "egocentric",
+        "source_uri": str(asset_root),
+        "episodes": [episode],
+        "asset_manifest": manifest,
+        "asset_manifest_sha256": canonical_json_sha256(manifest),
+    }
+    real_sha256_file = platform_workflow.sha256_file
+
+    def reject_source_hash(path, *args, **kwargs):
+        assert Path(path).name == "asset_manifest.json"
+        return real_sha256_file(path, *args, **kwargs)
+
+    monkeypatch.setattr(platform_workflow, "sha256_file", reject_source_hash)
+    cached = QualityCacheManager(tmp_path / "cache", reserve_bytes=0).cache_job(
+        FakeFlowClient(job), job
+    )
+
+    cache_root = Path(cached["cache_dir"])
+    assert (cache_root / "Cafe-Refill-17" / "manifest.json").read_bytes() == primary.read_bytes()
+    assert (cache_root / "Cafe-Refill-17" / "camera.bin").read_bytes() == media.read_bytes()
+
+
+def test_cache_rejects_changed_dohc_metadata_file(tmp_path: Path):
+    asset_root = tmp_path / "nas" / "AST-DOHC-CHANGED"
+    episode_root = asset_root / "Park-Litter-009"
+    episode_root.mkdir(parents=True)
+    primary = episode_root / "manifest.json"
+    primary.write_text('{"storage_format":"jpeg-stream-v1"}', encoding="utf-8")
+    registered_mtime_ms = primary.stat().st_mtime_ns // 1_000_000
+    episode = {
+        "episode_id": "AST-DOHC-CHANGED-EP0001",
+        "relative_path": "Park-Litter-009",
+        "primary_file": "manifest.json",
+        "data_format": "dohc_jpeg_v1",
+        "integrity_mode": "metadata",
+        "checksum_sha256": "",
+        "manifest": {
+            "integrity_mode": "metadata",
+            "files": [{
+                "relative_path": "Park-Litter-009/manifest.json",
+                "size_bytes": primary.stat().st_size,
+                "modified_time_ms": registered_mtime_ms + 1,
+            }],
+        },
+    }
+    manifest = {
+        "schema_version": 2,
+        "asset_id": "AST-DOHC-CHANGED",
+        "data_format": "dohc_jpeg_v1",
+        "integrity_mode": "metadata",
+        "episodes": [episode],
+    }
+    job = {
+        "code": "QCJ-DOHC-CHANGED",
+        "asset_id": "AST-DOHC-CHANGED",
+        "asset_type": "egocentric",
+        "source_uri": str(asset_root),
+        "episodes": [episode],
+        "asset_manifest": manifest,
+        "asset_manifest_sha256": canonical_json_sha256(manifest),
+    }
+
+    with pytest.raises(QualityCacheError, match="修改时间"):
+        QualityCacheManager(tmp_path / "cache", reserve_bytes=0).cache_job(
+            FakeFlowClient(job), job
+        )
+
+
 def test_cache_rejects_unsafe_platform_paths(tmp_path: Path):
     source = tmp_path / "nas" / "AST-003" / "episode_000001"
     source.mkdir(parents=True)

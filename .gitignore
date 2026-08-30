@@ -9,6 +9,7 @@ coverage/
 .episode-qc/
 .pytest_cache/
 .worktrees/
+.workspace/
 __pycache__/
 *.pyc
 

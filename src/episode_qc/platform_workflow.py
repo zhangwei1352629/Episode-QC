@@ -384,7 +384,9 @@ class QualityCacheManager:
             and isinstance(job.get("label_schema"), dict)
             else client.claim(job_code)
         )
-        source = resolve_source_directory(str(claimed["source_uri"]))
+        source = _windows_extended_path(
+            resolve_source_directory(str(claimed["source_uri"]))
+        )
         (
             files,
             asset_manifest_sha256,

@@ -60,6 +60,44 @@ def test_windows_extended_path_preserves_target_and_adds_win32_prefix():
     assert platform_workflow._windows_extended_path(unc, windows=False) == unc
 
 
+def test_cache_job_uses_extended_length_source_path(monkeypatch, tmp_path: Path):
+    source = Path(r"\\nas.local\datasets\deep\asset")
+    extended_source = Path(r"\\?\UNC\nas.local\datasets\deep\asset")
+    observed = []
+    manager = QualityCacheManager(tmp_path / "cache", reserve_bytes=0)
+
+    monkeypatch.setattr(
+        platform_workflow,
+        "resolve_source_directory",
+        lambda _value: source,
+    )
+
+    def use_extended_path(path):
+        observed.append(path)
+        return extended_source
+
+    monkeypatch.setattr(platform_workflow, "_windows_extended_path", use_extended_path)
+
+    def stop_after_source_resolution(_job, source_root):
+        assert source_root == extended_source
+        raise QualityCacheError("source path checked")
+
+    monkeypatch.setattr(manager, "_manifest_file_specs", stop_after_source_resolution)
+
+    with pytest.raises(QualityCacheError, match="source path checked"):
+        manager.cache_job(
+            object(),
+            {
+                "code": "QCJ-LONG-PATH",
+                "status": "claimed",
+                "label_schema": {},
+                "source_uri": "/nas/deep/asset",
+            },
+        )
+
+    assert observed == [source]
+
+
 def test_flow_client_preserves_drf_list_error_message():
     client = FlowClient("http://flow.test")
     client.opener.open = Mock(

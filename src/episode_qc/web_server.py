@@ -1153,7 +1153,12 @@ class EpisodeQcWebApplication:
                     },
                 }
             )
-        self._sync_platform_review_progress(job_code)
+        # A submit response can be lost after Flow has already committed the
+        # result.  Retrying that submit must reconcile the completed result
+        # instead of first posting progress, which Flow correctly rejects for
+        # completed jobs.
+        if job.get("status") != "completed":
+            self._sync_platform_review_progress(job_code)
         task = self._local_task_for_job(job_code) or task
         if ensure_work_session_before_submit:
             if reclaim_before_submit:

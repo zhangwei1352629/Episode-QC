@@ -2040,6 +2040,8 @@ Frame Time: 0.010000
 
         def report_review_progress(self, job_code, **values):
             assert job_code == job["code"]
+            if job.get("status") == "completed":
+                raise FlowClientError("Flow request failed (HTTP 400): 质检任务已经完成")
             self.progress_reports.append(values)
             return {"job_code": job_code, **values}
 
@@ -2144,6 +2146,16 @@ Frame Time: 0.010000
             / "attempt-0001"
             / "qc_result.json"
         ).is_file()
+        progress_report_count = len(fake_client.progress_reports)
+
+        status, retried = request_json(
+            f"{base_url}/api/platform/jobs/{job['code']}/submit",
+            method="POST",
+        )
+        assert status == 200
+        assert retried["job"]["status"] == "completed"
+        assert retried["local_task"]["status"] == "submitted"
+        assert len(fake_client.progress_reports) == progress_report_count
 
 
 def test_web_platform_refreshes_and_selects_reviewer_without_password(tmp_path: Path):

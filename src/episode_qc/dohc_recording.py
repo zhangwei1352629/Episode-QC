@@ -92,8 +92,14 @@ def discover_dohc_episode_files(root: str | Path) -> list[Path]:
         parent = states_path.parent.resolve()
         if parent not in discovered and is_dohc_primary_file(states_path):
             discovered[parent] = states_path.resolve()
+    episode_roots = set(discovered)
+    top_level = {
+        episode_root: primary_file
+        for episode_root, primary_file in discovered.items()
+        if not any(parent in episode_roots for parent in episode_root.parents)
+    }
     return sorted(
-        discovered.values(),
+        top_level.values(),
         key=lambda path: _natural_key(path.parent.relative_to(root_path).as_posix()),
     )
 

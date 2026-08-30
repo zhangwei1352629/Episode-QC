@@ -81,6 +81,11 @@ def test_hybrid_episode_prepares_mp4_and_t265_segment_cameras_without_fake_body_
     episode_root = root / "Park-Litter-009"
     (episode_root / "cam0").mkdir(parents=True)
     (episode_root / "t265" / "segments").mkdir(parents=True)
+    # Production T265 sidecars also contain empty camera directories.  Their
+    # nested manifest is part of the parent hybrid Episode, not a second one.
+    (episode_root / "t265" / "cam0").mkdir()
+    (episode_root / "t265" / "cam1").mkdir()
+    (episode_root / "t265" / "cam2").mkdir()
     (episode_root / "cam0" / "cam0-00000.mp4").write_bytes(b"fake-mp4")
     (episode_root / "manifest.json").write_text(
         json.dumps({

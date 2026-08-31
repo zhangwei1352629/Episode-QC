@@ -15,6 +15,13 @@ import {
   pendingInheritedDecision,
 } from "./incremental-review.mjs";
 import { loadInitialTasks } from "./startup.mjs";
+import {
+  beginRangeSelection,
+  completeRangeSelection,
+  frameGridForCameras,
+  singleFrameRange,
+  snapTimeToFrame,
+} from "./range-selection.mjs";
 
 const $ = (id) => document.getElementById(id);
 
@@ -1341,14 +1348,42 @@ function renderClock() {
 }
 
 function markSelectionStart() {
-  state.selectionStartNs = Math.round(state.playheadNs);
-  if (state.selectionEndNs !== null && state.selectionEndNs < state.selectionStartNs) state.selectionEndNs = null;
+  const selection = beginRangeSelection({
+    playheadNs: state.playheadNs,
+    durationNs: state.durationNs,
+    grid: selectionFrameGrid(),
+  });
+  state.selectionStartNs = selection.startNs;
+  state.selectionEndNs = selection.endNs;
   renderSelection();
 }
 
 function markSelectionEnd() {
-  if (state.selectionStartNs === null) state.selectionStartNs = 0;
-  state.selectionEndNs = Math.max(state.selectionStartNs, Math.round(state.playheadNs));
+  const selection = completeRangeSelection({
+    startNs: state.selectionStartNs,
+    playheadNs: state.playheadNs,
+    durationNs: state.durationNs,
+    grid: selectionFrameGrid(),
+  });
+  if (!selection.ok) {
+    const message = selection.reason === "missing_start"
+      ? "请先按 I 设置区间起点"
+      : "区间终点必须晚于起点，请移动播放位置后重试";
+    toast(message, "error");
+    return;
+  }
+  state.selectionStartNs = selection.startNs;
+  state.selectionEndNs = selection.endNs;
+  renderSelection();
+}
+
+function selectionFrameGrid() {
+  return frameGridForCameras(state.cache?.cameras || [], state.selectedCameraId);
+}
+
+function resetRangeSelection() {
+  state.selectionStartNs = null;
+  state.selectionEndNs = null;
   renderSelection();
 }
 
@@ -1498,6 +1533,7 @@ async function createAnnotation(labelCode) {
     updateEpisodeFromDetail();
     renderAnnotations();
     els.annotationComment.value = "";
+    resetRangeSelection();
     setSaveState("saved", "已保存");
   } catch (error) {
     setSaveState("error", "保存失败");
@@ -1560,6 +1596,7 @@ async function createOpenAnnotation(labelSlug = "") {
     renderAnnotations();
     els.openLabelName.value = "";
     els.annotationComment.value = "";
+    resetRangeSelection();
     setSaveState("saved", "已保存");
   } catch (error) {
     setSaveState("error", "保存失败");
@@ -1691,7 +1728,8 @@ function renderAnnotationLanes(annotations, labels) {
     grouped.get(annotation.label_code).push(annotation);
   });
   if (!grouped.size) {
-    els.annotationTrack.innerHTML = `<div class="timeline-empty">${state.timelineView === "changes" ? "本条暂时没有新增或修改" : "暂无有效标注"}</div>`;
+    const emptyText = state.timelineView === "changes" ? "本条暂时没有新增或修改" : "暂无有效标注";
+    els.annotationTrack.innerHTML = `<div class="timeline-empty annotation-lane-surface">${emptyText} · 可在此拖拽选择区间</div>`;
     return;
   }
   els.annotationTrack.innerHTML = [...grouped.entries()].map(([labelCode, items]) => {
@@ -2222,7 +2260,13 @@ function handleKeyboard(event) {
   if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
     if (!els.timelineRange.disabled) {
       event.preventDefault();
-      seekTo(state.playheadNs + (event.key === "ArrowRight" ? 1 : -1) * (event.shiftKey ? 1e9 : 1e9 / 30));
+      const grid = selectionFrameGrid();
+      const stepNs = event.shiftKey ? 1e9 : grid.stepNs;
+      seekTo(snapTimeToFrame(
+        state.playheadNs + (event.key === "ArrowRight" ? 1 : -1) * stepNs,
+        state.durationNs,
+        grid,
+      ));
     }
     return;
   }
@@ -2246,7 +2290,11 @@ function beginTimelineSelection(event) {
   if (!surface) return;
   state.timelineSelecting = true;
   state.timelineSurface = surface;
-  state.timelineAnchorNs = Math.round(timelineTimeFromPointer(event, surface));
+  state.timelineAnchorNs = snapTimeToFrame(
+    timelineTimeFromPointer(event, surface),
+    state.durationNs,
+    selectionFrameGrid(),
+  );
   state.selectionStartNs = state.timelineAnchorNs;
   state.selectionEndNs = state.selectionStartNs;
   els.annotationTrack.setPointerCapture?.(event.pointerId);
@@ -2255,7 +2303,11 @@ function beginTimelineSelection(event) {
 
 function updateTimelineSelection(event) {
   if (!state.timelineSelecting) return;
-  const time = Math.round(timelineTimeFromPointer(event, state.timelineSurface));
+  const time = snapTimeToFrame(
+    timelineTimeFromPointer(event, state.timelineSurface),
+    state.durationNs,
+    selectionFrameGrid(),
+  );
   state.selectionStartNs = Math.min(state.timelineAnchorNs, time);
   state.selectionEndNs = Math.max(state.timelineAnchorNs, time);
   renderSelection();
@@ -2266,7 +2318,15 @@ function endTimelineSelection() {
   state.timelineSelecting = false;
   state.timelineAnchorNs = null;
   state.timelineSurface = null;
-  if (state.selectionEndNs === state.selectionStartNs) state.selectionEndNs = Math.min(state.durationNs, state.selectionStartNs + Math.round(1e9 / 30));
+  if (state.selectionEndNs === state.selectionStartNs) {
+    const selection = singleFrameRange({
+      timeNs: state.selectionStartNs,
+      durationNs: state.durationNs,
+      grid: selectionFrameGrid(),
+    });
+    state.selectionStartNs = selection.startNs;
+    state.selectionEndNs = selection.endNs;
+  }
   renderSelection();
 }
 

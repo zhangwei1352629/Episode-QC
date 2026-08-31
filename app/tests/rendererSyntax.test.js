@@ -174,3 +174,11 @@ test("时间轴结果筛选向辅助技术回报当前选中状态", () => {
   assert.match(html, /data-timeline-view="changes"[^>]*aria-pressed="false"/);
   assert.match(renderer, /item\.setAttribute\("aria-pressed", String\(item === button\)\)/);
 });
+
+test("空 Episode 仍提供可拖拽选区且保存后清空已消费区间", () => {
+  const renderer = fs.readFileSync(path.resolve(__dirname, "../renderer/renderer.js"), "utf8");
+
+  assert.match(renderer, /timeline-empty annotation-lane-surface/);
+  assert.match(renderer, /resetRangeSelection\(\);/);
+  assert.match(renderer, /请先按 I 设置区间起点/);
+});

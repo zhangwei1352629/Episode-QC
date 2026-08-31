@@ -6,6 +6,7 @@ from http.client import HTTPConnection
 import json
 from pathlib import Path
 import re
+import shutil
 import sqlite3
 import struct
 import threading
@@ -1790,6 +1791,212 @@ Frame Time: 0.010000
                 break
             time.sleep(0.01)
         assert platform["jobs"][0]["cached_episode_count"] == 2
+
+
+def test_platform_cache_keeps_import_failed_dohc_episode_and_continues(tmp_path: Path):
+    source = tmp_path / "nas" / "AST-WEB-DOHC-PARTIAL"
+    invalid_root = source / "Washing-001"
+    (invalid_root / "cam0").mkdir(parents=True)
+    (invalid_root / "manifest.json").write_text(
+        json.dumps(
+            {
+                "result": "PARTIAL",
+                "storage_format": "jpeg-stream-v1",
+                "streams": {"cam0": {"record_count": 0, "chunks": []}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    valid_root = source / "Washing-002"
+    (valid_root / "cam0").mkdir(parents=True)
+    (valid_root / "cam0" / "000001.jpg").write_bytes(
+        b"\xff\xd8valid-frame\xff\xd9"
+    )
+    (valid_root / "states.jsonl").write_text(
+        '{"frame_id":1,"timestamp_ns":0}\n', encoding="utf-8"
+    )
+
+    episodes = [
+        {
+            "episode_id": "AST-WEB-DOHC-PARTIAL-EP0001",
+            "relative_path": "Washing-001",
+            "primary_file": "manifest.json",
+            "data_format": "dohc_jpeg_v1",
+        },
+        {
+            "episode_id": "AST-WEB-DOHC-PARTIAL-EP0002",
+            "relative_path": "Washing-002",
+            "primary_file": "states.jsonl",
+            "data_format": "dohc_jpeg_v1",
+        },
+    ]
+    job = {
+        "code": "QCJ-WEB-DOHC-PARTIAL",
+        "status": "pending",
+        "asset_id": "AST-WEB-DOHC-PARTIAL",
+        "task_name": "DOHC 坏条目容错测试",
+        "source_uri": str(source),
+        "viewer_profile": "ego_omniego",
+        "asset_type": "egocentric",
+        "annotation_mode": "open",
+        "annotation_schema_version": "ego_open_v1",
+        "episodes": episodes,
+    }
+    first_ready = threading.Event()
+    continue_cache = threading.Event()
+    work_reports = []
+
+    class FakeFlowClient:
+        def jobs_response(self):
+            return {"reviewer": "Web 质检员", "jobs": [dict(job)]}
+
+        def jobs(self):
+            return [dict(job)]
+
+        def claim(self, job_code):
+            assert job_code == job["code"]
+            job["status"] = "claimed"
+            return dict(job)
+
+        def report_work(self, job_code, *, action, **values):
+            assert job_code == job["code"]
+            work_reports.append({"action": action, **values})
+            job["status"] = "in_progress"
+            return dict(job)
+
+    class ControlledCache(QualityCacheManager):
+        def cache_job(
+            self,
+            client,
+            claimed_job,
+            *,
+            progress_callback=None,
+            episode_ready_callback=None,
+        ):
+            asset_root = (
+                self.cache_root
+                / "ready"
+                / claimed_job["code"]
+                / claimed_job["asset_id"]
+            )
+            state_path = asset_root.parent / ".qc-cache.json"
+            state = {
+                "schema_version": 3,
+                "job_code": claimed_job["code"],
+                "asset_id": claimed_job["asset_id"],
+                "cache_complete": False,
+                "cache_status": "partially_ready",
+                "cached_episode_count": 0,
+                "total_episode_count": 2,
+                "cached_bytes": 0,
+                "total_bytes": 2,
+                "episodes": [
+                    {
+                        "episode_id": item["episode_id"],
+                        "relative_path": item["relative_path"],
+                        "status": "not_cached",
+                    }
+                    for item in claimed_job["episodes"]
+                ],
+            }
+            asset_root.mkdir(parents=True, exist_ok=True)
+
+            def publish(index: int):
+                relative_path = claimed_job["episodes"][index]["relative_path"]
+                shutil.copytree(
+                    source / relative_path,
+                    asset_root / relative_path,
+                    dirs_exist_ok=True,
+                )
+                state["episodes"][index]["status"] = "ready"
+                state["cached_episode_count"] = index + 1
+                state["cached_bytes"] = index + 1
+                self._write_json_atomic(state_path, state)
+                episode_ready_callback(
+                    {
+                        "cache_dir": str(asset_root),
+                        "episode_id": claimed_job["episodes"][index]["episode_id"],
+                        "cached_episode_count": index + 1,
+                        "total_episode_count": 2,
+                    }
+                )
+                self._preserve_local_episode_mappings(state_path, state)
+
+            publish(0)
+            first_ready.set()
+            assert continue_cache.wait(timeout=3)
+            publish(1)
+            state["cache_complete"] = True
+            state["cache_status"] = "cache_ready"
+            self._write_json_atomic(state_path, state)
+            return {
+                "cache_dir": str(asset_root),
+                "cache_complete": True,
+                "cached_episode_count": 2,
+                "total_episode_count": 2,
+            }
+
+    fake_client = FakeFlowClient()
+    with running_server(tmp_path) as (server, base_url):
+        controlled_cache = ControlledCache(
+            server.application.paths.root / "platform-cache", reserve_bytes=0
+        )
+        server.application._flow_client = fake_client
+        server.application._quality_cache_manager = lambda: controlled_cache
+
+        status, accepted = request_json(
+            f"{base_url}/api/platform/jobs/{job['code']}/claim", method="POST"
+        )
+        assert status == 202
+        assert accepted["accepted"] is True
+        assert first_ready.wait(timeout=3)
+
+        status, platform = request_json(f"{base_url}/api/platform/jobs")
+        assert status == 200
+        visible = platform["jobs"][0]
+        assert visible["local_task_id"]
+        assert visible["local_caching"] is True
+        assert visible["cache_status"] == "partially_ready"
+
+        task_id = visible["local_task_id"]
+        status, workspace = request_json(
+            f"{base_url}/api/workspace?task_id={task_id}"
+        )
+        assert status == 200
+        assert [item["relative_path"] for item in workspace["episodes"]] == [
+            "Washing-001"
+        ]
+        assert workspace["episodes"][0]["import_status"] == "failed"
+        assert "未发现可播放" in workspace["episodes"][0]["import_error"]
+
+        continue_cache.set()
+        for _ in range(200):
+            _status, platform = request_json(f"{base_url}/api/platform/jobs")
+            if not platform["jobs"][0]["local_caching"]:
+                break
+            time.sleep(0.01)
+
+        visible = platform["jobs"][0]
+        assert visible["cache_complete"] is True
+        assert visible["cache_status"] == "cache_ready"
+        assert len(work_reports) == 1
+
+        status, workspace = request_json(
+            f"{base_url}/api/workspace?task_id={task_id}"
+        )
+        assert status == 200
+        assert {
+            item["relative_path"]: item["import_status"]
+            for item in workspace["episodes"]
+        } == {"Washing-001": "failed", "Washing-002": "ready"}
+        assert {
+            item["episode_id"]
+            for item in controlled_cache.local_episode_mappings(job["code"])
+        } == {
+            "AST-WEB-DOHC-PARTIAL-EP0001",
+            "AST-WEB-DOHC-PARTIAL-EP0002",
+        }
 
 
 def test_platform_login_resumes_an_incomplete_episode_cache_after_restart(tmp_path: Path):

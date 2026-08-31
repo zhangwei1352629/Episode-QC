@@ -1513,11 +1513,15 @@ class EpisodeQcWebApplication:
                     ),
                 )
             )
-            ready_by_path = {
+            indexed_by_path = {
                 str(Path(item["relative_path"]).as_posix()).strip("./"): item
                 for item in indexed["episodes"]
-                if item["import_status"] == "ready"
             }
+            import_failures = [
+                item
+                for item in indexed["episodes"]
+                if item["import_status"] != "ready"
+            ]
             mappings = []
             for platform_episode in job.get("episodes", []):
                 relative_path = str(
@@ -1530,7 +1534,11 @@ class EpisodeQcWebApplication:
                         str((Path(relative_path) / primary_file).as_posix()).strip("./")
                     )
                 local_episode = next(
-                    (ready_by_path.get(path) for path in candidate_paths if ready_by_path.get(path)),
+                    (
+                        indexed_by_path.get(path)
+                        for path in candidate_paths
+                        if indexed_by_path.get(path)
+                    ),
                     None,
                 )
                 if local_episode is not None:
@@ -1541,10 +1549,10 @@ class EpisodeQcWebApplication:
                             "relative_path": relative_path,
                         }
                     )
-            if len(mappings) != len(ready_by_path):
+            if len(mappings) != len(indexed_by_path):
                 raise QualityCacheError(
                     f"资产缓存包含未登记的 Episode：Flow {len(mappings)} 个，"
-                    f"本地 {len(ready_by_path)} 个"
+                    f"本地 {len(indexed_by_path)} 个"
                 )
             if not mappings:
                 raise QualityCacheError("本地缓存尚未索引到已验证的 Flow Episode")
@@ -1570,7 +1578,12 @@ class EpisodeQcWebApplication:
                 if cache_summary.get("total_bytes")
                 else 0
             )
-            warning = ""
+            warning = (
+                f"{len(import_failures)} 条 Episode 无法播放，"
+                "已保留为导入异常并继续缓存"
+                if import_failures
+                else ""
+            )
             if not review_started:
                 review_started = True
                 try:
@@ -1578,7 +1591,9 @@ class EpisodeQcWebApplication:
                 except Exception as exc:
                     # Local review may still be opened. The explicit start action
                     # can retry a transient Flow work-session conflict later.
-                    warning = str(exc)
+                    warning = "；".join(
+                        item for item in (warning, str(exc)) if item
+                    )
                 else:
                     publish_progress(
                         {

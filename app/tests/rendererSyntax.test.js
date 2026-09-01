@@ -182,3 +182,13 @@ test("空 Episode 仍提供可拖拽选区且保存后清空已消费区间", ()
   assert.match(renderer, /resetRangeSelection\(\);/);
   assert.match(renderer, /请先按 I 设置区间起点/);
 });
+
+test("标注轨道单击只移动播放头且不会在 pointerdown 覆盖 I 点", () => {
+  const renderer = fs.readFileSync(path.resolve(__dirname, "../renderer/renderer.js"), "utf8");
+  const pointerDown = renderer.match(/function beginTimelineSelection\(event\) \{([\s\S]*?)\n\}/)?.[1] || "";
+
+  assert.match(pointerDown, /state\.timelinePointer =/);
+  assert.doesNotMatch(pointerDown, /state\.selectionStartNs =/);
+  assert.match(renderer, /if \(!wasSelecting\) \{\s*seekTo\(pointer\.anchorNs\);\s*return;/);
+  assert.match(renderer, /isTimelineDrag\(pointer\.startX, event\.clientX\)/);
+});

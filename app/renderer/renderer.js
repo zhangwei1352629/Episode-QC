@@ -19,6 +19,7 @@ import {
   beginRangeSelection,
   completeRangeSelection,
   frameGridForCameras,
+  isTimelineDrag,
   singleFrameRange,
   snapTimeToFrame,
 } from "./range-selection.mjs";
@@ -112,6 +113,7 @@ const state = {
   cameraZoom: 1,
   drag: null,
   timelineSelecting: false,
+  timelinePointer: null,
   timelineAnchorNs: null,
   timelineSurface: null,
   reviewerTimer: null,
@@ -309,6 +311,7 @@ function bindEvents() {
   els.annotationTrack.addEventListener("pointerdown", beginTimelineSelection);
   window.addEventListener("pointermove", updateTimelineSelection);
   window.addEventListener("pointerup", endTimelineSelection);
+  window.addEventListener("pointercancel", cancelTimelineSelection);
   els.annotationTrack.addEventListener("dblclick", (event) => {
     if (event.target.closest("[data-annotation-id]")) return;
     seekTo(timelineTimeFromPointer(event));
@@ -2285,24 +2288,39 @@ function handleKeyboard(event) {
 }
 
 function beginTimelineSelection(event) {
-  if (event.target.closest("[data-annotation-id]") || !state.durationNs) return;
+  if (event.button !== 0 || event.target.closest("[data-annotation-id]") || !state.durationNs) return;
   const surface = event.target.closest(".annotation-lane-surface");
   if (!surface) return;
-  state.timelineSelecting = true;
-  state.timelineSurface = surface;
-  state.timelineAnchorNs = snapTimeToFrame(
+  const anchorNs = snapTimeToFrame(
     timelineTimeFromPointer(event, surface),
     state.durationNs,
     selectionFrameGrid(),
   );
-  state.selectionStartNs = state.timelineAnchorNs;
-  state.selectionEndNs = state.selectionStartNs;
-  els.annotationTrack.setPointerCapture?.(event.pointerId);
-  renderSelection();
+  state.timelinePointer = {
+    pointerId: event.pointerId,
+    startX: event.clientX,
+    anchorNs,
+    surface,
+    previousStartNs: state.selectionStartNs,
+    previousEndNs: state.selectionEndNs,
+  };
+  state.timelineSelecting = false;
+  state.timelineSurface = null;
+  state.timelineAnchorNs = null;
 }
 
 function updateTimelineSelection(event) {
-  if (!state.timelineSelecting) return;
+  const pointer = state.timelinePointer;
+  if (!pointer || event.pointerId !== pointer.pointerId) return;
+  if (!state.timelineSelecting) {
+    if (!isTimelineDrag(pointer.startX, event.clientX)) return;
+    state.timelineSelecting = true;
+    state.timelineSurface = pointer.surface;
+    state.timelineAnchorNs = pointer.anchorNs;
+    state.selectionStartNs = pointer.anchorNs;
+    state.selectionEndNs = pointer.anchorNs;
+    els.annotationTrack.setPointerCapture?.(event.pointerId);
+  }
   const time = snapTimeToFrame(
     timelineTimeFromPointer(event, state.timelineSurface),
     state.durationNs,
@@ -2313,11 +2331,19 @@ function updateTimelineSelection(event) {
   renderSelection();
 }
 
-function endTimelineSelection() {
-  if (!state.timelineSelecting) return;
+function endTimelineSelection(event) {
+  const pointer = state.timelinePointer;
+  if (!pointer || event.pointerId !== pointer.pointerId) return;
+  const wasSelecting = state.timelineSelecting;
+  if (wasSelecting) updateTimelineSelection(event);
+  state.timelinePointer = null;
   state.timelineSelecting = false;
   state.timelineAnchorNs = null;
   state.timelineSurface = null;
+  if (!wasSelecting) {
+    seekTo(pointer.anchorNs);
+    return;
+  }
   if (state.selectionEndNs === state.selectionStartNs) {
     const selection = singleFrameRange({
       timeNs: state.selectionStartNs,
@@ -2328,6 +2354,20 @@ function endTimelineSelection() {
     state.selectionEndNs = selection.endNs;
   }
   renderSelection();
+}
+
+function cancelTimelineSelection(event) {
+  const pointer = state.timelinePointer;
+  if (!pointer || event.pointerId !== pointer.pointerId) return;
+  if (state.timelineSelecting) {
+    state.selectionStartNs = pointer.previousStartNs;
+    state.selectionEndNs = pointer.previousEndNs;
+    renderSelection();
+  }
+  state.timelinePointer = null;
+  state.timelineSelecting = false;
+  state.timelineAnchorNs = null;
+  state.timelineSurface = null;
 }
 
 function timelineTimeFromPointer(event, surface = null) {

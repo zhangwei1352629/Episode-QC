@@ -54,7 +54,7 @@ test("没有起点或终点不晚于起点时不会静默生成错误区间", as
   );
 });
 
-test("单击时间轴在结尾也能得到一个有效的单帧区间", async () => {
+test("单帧区间在时间轴结尾仍保持有效", async () => {
   const { singleFrameRange } = await import("../renderer/range-selection.mjs");
 
   assert.deepEqual(
@@ -65,4 +65,13 @@ test("单击时间轴在结尾也能得到一个有效的单帧区间", async ()
     }),
     { startNs: 20_466_666_667, endNs: 20_500_000_000 },
   );
+});
+
+test("时间轴只有超过拖拽阈值才进入选区手势", async () => {
+  const { isTimelineDrag } = await import("../renderer/range-selection.mjs");
+
+  assert.equal(isTimelineDrag(100, 103.9), false);
+  assert.equal(isTimelineDrag(100, 104), true);
+  assert.equal(isTimelineDrag(100, 95), true);
+  assert.equal(isTimelineDrag(undefined, 110), false);
 });

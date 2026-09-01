@@ -1,4 +1,5 @@
 const DEFAULT_FRAME_STEP_NS = Math.round(1_000_000_000 / 30);
+const DEFAULT_TIMELINE_DRAG_THRESHOLD_PX = 4;
 
 function finiteNumber(value) {
   const number = Number(value);
@@ -64,4 +65,12 @@ export function singleFrameRange({ timeNs, durationNs, grid }) {
   const end = Math.min(duration, start + step);
   if (end > start) return { startNs: start, endNs: end };
   return { startNs: Math.max(0, duration - step), endNs: duration };
+}
+
+export function isTimelineDrag(startClientX, currentClientX, thresholdPx = DEFAULT_TIMELINE_DRAG_THRESHOLD_PX) {
+  const start = finiteNumber(startClientX);
+  const current = finiteNumber(currentClientX);
+  if (start === null || current === null) return false;
+  const threshold = Math.max(0, finiteNumber(thresholdPx) ?? DEFAULT_TIMELINE_DRAG_THRESHOLD_PX);
+  return Math.abs(current - start) >= threshold;
 }

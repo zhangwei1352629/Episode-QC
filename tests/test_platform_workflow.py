@@ -446,6 +446,230 @@ def test_versioned_result_copy_preserves_every_label_schema_version(tmp_path: Pa
     assert history_manifest["label_set"]["label_schema_version"] == "1.0.0"
 
 
+def test_open_annotation_history_uses_the_annotation_schema_version(tmp_path: Path):
+    asset_root = tmp_path / "asset"
+    asset_root.mkdir()
+    local_result = tmp_path / "open-result.json"
+    local_result.write_bytes(b'{"result_id":"QCR-OPEN"}\n')
+    digest = hashlib.sha256(local_result.read_bytes()).hexdigest()
+    result_manifest = {
+        "schema_version": 1,
+        "result_id": "QCR-OPEN",
+        "result_sha256": digest,
+        "job_code": "QCJ-OPEN",
+        "asset_id": "AST-OPEN",
+        "attempt": 1,
+        "files": [
+            {
+                "relative_path": "qc_result.json",
+                "size_bytes": local_result.stat().st_size,
+                "sha256": digest,
+            }
+        ],
+    }
+
+    published = QualityCacheManager._publish_versioned_result_copy(
+        {
+            "source_uri": str(asset_root),
+            "code": "QCJ-OPEN",
+            "annotation_mode": "open",
+            "annotation_schema_version": "ego_open_v1",
+        },
+        local_result,
+        result_manifest,
+        label_set=None,
+    )
+
+    assert published == str(
+        asset_root
+        / "qc_results"
+        / "vego_open_v1"
+        / "QCJ-OPEN"
+        / "attempt-0001"
+        / "qc_result.json"
+    )
+
+
+def test_partitioned_initial_results_publish_one_complete_asset_aggregate(
+    tmp_path: Path,
+):
+    asset_root = tmp_path / "asset"
+    asset_root.mkdir()
+    asset_id = "AST-PARTITIONED"
+
+    def publish_partition(job_code: str, partition_index: int, episode_id: str) -> dict:
+        result_document = {
+            "schema_version": 2,
+            "result_id": f"QCR-{partition_index}",
+            "job_code": job_code,
+            "asset_id": asset_id,
+            "attempt": 1,
+            "source_manifest_sha256": "a" * 64,
+            "annotation_mode": "open",
+            "annotation_schema_version": "ego_open_v1",
+            "episode_results": [
+                {
+                    "episode_id": episode_id,
+                    "decision": "pass",
+                    "annotation_count": 0,
+                    "annotations": [],
+                }
+            ],
+            "result": {},
+        }
+        destination = (
+            tmp_path
+            / "qc-results"
+            / asset_id
+            / job_code
+            / "attempt-0001"
+        )
+        destination.mkdir(parents=True)
+        result_path = destination / "qc_result.json"
+        result_path.write_text(
+            json.dumps(result_document, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        return {
+            "job_code": job_code,
+            "partition_index": partition_index,
+            "status": "completed",
+            "reviewer_employee_no": f"QC-{partition_index}",
+            "reviewer_name": f"Reviewer {partition_index}",
+            "result_id": result_document["result_id"],
+            "result_sha256": hashlib.sha256(result_path.read_bytes()).hexdigest(),
+            "result_nas_path": str(result_path),
+            "completed_at": f"2026-09-01T0{partition_index}:00:00+00:00",
+            "episode_ids": [episode_id],
+        }
+
+    first = publish_partition("QCJ-PART-001", 1, "EP-001")
+    second = publish_partition("QCJ-PART-002", 2, "EP-002")
+    job = {
+        "code": second["job_code"],
+        "job_type": "initial",
+        "affects_current_result": True,
+        "asset_id": asset_id,
+        "source_uri": str(asset_root),
+        "asset_episode_count": 2,
+        "asset_initial_job_count": 2,
+        "asset_manifest_sha256": "a" * 64,
+        "asset_manifest": {
+            "asset_id": asset_id,
+            "episodes": [
+                {"episode_id": "EP-001", "sequence_index": 1},
+                {"episode_id": "EP-002", "sequence_index": 2},
+            ],
+        },
+        "annotation_mode": "open",
+        "annotation_schema_version": "ego_open_v1",
+        "asset_initial_partitions": [
+            first,
+            {**second, "status": "in_progress", "result_id": ""},
+        ],
+    }
+
+    pending = QualityCacheManager._publish_asset_aggregate_if_complete(job)
+
+    assert pending is None
+    assert not (asset_root / "qc_result.json").exists()
+
+    job["asset_initial_partitions"] = [first, second]
+    published = QualityCacheManager._publish_asset_aggregate_if_complete(job)
+
+    assert published == str(asset_root / "qc_result.json")
+    aggregate = json.loads((asset_root / "qc_result.json").read_text(encoding="utf-8"))
+    assert aggregate["result_type"] == "asset_aggregate"
+    assert aggregate["complete"] is True
+    assert aggregate["result_id"].startswith("QCA-")
+    assert [row["episode_id"] for row in aggregate["episode_results"]] == [
+        "EP-001",
+        "EP-002",
+    ]
+    assert [row["job_code"] for row in aggregate["partition_results"]] == [
+        "QCJ-PART-001",
+        "QCJ-PART-002",
+    ]
+    assert aggregate["result"]["reviewed_episode_count"] == 2
+    assert aggregate["result"]["partition_count"] == 2
+
+
+def test_partition_submit_does_not_publish_a_partial_asset_root_result(
+    tmp_path: Path,
+    monkeypatch,
+):
+    cache = QualityCacheManager(tmp_path / "cache", reserve_bytes=0)
+    job = {
+        "code": "QCJ-PARTIAL-001",
+        "job_type": "initial",
+        "affects_current_result": True,
+        "asset_id": "AST-PARTIAL",
+        "asset_initial_job_count": 2,
+        "asset_episode_count": 2,
+        "status": "in_progress",
+        "annotation_mode": "open",
+        "annotation_schema_version": "ego_open_v1",
+        "episodes": [
+            {
+                "episode_id": "EP-001",
+                "relative_path": "episode_000001",
+            }
+        ],
+    }
+    state_path = cache.cache_root / "ready" / job["code"] / ".qc-cache.json"
+    state_path.parent.mkdir(parents=True)
+    QualityCacheManager._write_json_atomic(
+        state_path,
+        {
+            "asset_id": job["asset_id"],
+            "asset_manifest_sha256": "a" * 64,
+            "cache_complete": True,
+            "next_attempt": 1,
+            "episodes": [
+                {
+                    "episode_id": "EP-001",
+                    "relative_path": "episode_000001",
+                    "status": "ready",
+                }
+            ],
+        },
+    )
+    client = FakeFlowClient(job)
+    publish_latest = Mock(side_effect=AssertionError("partial result reached asset root"))
+    publish_aggregate = Mock(return_value=None)
+    monkeypatch.setattr(cache, "_publish_result", Mock(return_value="/qc/part/qc_result.json"))
+    monkeypatch.setattr(
+        cache,
+        "_publish_versioned_result_copy",
+        Mock(return_value="/asset/qc_results/part/qc_result.json"),
+    )
+    monkeypatch.setattr(cache, "_publish_latest_result_copy", publish_latest)
+    monkeypatch.setattr(
+        cache,
+        "_publish_asset_aggregate_if_complete",
+        publish_aggregate,
+    )
+    monkeypatch.setattr(cache, "_verify_result_readback", Mock())
+    monkeypatch.setattr(cache, "_verify_result_file_readback", Mock())
+
+    response = cache.submit_result(
+        client,
+        job,
+        episode_results=[
+            {
+                "episode_id": "EP-001",
+                "decision": "pass",
+                "annotation_count": 0,
+                "annotations": [],
+            }
+        ],
+    )
+
+    assert response["status"] == "completed"
+    publish_latest.assert_not_called()
+    publish_aggregate.assert_called_once()
+
+
 def test_versioned_result_copy_is_idempotent_and_rejects_conflicting_attempt(
     tmp_path: Path,
 ):

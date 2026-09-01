@@ -1041,11 +1041,13 @@ class QualityCacheManager:
             result_manifest,
             label_set=label_set,
         )
-        self._publish_latest_result_copy(
-            job,
-            local_result,
-            result_sha256=result_sha256,
-        )
+        partitioned_initial_job = self._is_partitioned_initial_job(job)
+        if not partitioned_initial_job:
+            self._publish_latest_result_copy(
+                job,
+                local_result,
+                result_sha256=result_sha256,
+            )
         if hasattr(client, "report_work") and job.get("status") != "completed":
             client.report_work(job_code, action="heartbeat")
         response = client.submit_result(
@@ -1070,6 +1072,11 @@ class QualityCacheManager:
                 versioned_result_path,
                 expected_sha256=result_sha256,
             )
+            aggregate_result_path = (
+                self._publish_asset_aggregate_if_complete(response)
+                if partitioned_initial_job
+                else None
+            )
         except (OSError, ValueError, QualityCacheError) as exc:
             raise QualityCacheError(f"提交后 NAS 回读校验失败：{exc}") from exc
         state["result_synced"] = True
@@ -1078,6 +1085,8 @@ class QualityCacheManager:
         state["result_nas_path"] = result_nas_path
         state["result_id"] = result_id
         state["result_sha256"] = result_sha256
+        if aggregate_result_path:
+            state["asset_aggregate_result_path"] = aggregate_result_path
         state.pop("result_sync_error", None)
         state.pop("result_sync_error_at", None)
         self._write_json_atomic(state_path, state)
@@ -1394,6 +1403,11 @@ class QualityCacheManager:
         raw_version = str(
             (label_set or {}).get("label_schema_version")
             or (label_set or {}).get("schema_version")
+            or (
+                job.get("annotation_schema_version")
+                if str(job.get("annotation_mode") or "") == "open"
+                else ""
+            )
             or "unversioned"
         )
         version = cls._safe_component(raw_version, "标签版本")
@@ -1492,6 +1506,258 @@ class QualityCacheManager:
                 raise
             raise QualityCacheError(f"无法在原始数据目录保存最新质检结果副本：{exc}") from exc
         return str(destination)
+
+    @staticmethod
+    def _is_partitioned_initial_job(job: dict) -> bool:
+        try:
+            initial_job_count = int(job.get("asset_initial_job_count") or 0)
+        except (TypeError, ValueError):
+            return False
+        return (
+            str(job.get("job_type") or "") == "initial"
+            and bool(job.get("affects_current_result", True))
+            and initial_job_count > 1
+        )
+
+    @classmethod
+    def _publish_asset_aggregate_if_complete(cls, job: dict) -> str | None:
+        """Publish the asset-root mirror only after every initial partition completes."""
+
+        try:
+            expected_partition_count = int(job.get("asset_initial_job_count") or 0)
+            expected_episode_count = int(job.get("asset_episode_count") or 0)
+        except (TypeError, ValueError) as exc:
+            raise QualityCacheError("Flow 返回的资产分片统计无效") from exc
+        if expected_partition_count <= 1:
+            raise QualityCacheError("资产级聚合只适用于多分片初检任务")
+
+        partitions = job.get("asset_initial_partitions")
+        if not isinstance(partitions, list) or len(partitions) != expected_partition_count:
+            raise QualityCacheError("Flow 返回的初检分片清单不完整")
+        if any(not isinstance(partition, dict) for partition in partitions):
+            raise QualityCacheError("Flow 返回的初检分片清单格式无效")
+        partition_codes = [str(partition.get("job_code") or "") for partition in partitions]
+        partition_indexes = [partition.get("partition_index") for partition in partitions]
+        if (
+            any(not code for code in partition_codes)
+            or len(set(partition_codes)) != len(partition_codes)
+            or len(set(partition_indexes)) != len(partition_indexes)
+        ):
+            raise QualityCacheError("Flow 返回的初检分片编号重复或缺失")
+        if any(partition.get("status") != "completed" for partition in partitions):
+            return None
+
+        asset_id = str(job.get("asset_id") or "")
+        asset_uri = str(job.get("source_uri") or job.get("asset_nas_uri") or "").strip()
+        if not asset_id or not asset_uri:
+            raise QualityCacheError("Flow 没有返回资产编号或原始数据目录")
+        manifest = job.get("asset_manifest")
+        manifest_episodes = manifest.get("episodes") if isinstance(manifest, dict) else None
+        if not isinstance(manifest_episodes, list):
+            raise QualityCacheError("Flow 资产清单缺少完整 Episode 列表")
+        expected_episode_ids = [
+            str(item.get("episode_id") or "")
+            for item in manifest_episodes
+            if isinstance(item, dict)
+        ]
+        if (
+            any(not episode_id for episode_id in expected_episode_ids)
+            or len(set(expected_episode_ids)) != len(expected_episode_ids)
+            or len(expected_episode_ids) != expected_episode_count
+        ):
+            raise QualityCacheError("Flow 资产 Episode 总数或清单无效")
+
+        ordered_partitions = sorted(
+            partitions,
+            key=lambda partition: (
+                int(partition.get("partition_index") or 0),
+                str(partition.get("job_code") or ""),
+            ),
+        )
+        result_by_episode_id: dict[str, dict] = {}
+        partition_results = []
+        aggregate_identity_rows = []
+        expected_manifest_sha256 = str(job.get("asset_manifest_sha256") or "")
+        expected_annotation_mode = str(job.get("annotation_mode") or "library")
+        expected_annotation_schema_version = str(
+            job.get("annotation_schema_version") or ""
+        )
+
+        for partition in ordered_partitions:
+            result_id = str(partition.get("result_id") or "")
+            result_sha256 = str(partition.get("result_sha256") or "").lower()
+            result_nas_path = str(partition.get("result_nas_path") or "").strip()
+            episode_ids = [str(value or "") for value in partition.get("episode_ids") or []]
+            if (
+                not result_id
+                or len(result_sha256) != 64
+                or not result_nas_path
+                or any(not episode_id for episode_id in episode_ids)
+                or len(set(episode_ids)) != len(episode_ids)
+            ):
+                raise QualityCacheError(
+                    f"分片 {partition['job_code']} 缺少可核验的正式结果"
+                )
+
+            raw_result_path = result_nas_path.replace("\\", "/")
+            parent_uri, separator, name = raw_result_path.rpartition("/")
+            if not separator or name != "qc_result.json" or not parent_uri:
+                raise QualityCacheError(
+                    f"分片 {partition['job_code']} 的正式结果路径无效"
+                )
+            result_path = _windows_extended_path(resolve_target_directory(parent_uri)) / name
+            if not result_path.is_file() or sha256_file(result_path) != result_sha256:
+                raise QualityCacheError(
+                    f"分片 {partition['job_code']} 的正式结果 SHA-256 回读失败"
+                )
+            try:
+                result_document = json.loads(result_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise QualityCacheError(
+                    f"分片 {partition['job_code']} 的正式结果不是有效 JSON"
+                ) from exc
+            if not isinstance(result_document, dict):
+                raise QualityCacheError(
+                    f"分片 {partition['job_code']} 的正式结果格式无效"
+                )
+            if (
+                result_document.get("asset_id") != asset_id
+                or result_document.get("job_code") != partition["job_code"]
+                or result_document.get("result_id") != result_id
+                or (
+                    expected_manifest_sha256
+                    and result_document.get("source_manifest_sha256")
+                    != expected_manifest_sha256
+                )
+            ):
+                raise QualityCacheError(
+                    f"分片 {partition['job_code']} 的正式结果身份不一致"
+                )
+            if expected_annotation_mode == "open" and (
+                result_document.get("annotation_mode") != "open"
+                or result_document.get("annotation_schema_version")
+                != expected_annotation_schema_version
+            ):
+                raise QualityCacheError(
+                    f"分片 {partition['job_code']} 的开放标注结构版本不一致"
+                )
+            episode_results = result_document.get("episode_results")
+            if not isinstance(episode_results, list) or any(
+                not isinstance(item, dict) for item in episode_results
+            ):
+                raise QualityCacheError(
+                    f"分片 {partition['job_code']} 的 Episode 结果格式无效"
+                )
+            submitted_episode_ids = [
+                str(item.get("episode_id") or "") for item in episode_results
+            ]
+            if (
+                len(set(submitted_episode_ids)) != len(submitted_episode_ids)
+                or set(submitted_episode_ids) != set(episode_ids)
+            ):
+                raise QualityCacheError(
+                    f"分片 {partition['job_code']} 的结果覆盖范围不一致"
+                )
+            for episode_result in episode_results:
+                episode_id = str(episode_result["episode_id"])
+                if episode_id in result_by_episode_id:
+                    raise QualityCacheError(f"初检分片重复覆盖 Episode：{episode_id}")
+                result_by_episode_id[episode_id] = episode_result
+
+            partition_result = {
+                "job_code": partition["job_code"],
+                "partition_index": int(partition["partition_index"]),
+                "reviewer_employee_no": partition.get("reviewer_employee_no"),
+                "reviewer_name": str(partition.get("reviewer_name") or ""),
+                "result_id": result_id,
+                "result_sha256": result_sha256,
+                "result_nas_path": result_nas_path,
+                "completed_at": partition.get("completed_at"),
+                "episode_count": len(episode_results),
+            }
+            partition_results.append(partition_result)
+            aggregate_identity_rows.append(
+                {
+                    "job_code": partition_result["job_code"],
+                    "partition_index": partition_result["partition_index"],
+                    "result_id": result_id,
+                    "result_sha256": result_sha256,
+                }
+            )
+
+        if set(result_by_episode_id) != set(expected_episode_ids):
+            missing = sorted(set(expected_episode_ids) - set(result_by_episode_id))
+            unexpected = sorted(set(result_by_episode_id) - set(expected_episode_ids))
+            detail = []
+            if missing:
+                detail.append(f"缺少 Episode：{', '.join(missing)}")
+            if unexpected:
+                detail.append(f"包含未登记 Episode：{', '.join(unexpected)}")
+            raise QualityCacheError("资产级质检结果覆盖不完整；" + "；".join(detail))
+
+        merged_episode_results = [
+            result_by_episode_id[episode_id] for episode_id in expected_episode_ids
+        ]
+        decision_counts: dict[str, int] = {}
+        for episode_result in merged_episode_results:
+            decision = str(episode_result.get("decision") or "")
+            decision_counts[decision] = decision_counts.get(decision, 0) + 1
+        aggregate_result_id = "QCA-" + canonical_json_sha256(
+            {"asset_id": asset_id, "partitions": aggregate_identity_rows}
+        )
+        completed_values = [
+            str(partition.get("completed_at") or "") for partition in ordered_partitions
+        ]
+        aggregate_document = {
+            "schema_version": 2,
+            "result_type": "asset_aggregate",
+            "complete": True,
+            "result_id": aggregate_result_id,
+            "asset_id": asset_id,
+            "source_manifest_sha256": expected_manifest_sha256,
+            "created_at": max(completed_values),
+            "episode_results": merged_episode_results,
+            "partition_results": partition_results,
+            "result": {
+                "reviewed_episode_count": len(merged_episode_results),
+                "partition_count": len(partition_results),
+                "decision_counts": decision_counts,
+            },
+            **(
+                {
+                    "annotation_mode": "open",
+                    "annotation_schema_version": expected_annotation_schema_version,
+                }
+                if expected_annotation_mode == "open"
+                else {}
+            ),
+        }
+
+        try:
+            asset_root = resolve_source_directory(asset_uri)
+            destination = _windows_extended_path(asset_root) / "qc_result.json"
+            if destination.is_file():
+                try:
+                    existing = json.loads(destination.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    existing = None
+                if (
+                    isinstance(existing, dict)
+                    and existing.get("result_type") == "asset_aggregate"
+                    and existing.get("complete") is True
+                ):
+                    if existing.get("result_id") == aggregate_result_id:
+                        return str(asset_root / "qc_result.json")
+                    raise QualityCacheError("资产根目录已有不同的完整聚合质检结果")
+            cls._write_json_atomic(destination, aggregate_document)
+            published = json.loads(destination.read_text(encoding="utf-8"))
+            if published != aggregate_document:
+                raise QualityCacheError("资产级聚合质检结果回读不一致")
+        except (OSError, ValueError, json.JSONDecodeError, QualityCacheError) as exc:
+            if isinstance(exc, QualityCacheError):
+                raise
+            raise QualityCacheError(f"无法发布资产级聚合质检结果：{exc}") from exc
+        return str(asset_root / "qc_result.json")
 
     @staticmethod
     def _normalized_uri(value: str) -> str:

@@ -11,7 +11,7 @@ if (-not (Test-Path -LiteralPath $StartScript -PathType Leaf)) {
 $credential = Get-Credential -Message "Dedicated Windows account that owns the QC workspace and SMB credentials"
 $action = New-ScheduledTaskAction `
     -Execute "powershell.exe" `
-    -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$StartScript`""
+    -Argument "-WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$StartScript`""
 $trigger = New-ScheduledTaskTrigger -AtStartup
 $settings = New-ScheduledTaskSettingsSet `
     -ExecutionTimeLimit (New-TimeSpan -Days 3650) `

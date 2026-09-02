@@ -310,6 +310,11 @@ body.episodes-collapsed .episode-sidebar, body.labels-collapsed .label-sidebar {
 .ego-fields-grid label { display: grid; gap: 2px; color: var(--muted); font-size: 8px; }
 .ego-fields-grid label.wide { grid-column: 1 / -1; }
 .ego-fields-grid input, .ego-fields-grid select { min-width: 0; height: 27px; padding: 0 6px; border: 1px solid var(--line); border-radius: 5px; background: var(--surface-strong); color: var(--text); font: inherit; }
+.ego-fields-grid select { width: 100%; padding-right: 26px; color-scheme: dark; }
+.ego-fields-grid select option { color: #eef3f6; background-color: #10151a; }
+.ego-fields-grid select option:checked { color: #f8ffdc; background-color: #314116; }
+.label-section.ego-mode { overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
+.label-section.ego-mode .label-list { flex: 0 0 auto; min-height: min(180px, 28vh); max-height: min(280px, 36vh); }
 .label-list { min-height: 0; flex: 1 1 auto; display: grid; grid-template-columns: repeat(auto-fit, minmax(126px, 1fr)); grid-auto-rows: minmax(44px, auto); align-content: start; gap: 5px; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; padding-right: 2px; }
 .label-list > .empty-panel { grid-column: 1 / -1; }
 .label-button { width: 100%; min-width: 0; min-height: 44px; height: auto; align-self: start; display: grid; grid-template-columns: 4px minmax(0, 1fr) auto; align-items: center; gap: 6px; text-align: left; border: 1px solid var(--line-soft); background: linear-gradient(145deg, #171d23, #14191f); border-radius: 7px; padding: 5px 6px 5px 5px; cursor: pointer; }

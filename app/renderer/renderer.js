@@ -2549,6 +2549,10 @@ function setMotionControlsExpanded(expanded) {
 }
 function renderViewerProfile() {
   const ego = isEgoTask();
+  const labelSection = els.egoAnnotationFields.closest(".label-section");
+  const egoModeChanged = labelSection?.classList.contains("ego-mode") !== ego;
+  labelSection?.classList.toggle("ego-mode", ego);
+  if (labelSection && egoModeChanged) labelSection.scrollTop = 0;
   els.motionViewerTitle.textContent = ego ? "人体 Pose 骨架" : "宇树 G1 29DOF";
   els.motionViewerBadge.textContent = ego ? "SMPL 24" : "URDF";
   els.motionHint.textContent = ego

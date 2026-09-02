@@ -114,6 +114,17 @@ test("Ego 任务入口复用五路相机和 SMPL Pose 骨架工作区", () => {
   assert.match(css, /\.motion-control-panel\[hidden\]\s*\{\s*display:\s*none/);
 });
 
+test("Ego 身体部位表单在标签面板内滚动且不覆盖下方区域", () => {
+  const renderer = fs.readFileSync(path.resolve(__dirname, "../renderer/renderer.js"), "utf8");
+  const css = fs.readFileSync(path.resolve(__dirname, "../renderer/styles.css"), "utf8");
+
+  assert.match(renderer, /labelSection\?\.classList\.toggle\("ego-mode", ego\)/);
+  assert.match(css, /\.label-section\.ego-mode\s*\{[^}]*overflow-y:\s*auto/s);
+  assert.match(css, /\.label-section\.ego-mode \.label-list\s*\{[^}]*flex:\s*0 0 auto/s);
+  assert.match(css, /\.ego-fields-grid select\s*\{[^}]*color-scheme:\s*dark/s);
+  assert.match(css, /\.ego-fields-grid select option\s*\{[^}]*color:\s*#eef3f6;[^}]*background-color:\s*#10151a/s);
+});
+
 test("标签库菜单和本地任务历史管理入口完整", () => {
   const html = fs.readFileSync(path.resolve(__dirname, "../renderer/index.html"), "utf8");
   const renderer = fs.readFileSync(path.resolve(__dirname, "../renderer/renderer.js"), "utf8");

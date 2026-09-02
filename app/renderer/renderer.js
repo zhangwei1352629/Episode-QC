@@ -25,6 +25,12 @@ import {
   singleFrameRange,
   snapTimeToFrame,
 } from "./range-selection.mjs";
+import {
+  createEgoDraft,
+  labelUsesEgoSemanticFields,
+  reuseSameObjectDraft,
+  sameStepNewObjectDraft,
+} from "./ego-annotation-draft.mjs";
 
 const $ = (id) => document.getElementById(id);
 
@@ -55,12 +61,20 @@ const els = {
   egoAnnotationFields: $("ego-annotation-fields"), egoBodyPart: $("ego-body-part"), egoObjectName: $("ego-object-name"),
   egoObjectColor: $("ego-object-color"), egoSourceName: $("ego-source-name"), egoTargetName: $("ego-target-name"),
   egoExceptionType: $("ego-exception-type"), egoRecoveryAction: $("ego-recovery-action"),
+  egoStepDraft: $("ego-step-draft"), egoSelectedStep: $("ego-selected-step"),
+  egoSemanticField: $("ego-semantic-field"), egoSemanticDescription: $("ego-semantic-description"),
+  egoNewObject: $("ego-new-object"), egoReuseObject: $("ego-reuse-object"), saveEgoAnnotation: $("save-ego-annotation"),
   annotationCount: $("annotation-count"), annotationList: $("annotation-list"), decisionGrid: $("decision-grid"), decisionCurrent: $("decision-current"),
   annotationsSection: $("current-annotations-section"),
   toggleCurrentAnnotations: $("toggle-current-annotations"),
   needsRecheck: $("needs-recheck"), toastStack: $("toast-stack"), taskCenterToastStack: $("task-center-toast-stack"), annotationEditor: $("annotation-editor"),
   editId: $("edit-id"), editStart: $("edit-start"), editEnd: $("edit-end"), editSeverity: $("edit-severity"),
   editAction: $("edit-action"), editComment: $("edit-comment"), editProvenance: $("edit-provenance"), deleteAnnotation: $("delete-annotation"),
+  editEgoFields: $("edit-ego-fields"), editEgoStepField: $("edit-ego-step-field"), editEgoStep: $("edit-ego-step"),
+  editEgoSemanticField: $("edit-ego-semantic-field"),
+  editEgoSemanticDescription: $("edit-ego-semantic-description"), editEgoBodyPart: $("edit-ego-body-part"),
+  editEgoObjectName: $("edit-ego-object-name"), editEgoObjectColor: $("edit-ego-object-color"),
+  editEgoSourceName: $("edit-ego-source-name"), editEgoTargetName: $("edit-ego-target-name"),
   saveEdit: $("save-edit"), currentTaskName: $("current-task-name"), currentTaskCode: $("current-task-code"),
   currentTaskPath: $("current-task-path"), currentTaskStatus: $("current-task-status"),
   openTaskCenter: $("open-task-center"), rescanTask: $("rescan-task"), taskCenter: $("task-center"),
@@ -125,7 +139,9 @@ const state = {
   pendingFlowJobCode: null,
   flowPollTimer: null,
   expandedFlowTaskKeys: new Set(),
-  timelineView: "effective"
+  timelineView: "effective",
+  selectedEgoStepCode: null,
+  lastEgoDraft: null,
 };
 
 const g1Viewer = new G1Viewer(els.motionCanvas, (status, error) => {
@@ -188,6 +204,7 @@ async function refreshNasStatus() {
 }
 
 async function refreshWorkspace({ preserveEpisode = true } = {}) {
+  const previousTaskId = state.currentTaskId;
   const payload = await window.episodeQc.getWorkspaceState(state.currentTaskId);
   state.workspace = payload.workspace;
   state.tasks = payload.tasks || [];
@@ -195,6 +212,7 @@ async function refreshWorkspace({ preserveEpisode = true } = {}) {
   state.currentTaskId = state.currentTask?.id || null;
   state.episodes = payload.episodes || [];
   state.labelSchema = payload.label_schema;
+  if (state.currentTaskId !== previousTaskId) clearEgoDraft();
   if (state.currentTaskId) window.localStorage.setItem("episodeQcActiveTaskId", state.currentTaskId);
   else window.localStorage.removeItem("episodeQcActiveTaskId");
   els.workspaceName.textContent = payload.workspace.name;
@@ -266,6 +284,10 @@ function bindEvents() {
   els.labelSearch.addEventListener("input", renderLabels);
   els.labelGroupFilter.addEventListener("change", renderLabels);
   els.saveOpenLabel.addEventListener("click", () => createOpenAnnotation());
+  els.saveEgoAnnotation.addEventListener("click", saveSelectedEgoAnnotation);
+  els.egoNewObject.addEventListener("click", () => applyEgoDraftShortcut("new_object"));
+  els.egoReuseObject.addEventListener("click", () => applyEgoDraftShortcut("same_object"));
+  els.editEgoStep.addEventListener("change", renderEditEgoFieldState);
   els.openLabelName.addEventListener("keydown", (event) => {
     if (event.key === "Enter") { event.preventDefault(); createOpenAnnotation(); }
   });
@@ -781,6 +803,7 @@ async function switchTask(taskId) {
   try {
     await savePlayhead();
     state.playing = false;
+    clearEgoDraft();
     state.currentTaskId = taskId;
     state.currentEpisodeId = null;
     await refreshWorkspace({ preserveEpisode: false });
@@ -1424,11 +1447,15 @@ function renderLabels() {
   const labels = state.labelSchema?.labels || [];
   const openMode = state.currentTask?.annotation_mode === "open"
     || state.labelSchema?.schema?.annotation_mode === "open";
+  const egoFixedMode = isEgoTask() && !openMode;
   els.openLabelEditor.hidden = !openMode;
   els.labelSearch.parentElement.hidden = openMode;
   els.labelHelp.textContent = openMode
-    ? "标签可现场创建；首次保存后会成为本任务建议项。人工标注，不使用机器初标"
-    : "简易模板只要求填写标签名称，其余字段均可省略";
+    ? "兼容历史开放任务；当前任务未绑定固定步骤模板，标注仍按原结构保存"
+    : egoFixedMode
+      ? "先选择固定步骤，再填写人工语义和结构化字段，最后保存本段标注"
+      : "简易模板只要求填写标签名称，其余字段均可省略";
+  renderEgoDraftControls();
   if (openMode) {
     renderOpenLabels(labels);
     return;
@@ -1470,8 +1497,9 @@ function renderLabels() {
     const relatedAnnotations = annotations.filter((annotation) => annotation.label_code === label.code);
     const annotationStatus = labelAnnotationStatus(relatedAnnotations);
     const focusOnly = !enabledForEpisode && relatedAnnotations.length > 0;
+    const selectedStep = egoFixedMode && state.selectedEgoStepCode === label.code;
     return `
-    <button class="label-button${enabledForEpisode ? "" : focusOnly ? " label-view-only" : " target-disabled"}" data-label-code="${escapeHtml(label.code)}" data-focus-only="${focusOnly}" style="--label-color:${escapeHtml(label.color || "#8c959f")}" title="${escapeHtml(focusOnly ? "当前范围不可新增；点击定位已有标注" : state.detail ? title : "请先选择 Episode")}" type="button"${enabledForEpisode || focusOnly ? "" : " disabled"}>
+    <button class="label-button${selectedStep ? " selected-step" : ""}${enabledForEpisode ? "" : focusOnly ? " label-view-only" : " target-disabled"}" data-label-code="${escapeHtml(label.code)}" data-focus-only="${focusOnly}" style="--label-color:${escapeHtml(label.color || "#8c959f")}" title="${escapeHtml(focusOnly ? "当前范围不可新增；点击定位已有标注" : state.detail ? title : "请先选择 Episode")}" aria-pressed="${selectedStep}" type="button"${enabledForEpisode || focusOnly ? "" : " disabled"}>
       <i class="label-color"></i>
       <span class="label-copy"><strong>${escapeHtml(label.name)}</strong><small>${escapeHtml(supported ? (groups.get(label.group) || label.group) : `仅支持：${targetHint}`)}</small></span>
       <span class="label-button-meta">${annotationStatus ? `<span class="label-annotation-status ${annotationStatus.tone}" data-focus-label="${escapeHtml(label.code)}" title="定位该标签的全部有效标注">${escapeHtml(annotationStatus.text)}</span>` : ""}${label.shortcut ? `<kbd>${escapeHtml(label.shortcut)}</kbd>` : ""}</span>
@@ -1518,7 +1546,128 @@ function renderTargetContext() {
     </div>`;
 }
 
-async function createAnnotation(labelCode) {
+function isOpenAnnotationMode() {
+  return state.currentTask?.annotation_mode === "open"
+    || state.labelSchema?.schema?.annotation_mode === "open";
+}
+
+function egoFieldElements() {
+  return {
+    semantic_description: els.egoSemanticDescription,
+    body_part: els.egoBodyPart,
+    object_name: els.egoObjectName,
+    object_color: els.egoObjectColor,
+    source_name: els.egoSourceName,
+    target_name: els.egoTargetName,
+    exception_type: els.egoExceptionType,
+    recovery_action: els.egoRecoveryAction,
+  };
+}
+
+function editEgoFieldElements() {
+  return {
+    semantic_description: els.editEgoSemanticDescription,
+    body_part: els.editEgoBodyPart,
+    object_name: els.editEgoObjectName,
+    object_color: els.editEgoObjectColor,
+    source_name: els.editEgoSourceName,
+    target_name: els.editEgoTargetName,
+  };
+}
+
+function clearEgoDraft() {
+  state.selectedEgoStepCode = null;
+  state.lastEgoDraft = null;
+  Object.values(egoFieldElements()).forEach((element) => { element.value = ""; });
+  renderEgoDraftControls();
+}
+
+function writeEgoDraft(draft) {
+  const labels = state.labelSchema?.labels || [];
+  if (!labels.some((label) => label.code === draft.labelCode)) {
+    toast("当前任务模板中不存在要复用的固定步骤", "error");
+    return false;
+  }
+  state.selectedEgoStepCode = draft.labelCode;
+  const fields = egoFieldElements();
+  Object.entries(draft.values || {}).forEach(([field, value]) => {
+    if (fields[field]) fields[field].value = value || "";
+  });
+  resetRangeSelection();
+  renderLabels();
+  return true;
+}
+
+function renderEgoDraftControls() {
+  const fixedMode = isEgoTask() && !isOpenAnnotationMode();
+  els.egoStepDraft.hidden = !fixedMode;
+  els.egoSemanticField.hidden = !fixedMode;
+  if (!fixedMode) return;
+  const label = (state.labelSchema?.labels || []).find(
+    (item) => item.code === state.selectedEgoStepCode,
+  );
+  if (!label && state.selectedEgoStepCode) state.selectedEgoStepCode = null;
+  els.egoSelectedStep.textContent = label
+    ? `${label.code} · ${label.name}`
+    : "请从下方选择步骤";
+  els.saveEgoAnnotation.disabled = !label || !state.detail;
+  els.saveEgoAnnotation.textContent = label ? `保存：${label.name}` : "保存本段标注";
+  const canReuse = Boolean(
+    state.lastEgoDraft && (!label || labelUsesEgoSemanticFields(label)),
+  );
+  els.egoNewObject.disabled = !canReuse;
+  els.egoReuseObject.disabled = !canReuse;
+  const semanticField = label?.fields?.find((field) => field.code === "semantic_description");
+  els.egoSemanticField.hidden = Boolean(label) && !semanticField;
+  els.egoSemanticDescription.required = Boolean(semanticField?.required);
+}
+
+function selectEgoStep(labelCode) {
+  const label = (state.labelSchema?.labels || []).find((item) => item.code === labelCode);
+  if (!label) return;
+  state.selectedEgoStepCode = label.code;
+  renderLabels();
+  if (labelUsesEgoSemanticFields(label)) {
+    els.egoSemanticDescription.focus();
+    toast(`已选择固定步骤：${label.name}；填写字段并选择区间后保存`, "success", 3500);
+  } else {
+    toast(`已选择标签：${label.name}；选择范围后保存`, "success", 3000);
+  }
+}
+
+function saveSelectedEgoAnnotation() {
+  if (!state.selectedEgoStepCode) return toast("请先选择固定步骤", "error");
+  return createAnnotation(
+    state.selectedEgoStepCode,
+    { saveSelectedEgoStep: true },
+  );
+}
+
+function applyEgoDraftShortcut(kind) {
+  if (!state.lastEgoDraft) return toast("还没有可复用的上一条标注", "error");
+  const selectedLabel = (state.labelSchema?.labels || []).find(
+    (label) => label.code === state.selectedEgoStepCode,
+  );
+  if (selectedLabel && !labelUsesEgoSemanticFields(selectedLabel)) {
+    return toast("当前选择的不是语义动作步骤，不能复用物品字段", "error");
+  }
+  const draft = kind === "new_object"
+    ? sameStepNewObjectDraft(state.lastEgoDraft)
+    : reuseSameObjectDraft(
+      state.lastEgoDraft,
+      state.selectedEgoStepCode || state.lastEgoDraft.labelCode,
+    );
+  if (!writeEgoDraft(draft)) return;
+  if (kind === "new_object") {
+    els.egoObjectName.focus();
+    toast("已保留步骤、执行部位和位置；请填写新物品及本段人工语义", "success", 4200);
+  } else {
+    els.egoSemanticDescription.focus();
+    toast("已沿用上一条物品属性；请核对当前步骤并填写本段人工语义", "success", 4200);
+  }
+}
+
+async function createAnnotation(labelCode, { saveSelectedEgoStep = false } = {}) {
   if (!state.detail) return toast("请先选择 Episode", "error");
   const label = state.labelSchema?.labels?.find((item) => item.code === labelCode);
   if (!label) return;
@@ -1526,6 +1675,10 @@ async function createAnnotation(labelCode) {
     els.openAnnotationType.value = label.annotation_type || label.group || "other";
     els.openLabelName.value = label.name;
     return createOpenAnnotation(label.code);
+  }
+  if (isEgoTask() && !saveSelectedEgoStep) {
+    selectEgoStep(label.code);
+    return;
   }
   let start = Math.round(state.playheadNs);
   let end = start;
@@ -1546,6 +1699,9 @@ async function createAnnotation(labelCode) {
   }
   const attributes = collectCustomFields(label, target);
   if (attributes === null) return;
+  const egoDraft = isEgoTask() && labelUsesEgoSemanticFields(label)
+    ? createEgoDraft(label.code, attributes)
+    : null;
   const payload = {
     episode_id: state.currentEpisodeId, label_code: label.code, scope: state.scope,
     start_offset_ns: start, end_offset_ns: end, target_type: target.targetType, target_key: target.targetKey,
@@ -1556,6 +1712,13 @@ async function createAnnotation(labelCode) {
   try {
     const saved = await window.episodeQc.saveAnnotation({ payload });
     state.detail.annotations.push(saved);
+    if (egoDraft) {
+      state.lastEgoDraft = egoDraft;
+      state.selectedEgoStepCode = label.code;
+      els.egoSemanticDescription.value = "";
+      els.egoExceptionType.value = "";
+      els.egoRecoveryAction.value = "";
+    }
     state.detail.episode.annotation_count = state.detail.annotations.length;
     updateEpisodeFromDetail();
     renderAnnotations();
@@ -1634,6 +1797,7 @@ async function createOpenAnnotation(labelSlug = "") {
 function collectCustomFields(label, target) {
   const attributes = {};
   const egoInputs = {
+    semantic_description: els.egoSemanticDescription,
     body_part: els.egoBodyPart,
     object_name: els.egoObjectName,
     object_color: els.egoObjectColor,
@@ -1731,7 +1895,13 @@ function renderAnnotations() {
     const badgeTitle = round.inherited
       ? `从历史质检结果继承，可修改或删除；首次 R${round.originRound}，最近 R${round.lastRound}`
       : `本轮 R${round.lastRound} 新增`;
-    return `<div class="annotation-item ${round.tone}" data-annotation-id="${escapeHtml(annotation.annotation_id)}"><i style="background:${escapeHtml(label.color || "#8c959f")}"></i><span><strong>${escapeHtml(label.name)}<em class="inherited-annotation-badge" title="${escapeHtml(badgeTitle)}">${escapeHtml(round.badge)}</em></strong><small>${escapeHtml(annotationTargetName(annotation))} · ${escapeHtml(severities.get(annotation.severity) || annotation.severity || "未分级")}</small></span><time>${annotationTiming(annotation)}</time></div>`;
+    const semanticDescription = String(annotation.attributes?.semantic_description || "").trim();
+    const details = [
+      semanticDescription,
+      annotationTargetName(annotation),
+      severities.get(annotation.severity) || annotation.severity || "未分级",
+    ].filter(Boolean).join(" · ");
+    return `<div class="annotation-item ${round.tone}" data-annotation-id="${escapeHtml(annotation.annotation_id)}"><i style="background:${escapeHtml(label.color || "#8c959f")}"></i><span><strong>${escapeHtml(label.name)}<em class="inherited-annotation-badge" title="${escapeHtml(badgeTitle)}">${escapeHtml(round.badge)}</em></strong><small title="${escapeHtml(details)}">${escapeHtml(details)}</small></span><time>${annotationTiming(annotation)}</time></div>`;
   }).join("");
   renderAnnotationLanes(annotations, labels);
   const summary = summarizeAnnotationChanges(
@@ -1868,6 +2038,28 @@ function openAnnotationEditor(annotationId) {
   fillSelect(els.editSeverity, state.labelSchema?.severity_levels || [], annotation.severity);
   fillSelect(els.editAction, state.labelSchema?.actions || [], annotation.action);
   els.editComment.value = annotation.comment || "";
+  const ego = isEgoTask();
+  const openMode = annotation.annotation_mode === "open" || isOpenAnnotationMode();
+  const annotationLabel = (state.labelSchema?.labels || []).find(
+    (label) => label.code === annotation.label_code,
+  );
+  const semanticAnnotation = ego && !openMode && labelUsesEgoSemanticFields(annotationLabel);
+  els.editEgoFields.hidden = !semanticAnnotation;
+  els.editEgoStepField.hidden = !semanticAnnotation;
+  els.editEgoSemanticField.hidden = !semanticAnnotation;
+  if (semanticAnnotation) {
+    const labels = (state.labelSchema?.labels || []).filter(
+      (label) => label.enabled !== false && labelUsesEgoSemanticFields(label),
+    );
+    els.editEgoStep.innerHTML = labels.map((label) => (
+      `<option value="${escapeHtml(label.code)}"${label.code === annotation.label_code ? " selected" : ""}>${escapeHtml(label.name)}</option>`
+    )).join("");
+    const fields = editEgoFieldElements();
+    Object.entries(fields).forEach(([field, element]) => {
+      element.value = String(annotation.attributes?.[field] || "");
+    });
+    renderEditEgoFieldState();
+  }
   const round = annotationRoundMeta(annotation);
   els.editProvenance.hidden = false;
   els.editProvenance.textContent = round.inherited
@@ -1877,6 +2069,16 @@ function openAnnotationEditor(annotationId) {
   els.annotationEditor.showModal();
 }
 
+function renderEditEgoFieldState() {
+  if (els.editEgoFields.hidden || isOpenAnnotationMode()) return;
+  const label = (state.labelSchema?.labels || []).find(
+    (item) => item.code === els.editEgoStep.value,
+  );
+  const semanticField = label?.fields?.find((field) => field.code === "semantic_description");
+  els.editEgoSemanticField.hidden = !semanticField;
+  els.editEgoSemanticDescription.required = Boolean(semanticField?.required);
+}
+
 function fillSelect(element, choices, selected) {
   element.innerHTML = choices.map((item) => `<option value="${escapeHtml(item.code)}" ${item.code === selected ? "selected" : ""}>${escapeHtml(item.name)}</option>`).join("");
 }
@@ -1884,14 +2086,36 @@ function fillSelect(element, choices, selected) {
 async function saveAnnotationEdit() {
   const annotation = state.detail?.annotations?.find((item) => item.annotation_id === els.editId.value);
   if (!annotation) return;
+  let labelCode = annotation.label_code;
+  let attributes = { ...(annotation.attributes || {}) };
+  if (isEgoTask() && !els.editEgoFields.hidden) {
+    if (annotation.annotation_mode !== "open" && !isOpenAnnotationMode()) {
+      labelCode = els.editEgoStep.value;
+    }
+    const label = (state.labelSchema?.labels || []).find((item) => item.code === labelCode);
+    const editableFields = editEgoFieldElements();
+    Object.entries(editableFields).forEach(([field, element]) => {
+      const value = element.value.trim();
+      if (value) attributes[field] = value;
+      else delete attributes[field];
+    });
+    for (const field of label?.fields || []) {
+      if (field.required && !attributes[field.code]) {
+        toast(`标签“${label.name}”需要填写：${field.name || field.code}`, "error");
+        return;
+      }
+    }
+  }
   const payload = {
     ...annotation,
     episode_id: annotation.episode_id,
+    label_code: labelCode,
     start_offset_ns: Math.round(Number(els.editStart.value) * 1e9),
     end_offset_ns: Math.round(Number(els.editEnd.value) * 1e9),
     severity: els.editSeverity.value,
     action: els.editAction.value,
     comment: els.editComment.value,
+    attributes,
     reviewer_name: els.reviewerName.value.trim()
   };
   setSaveState("saving", "保存中…");

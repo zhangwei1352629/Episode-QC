@@ -201,8 +201,17 @@
             <textarea id="annotation-comment" rows="1" placeholder="补充这次标注的说明…"></textarea>
           </label>
           <section class="ego-annotation-fields" id="ego-annotation-fields" hidden>
-            <div class="ego-fields-heading"><strong>Ego 动作信息</strong><span>人工填写，不使用机器初标</span></div>
+            <div class="ego-fields-heading"><strong>Ego 语义标注</strong><span>固定步骤＋人工描述＋结构化属性</span></div>
+            <div class="ego-step-draft" id="ego-step-draft" hidden>
+              <div class="ego-selected-step"><span>当前固定步骤</span><strong id="ego-selected-step">请从下方选择步骤</strong></div>
+              <div class="ego-draft-actions">
+                <button id="ego-new-object" class="button secondary" type="button" disabled>同一步骤，新物品</button>
+                <button id="ego-reuse-object" class="button secondary" type="button" disabled>沿用同一物品</button>
+                <button id="save-ego-annotation" class="button primary" type="button" disabled>保存本段标注</button>
+              </div>
+            </div>
             <div class="ego-fields-grid">
+              <label class="wide" id="ego-semantic-field"><span>人工语义描述</span><textarea id="ego-semantic-description" rows="2" maxlength="500" placeholder="如：使用左手从椅子上拿起黑色衣服，目标位置为洗衣机滚筒"></textarea></label>
               <label><span>执行部位</span><select id="ego-body-part"><option value="">请选择</option><option value="left_hand">左手</option><option value="right_hand">右手</option><option value="both_hands">双手</option><option value="whole_body">全身</option><option value="unknown">无法判断</option></select></label>
               <label><span>物品名称</span><input id="ego-object-name" placeholder="如：咖啡杯" /></label>
               <label><span>物品颜色</span><input id="ego-object-color" placeholder="如：红色" /></label>
@@ -312,6 +321,15 @@
           <label>起点（秒）<input id="edit-start" type="number" min="0" step="0.001" /></label>
           <label>终点（秒）<input id="edit-end" type="number" min="0" step="0.001" /></label>
         </div>
+        <section class="edit-ego-fields" id="edit-ego-fields" hidden>
+          <label class="wide" id="edit-ego-step-field">固定步骤<select id="edit-ego-step"></select></label>
+          <label class="wide" id="edit-ego-semantic-field">人工语义描述<textarea id="edit-ego-semantic-description" rows="2" maxlength="500"></textarea></label>
+          <label>执行部位<select id="edit-ego-body-part"><option value="">请选择</option><option value="left_hand">左手</option><option value="right_hand">右手</option><option value="both_hands">双手</option><option value="whole_body">全身</option><option value="unknown">无法判断</option></select></label>
+          <label>物品名称<input id="edit-ego-object-name" /></label>
+          <label>物品颜色<input id="edit-ego-object-color" /></label>
+          <label>起始位置<input id="edit-ego-source-name" /></label>
+          <label class="wide">目标位置<input id="edit-ego-target-name" /></label>
+        </section>
         <label>严重程度<select id="edit-severity"></select></label>
         <label>处理建议<select id="edit-action"></select></label>
         <label>备注<textarea id="edit-comment" rows="3"></textarea></label>

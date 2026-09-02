@@ -12,6 +12,7 @@ from episode_qc.playback import prepare_episode_cache, read_cached_motion_frame
 from episode_qc.workspace import (
     episode_detail,
     export_workspace,
+    import_label_schema,
     preview_label_schema,
     save_annotation,
     scan_data_source,
@@ -129,11 +130,18 @@ def test_packaged_ego_manual_label_schema_covers_actions_exceptions_and_pose(tmp
     labels = {item["code"]: item for item in preview["schema"]["labels"]}
     assert {"transport_object", "pick_object", "place_object", "arrange_object"} <= labels.keys()
     assert {field["code"] for field in labels["pick_object"]["fields"]} >= {
+        "semantic_description",
         "body_part",
         "object_name",
         "object_color",
         "target_name",
     }
+    semantic_field = next(
+        field
+        for field in labels["pick_object"]["fields"]
+        if field["code"] == "semantic_description"
+    )
+    assert semantic_field["required"] is True
     assert labels["unexpected_event"]["default_action"] == "keep_with_label"
     assert labels["pose_misaligned"]["target_types"] == ["mocap", "joint"]
 
@@ -182,6 +190,55 @@ def test_ego_uses_open_labels_without_a_label_library_and_exports_a_snapshot(tmp
     document = json.loads(Path(exported["output_file"]).read_text(encoding="utf-8"))
     assert document["annotations"][0]["annotation_mode"] == "open"
     assert document["annotations"][0]["label_name"] == "双手拿起红色咖啡杯"
+
+
+def test_ego_fixed_step_template_preserves_manual_semantics_and_structured_fields(tmp_path: Path):
+    root = tmp_path / "OmniEgo"
+    _write_actual_omniego_mcap(root / "laundry" / "laundry_001.mcap")
+    db_path = tmp_path / "workspace.db"
+    schema_path = (
+        Path(__file__).resolve().parents[1]
+        / "app"
+        / "renderer"
+        / "label-schema-ego-manual.yaml"
+    )
+    installed = import_label_schema(db_path, schema_path)
+    indexed = scan_data_source(
+        db_path,
+        root,
+        task_kind="ego_omniego",
+        annotation_mode="library",
+        label_set_id=installed["id"],
+    )
+
+    saved = save_annotation(
+        db_path,
+        {
+            "episode_id": indexed["episodes"][0]["id"],
+            "label_code": "pick_object",
+            "scope": "time_range",
+            "start_offset_ns": 0,
+            "end_offset_ns": 20_000_000,
+            "target_type": "global",
+            "severity": "normal",
+            "action": "keep",
+            "attributes": {
+                "semantic_description": "使用左手从椅子上拿起黑色衣服",
+                "body_part": "left_hand",
+                "object_name": "黑色衣服",
+                "object_color": "黑色",
+                "source_name": "椅子",
+                "target_name": "洗衣机滚筒",
+            },
+        },
+    )
+
+    assert saved["annotation_mode"] == "library"
+    assert saved["label_code"] == "pick_object"
+    assert saved["label_schema_version"] == "1.1.0"
+    assert saved["attributes"]["semantic_description"] == "使用左手从椅子上拿起黑色衣服"
+    assert saved["attributes"]["body_part"] == "left_hand"
+    assert saved["attributes"]["object_name"] == "黑色衣服"
 
 
 def _write_omniego_mcap(path: Path) -> None:

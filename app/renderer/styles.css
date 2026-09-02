@@ -308,10 +308,20 @@ body.episodes-collapsed .episode-sidebar, body.labels-collapsed .label-sidebar {
 .ego-fields-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; margin-bottom: 6px; }
 .ego-fields-heading strong { font-size: 10px; }
 .ego-fields-heading span { color: var(--muted); font-size: 8px; }
+.ego-step-draft { display: grid; gap: 6px; margin-bottom: 7px; padding: 6px; border: 1px solid rgba(207,244,90,.26); border-radius: 6px; background: rgba(207,244,90,.045); }
+.ego-step-draft[hidden] { display: none; }
+.ego-selected-step { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-width: 0; }
+.ego-selected-step span { color: var(--muted); font-size: 8px; }
+.ego-selected-step strong { min-width: 0; color: #e7f5bd; font-size: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ego-draft-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px; }
+.ego-draft-actions .button { min-width: 0; min-height: 29px; padding: 4px 7px; font-size: 8.5px; }
+.ego-draft-actions #save-ego-annotation { grid-column: 1 / -1; font-size: 9.5px; }
 .ego-fields-grid { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 5px; }
 .ego-fields-grid label { display: grid; gap: 2px; color: var(--muted); font-size: 8px; }
 .ego-fields-grid label.wide { grid-column: 1 / -1; }
-.ego-fields-grid input, .ego-fields-grid select { min-width: 0; height: 27px; padding: 0 6px; border: 1px solid var(--line); border-radius: 5px; background: var(--surface-strong); color: var(--text); font: inherit; }
+.ego-fields-grid input, .ego-fields-grid select, .ego-fields-grid textarea { min-width: 0; padding: 0 6px; border: 1px solid var(--line); border-radius: 5px; background: var(--surface-strong); color: var(--text); font: inherit; }
+.ego-fields-grid input, .ego-fields-grid select { height: 27px; }
+.ego-fields-grid textarea { min-height: 46px; padding-top: 6px; padding-bottom: 6px; resize: vertical; line-height: 1.35; }
 .ego-fields-grid select { width: 100%; padding-right: 26px; color-scheme: dark; }
 .ego-fields-grid select option { color: #eef3f6; background-color: #10151a; }
 .ego-fields-grid select option:checked { color: #f8ffdc; background-color: #314116; }
@@ -321,6 +331,7 @@ body.episodes-collapsed .episode-sidebar, body.labels-collapsed .label-sidebar {
 .label-list > .empty-panel { grid-column: 1 / -1; }
 .label-button { width: 100%; min-width: 0; min-height: 44px; height: auto; align-self: start; display: grid; grid-template-columns: 4px minmax(0, 1fr) auto; align-items: center; gap: 6px; text-align: left; border: 1px solid var(--line-soft); background: linear-gradient(145deg, #171d23, #14191f); border-radius: 7px; padding: 5px 6px 5px 5px; cursor: pointer; }
 .label-button:hover { border-color: var(--label-color, var(--accent)); transform: translateY(-1px); box-shadow: 0 4px 12px rgba(0,0,0,.18); }
+.label-button.selected-step { border-color: var(--label-color, var(--accent)); background: color-mix(in srgb, var(--label-color, var(--accent)) 11%, #14191f); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--label-color, var(--accent)) 28%, transparent); }
 .label-button.target-disabled { opacity: .38; cursor: not-allowed; filter: grayscale(.5); }
 .label-button.target-disabled:hover { border-color: var(--line-soft); transform: none; box-shadow: none; }
 .label-button.label-view-only { border-color: color-mix(in srgb, var(--label-color) 42%, var(--line-soft)); }
@@ -422,6 +433,11 @@ dialog::backdrop { background: rgba(0,0,0,.66); }
 .dialog-heading button { border: 0; background: transparent; font-size: 20px; }
 .edit-times { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }
 #annotation-edit-form label { display: grid; gap: 5px; font-size: 10px; color: var(--muted); }
+.edit-ego-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; padding: 9px; border: 1px solid rgba(207,244,90,.22); border-radius: 7px; background: rgba(207,244,90,.035); }
+.edit-ego-fields[hidden] { display: none; }
+.edit-ego-fields label.wide { grid-column: 1 / -1; }
+.edit-ego-fields input, .edit-ego-fields select, .edit-ego-fields textarea { width: 100%; min-width: 0; }
+.edit-ego-fields textarea { resize: vertical; }
 .dialog-actions { display: grid; grid-template-columns: auto 1fr auto auto; gap: 8px; }
 .dialog-actions button { height: 32px; border: 1px solid var(--line); background: var(--panel-3); border-radius: 6px; padding: 0 12px; }
 .dialog-actions .danger { color: #ff9b9c; border-color: #743b3e; }

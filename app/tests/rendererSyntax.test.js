@@ -125,6 +125,32 @@ test("Ego 身体部位表单在标签面板内滚动且不覆盖下方区域", (
   assert.match(css, /\.ego-fields-grid select option\s*\{[^}]*color:\s*#eef3f6;[^}]*background-color:\s*#10151a/s);
 });
 
+test("Ego 固定步骤先选择后保存，并支持人工语义和两种安全复用", () => {
+  const html = fs.readFileSync(path.resolve(__dirname, "../renderer/index.html"), "utf8");
+  const renderer = fs.readFileSync(path.resolve(__dirname, "../renderer/renderer.js"), "utf8");
+
+  assert.match(html, /id="ego-selected-step"/);
+  assert.match(html, /id="ego-semantic-description"/);
+  assert.match(html, /id="ego-new-object"/);
+  assert.match(html, /id="ego-reuse-object"/);
+  assert.match(html, /id="save-ego-annotation"/);
+  assert.match(renderer, /if \(isEgoTask\(\) && !saveSelectedEgoStep\) \{\s*selectEgoStep\(label\.code\);\s*return;/s);
+  assert.match(renderer, /semantic_description: els\.egoSemanticDescription/);
+  assert.match(renderer, /sameStepNewObjectDraft/);
+  assert.match(renderer, /reuseSameObjectDraft/);
+});
+
+test("Ego 质检编辑器可以修正固定步骤、人工语义和结构化属性", () => {
+  const html = fs.readFileSync(path.resolve(__dirname, "../renderer/index.html"), "utf8");
+  const renderer = fs.readFileSync(path.resolve(__dirname, "../renderer/renderer.js"), "utf8");
+
+  assert.match(html, /id="edit-ego-step"/);
+  assert.match(html, /id="edit-ego-semantic-description"/);
+  assert.match(renderer, /function renderEditEgoFieldState\(\)/);
+  assert.match(renderer, /label_code: labelCode/);
+  assert.match(renderer, /attributes,/);
+});
+
 test("标签库菜单和本地任务历史管理入口完整", () => {
   const html = fs.readFileSync(path.resolve(__dirname, "../renderer/index.html"), "utf8");
   const renderer = fs.readFileSync(path.resolve(__dirname, "../renderer/renderer.js"), "utf8");

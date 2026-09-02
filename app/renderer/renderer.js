@@ -19,6 +19,8 @@ import {
   beginRangeSelection,
   completeRangeSelection,
   frameGridForCameras,
+  framePositionForTime,
+  frameRangeForInterval,
   isTimelineDrag,
   singleFrameRange,
   snapTimeToFrame,
@@ -37,7 +39,7 @@ const els = {
   episodeSearch: $("episode-search"), statusFilter: $("status-filter"), episodeList: $("episode-list"),
   currentEpisode: $("current-episode"), episodeMeta: $("episode-meta"), previousEpisode: $("previous-episode"),
   nextEpisode: $("next-episode"), togglePlay: $("toggle-play"), playbackRate: $("playback-rate"),
-  currentTime: $("current-time"), durationTime: $("duration-time"), cacheStatus: $("cache-status"),
+  currentTime: $("current-time"), durationTime: $("duration-time"), framePosition: $("frame-position"), cacheStatus: $("cache-status"),
   motionCard: $("motion-card"), motionCanvas: $("motion-canvas"), motionEmpty: $("motion-empty"), jointLabelLayer: $("joint-label-layer"),
   motionViewerTitle: $("motion-viewer-title"), motionViewerBadge: $("motion-viewer-badge"), motionHint: $("motion-hint"),
   motionControlsToggle: $("motion-controls-toggle"), motionControlPanel: $("motion-control-panel"),
@@ -1050,6 +1052,9 @@ async function openEpisode(episodeId) {
     syncInteractiveState();
     renderCameras();
     renderMotionAvailability();
+    renderClock();
+    renderSelection();
+    renderAnnotations();
     const cacheMessage = cache.complete
       ? (cache.reused ? "完整播放缓存已复用" : "完整播放缓存已就绪")
       : "默认相机与 Policy 已就绪 · 其余流后台缓存中…";
@@ -1267,7 +1272,9 @@ async function requestVisualFrames(force = false) {
         image.dataset.frameIndex = String(frame.frameIndex);
       }
       card.classList.add("ready");
-      card.querySelector(".camera-time").textContent = `${formatClock(frame.frameOffsetNs)} · ${formatSkew(frame.skewNs)}`;
+      const totalFrames = Number(camera.frame_offsets_ns?.length || camera.message_count || 0);
+      const frameText = totalFrames ? `F${frame.frameIndex + 1}/${totalFrames}` : `F${frame.frameIndex + 1}`;
+      card.querySelector(".camera-time").textContent = `${formatClock(frame.frameOffsetNs)} · ${frameText} · ${formatSkew(frame.skewNs)}`;
     });
     const motionRequest = state.cache.motion?.available
       ? window.episodeQc.getMotionFrame({ episodeId: playbackEpisodeId, timeNs }).then((frame) => {
@@ -1347,6 +1354,15 @@ function seekTo(timeNs) {
 function renderClock() {
   els.currentTime.textContent = formatClock(state.playheadNs);
   els.durationTime.textContent = formatClock(state.durationNs);
+  const grid = selectionFrameGrid();
+  const frame = framePositionForTime(state.playheadNs, state.durationNs, grid);
+  if (frame) {
+    els.framePosition.textContent = `${frame.exact ? "" : "约"}第 ${frame.number} / ${frame.total} 帧`;
+    els.framePosition.title = `${grid.displayName || "参考相机"} · ${frame.exact ? "按真实帧时间戳定位" : "按平均帧间隔估算"}`;
+  } else {
+    els.framePosition.textContent = "帧 -- / --";
+    els.framePosition.title = "播放缓存就绪后显示帧号";
+  }
   els.timelineRange.value = state.durationNs ? String(Math.round((state.playheadNs / state.durationNs) * 1_000_000)) : "0";
 }
 
@@ -1391,9 +1407,17 @@ function resetRangeSelection() {
 }
 
 function renderSelection() {
-  if (state.selectionStartNs === null) els.selectionLabel.textContent = "未选择区间";
-  else if (state.selectionEndNs === null) els.selectionLabel.textContent = `${formatClock(state.selectionStartNs)} → 等待终点`;
-  else els.selectionLabel.textContent = `${formatClock(state.selectionStartNs)} → ${formatClock(state.selectionEndNs)}`;
+  const grid = selectionFrameGrid();
+  if (state.selectionStartNs === null) {
+    els.selectionLabel.textContent = "未选择区间";
+  } else if (state.selectionEndNs === null) {
+    const frame = framePositionForTime(state.selectionStartNs, state.durationNs, grid);
+    els.selectionLabel.textContent = `${formatClock(state.selectionStartNs)}${frame ? ` · ${frame.exact ? "" : "≈"}F${frame.number}` : ""} → 等待终点`;
+  } else {
+    const durationText = formatSeconds(state.selectionEndNs - state.selectionStartNs);
+    const frameText = formatFrameRange(frameRangeForInterval(state.selectionStartNs, state.selectionEndNs, grid));
+    els.selectionLabel.textContent = `${formatClock(state.selectionStartNs)} → ${formatClock(state.selectionEndNs)} · ${durationText}${frameText ? ` · ${frameText}` : ""}`;
+  }
 }
 
 function renderLabels() {
@@ -1680,7 +1704,9 @@ function selectAnnotationTarget(targetType, targetKey = null) {
   syncJointSelectionUi();
   syncCameraSelectionUi();
   renderTargetContext();
-  renderLabels();
+  renderClock();
+  renderSelection();
+  renderAnnotations();
   drawMotion();
 }
 
@@ -1755,9 +1781,20 @@ function renderAnnotationLanes(annotations, labels) {
 }
 
 function annotationTiming(annotation) {
-  if (annotation.scope === "episode") return "整条";
-  if (annotation.scope === "time_point") return formatClock(annotation.start_offset_ns);
-  return `${formatClock(annotation.start_offset_ns)}–${formatClock(annotation.end_offset_ns)}`;
+  const grid = frameGridForCameras(
+    state.cache?.cameras || [],
+    annotation.target_type === "camera" ? annotation.target_key : state.selectedCameraId,
+  );
+  if (annotation.scope === "episode") {
+    const total = Number(grid.frameCount || 0);
+    return `整条 · ${formatSeconds(state.durationNs)}${total ? ` · ${grid.exact ? "" : "约"}${total}帧` : ""}`;
+  }
+  if (annotation.scope === "time_point") {
+    const frame = framePositionForTime(annotation.start_offset_ns, state.durationNs, grid);
+    return `${formatClock(annotation.start_offset_ns)}${frame ? ` · ${frame.exact ? "" : "≈"}F${frame.number}` : ""}`;
+  }
+  const frameText = formatFrameRange(frameRangeForInterval(annotation.start_offset_ns, annotation.end_offset_ns, grid));
+  return `${formatClock(annotation.start_offset_ns)}–${formatClock(annotation.end_offset_ns)} · ${formatSeconds(Number(annotation.end_offset_ns) - Number(annotation.start_offset_ns))}${frameText ? ` · ${frameText}` : ""}`;
 }
 
 function currentReviewRound(episode = state.detail?.episode) {
@@ -2509,6 +2546,14 @@ function formatClock(ns) {
   const milliseconds = Math.max(0, Number(ns) || 0) / 1e6;
   const minutes = Math.floor(milliseconds / 60000); const seconds = Math.floor(milliseconds / 1000) % 60; const millis = Math.floor(milliseconds % 1000);
   return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}.${String(millis).padStart(3, "0")}`;
+}
+function formatSeconds(ns) { return `${(Math.max(0, Number(ns) || 0) / 1e9).toFixed(3)}s`; }
+function formatFrameRange(range) {
+  if (!range) return "";
+  if (!range.count) return `${range.exact ? "" : "约"}0帧`;
+  const prefix = range.exact ? "" : "≈";
+  const frames = range.startNumber === range.endNumber ? `F${range.startNumber}` : `F${range.startNumber}–F${range.endNumber}`;
+  return `${prefix}${frames}（${range.count}帧）`;
 }
 function formatDuration(seconds) { const value = Math.max(0, Number(seconds) || 0); return `${Math.floor(value / 60)}:${String(Math.floor(value % 60)).padStart(2, "0")}`; }
 function formatBytes(bytes) {

@@ -186,6 +186,19 @@ test("时间轴结果筛选向辅助技术回报当前选中状态", () => {
   assert.match(renderer, /item\.setAttribute\("aria-pressed", String\(item === button\)\)/);
 });
 
+test("播放位置和标注区间同时显示时间、秒数与真实帧号", () => {
+  const html = fs.readFileSync(path.resolve(__dirname, "../renderer/index.html"), "utf8");
+  const renderer = fs.readFileSync(path.resolve(__dirname, "../renderer/renderer.js"), "utf8");
+
+  assert.match(html, /id="current-time"/);
+  assert.match(html, /id="duration-time"/);
+  assert.match(html, /id="frame-position"/);
+  assert.match(renderer, /framePositionForTime/);
+  assert.match(renderer, /frameRangeForInterval/);
+  assert.match(renderer, /formatSeconds\(state\.selectionEndNs - state\.selectionStartNs\)/);
+  assert.match(renderer, /frame\.frameIndex \+ 1/);
+});
+
 test("空 Episode 仍提供可拖拽选区且保存后清空已消费区间", () => {
   const renderer = fs.readFileSync(path.resolve(__dirname, "../renderer/renderer.js"), "utf8");
 

@@ -168,7 +168,9 @@ body.episodes-collapsed .episode-sidebar, body.labels-collapsed .label-sidebar {
 .icon-button, .play-button { width: 32px; height: 32px; }
 .play-button { background: var(--accent); color: #12150b; border-color: var(--accent); border-radius: 50%; }
 .playback-controls select { width: 68px; height: 30px; font-size: 11px; }
-.clock { font-variant-numeric: tabular-nums; font-size: 11px; min-width: 130px; }
+.playback-readout { min-width: 142px; display: grid; gap: 2px; font-variant-numeric: tabular-nums; }
+.clock { font-size: 11px; white-space: nowrap; }
+.frame-position { color: var(--accent); font-size: 9px; white-space: nowrap; }
 .cache-status { justify-self: end; font-size: 10px; color: var(--muted); }
 .cache-status.busy { color: var(--warning); }
 .cache-status.ready { color: #70c98b; }
@@ -223,7 +225,7 @@ body.episodes-collapsed .episode-sidebar, body.labels-collapsed .label-sidebar {
 .timeline-panel { border-top: 1px solid var(--line); background: #0d1217; padding: 8px 11px; overflow-y: auto; overscroll-behavior: contain; }
 .timeline-heading { display: flex; align-items: center; justify-content: space-between; font-size: 10px; margin-bottom: 8px; }
 .timeline-heading strong { margin-right: 9px; }
-#selection-label { color: var(--accent); }
+#selection-label { color: var(--accent); font-variant-numeric: tabular-nums; }
 .timeline-actions { display: flex; align-items: center; gap: 6px; color: var(--muted); }
 .timeline-actions button { height: 24px; padding: 0 8px; font-size: 9px; }
 .timeline-actions label { display: flex; align-items: center; font-size: 9px; }
@@ -356,7 +358,7 @@ body.episodes-collapsed .episode-sidebar, body.labels-collapsed .label-sidebar {
 .annotation-item span { min-width: 0; }
 .annotation-item strong { display: block; font-size: 10px; line-height: 1.35; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .annotation-item small { display: block; margin-top: 2px; color: var(--muted); font-size: 8.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.annotation-item time { align-self: start; margin-top: 2px; padding: 2px 5px; border-radius: 8px; color: #c9d581; background: rgba(207,244,90,.07); font-size: 8.5px; font-variant-numeric: tabular-nums; }
+.annotation-item time { align-self: start; max-width: 190px; margin-top: 2px; padding: 2px 5px; border-radius: 8px; color: #c9d581; background: rgba(207,244,90,.07); font-size: 8.5px; line-height: 1.35; text-align: right; font-variant-numeric: tabular-nums; }
 .decision-section { padding-top: 9px; padding-bottom: 9px; background: rgba(11,15,19,.9); }
 .decision-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 8px; }
 .decision-heading strong { display: block; margin-top: 2px; font-size: 11px; }
@@ -511,7 +513,8 @@ dialog::backdrop { background: rgba(0,0,0,.66); }
   .save-state { min-width: 52px; }
   .viewer-grid { grid-template-columns: minmax(210px, .75fr) minmax(300px, 1.45fr); }
   .playback-toolbar { grid-template-columns: minmax(120px, 1fr) auto minmax(90px, 1fr); }
-  .clock { min-width: 112px; font-size: 10px; }
+  .playback-readout { min-width: 124px; }
+  .clock { font-size: 10px; }
   .panel-toggle b { display: none; }
 }
 

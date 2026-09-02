@@ -1050,10 +1050,11 @@ def _parent_indices(names: list[str]) -> list[int]:
 
 
 def public_cache_manifest(manifest: dict[str, object]) -> dict[str, object]:
-    cameras = [
-        {key: value for key, value in camera.items() if key != "index"}
-        for camera in manifest.get("cameras", [])
-    ]
+    cameras = []
+    for camera in manifest.get("cameras", []):
+        public_camera = {key: value for key, value in camera.items() if key != "index"}
+        public_camera["frame_offsets_ns"] = [int(entry[0]) for entry in camera.get("index", [])]
+        cameras.append(public_camera)
     motion = {key: value for key, value in (manifest.get("motion") or {}).items() if key != "index"}
     robot_actions = dict(manifest.get("robot_actions") or {})
     robot_actions["sources"] = [

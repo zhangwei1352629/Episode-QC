@@ -130,19 +130,27 @@ def _annotations_for_flow_submission(
         end_offset_ns = int(annotation.get("end_offset_ns") or 0)
         if start_offset_ns <= flow_duration_ns and end_offset_ns <= flow_duration_ns:
             continue
-        is_local_whole_episode = (
-            annotation.get("scope") == "episode"
+        scope = annotation.get("scope")
+        is_safe_episode_scope_alignment = (
+            scope == "episode"
             and start_offset_ns == 0
             and local_duration_ns > 0
-            and end_offset_ns == local_duration_ns
-            and flow_duration_ns < local_duration_ns
+            and flow_duration_ns < end_offset_ns <= local_duration_ns
         )
-        if is_local_whole_episode:
+        is_safe_local_tail_alignment = (
+            scope == "time_range"
+            and local_duration_ns > 0
+            and start_offset_ns <= flow_duration_ns
+            and end_offset_ns == local_duration_ns
+            and flow_duration_ns < end_offset_ns
+        )
+        if is_safe_episode_scope_alignment or is_safe_local_tail_alignment:
             annotation["end_offset_ns"] = flow_duration_ns
             LOGGER.info(
-                "Aligned full-episode annotation %s for %s from local duration %dns to Flow duration %dns",
+                "Aligned full-episode annotation %s for %s from stored end %dns (local duration %dns) to Flow duration %dns",
                 annotation.get("annotation_id") or annotation.get("id") or "",
                 episode_id,
+                end_offset_ns,
                 local_duration_ns,
                 flow_duration_ns,
             )
@@ -725,20 +733,35 @@ class EpisodeQcWebApplication:
     def _heartbeat_platform_claims_once(self) -> None:
         with self._platform_lock:
             client = self._flow_client
-            job_codes = sorted(self._platform_owned_jobs)
+            job_codes = sorted(
+                self._platform_owned_jobs - self._platform_result_jobs
+            )
         if client is None:
             return
         for job_code in job_codes:
-            try:
-                client.heartbeat(job_code)
-            except FlowClientError as exc:
-                with self._platform_lock:
-                    self._platform_ownership_errors[job_code] = str(exc)
-                    if exc.status_code in {403, 409}:
-                        self._platform_owned_jobs.discard(job_code)
+            operation_lock = self._platform_claim_lock(job_code)
+            if not operation_lock.acquire(blocking=False):
                 continue
-            with self._platform_lock:
-                self._platform_ownership_errors.pop(job_code, None)
+            try:
+                with self._platform_lock:
+                    if (
+                        client is not self._flow_client
+                        or job_code not in self._platform_owned_jobs
+                        or job_code in self._platform_result_jobs
+                    ):
+                        continue
+                try:
+                    client.heartbeat(job_code)
+                except FlowClientError as exc:
+                    with self._platform_lock:
+                        self._platform_ownership_errors[job_code] = str(exc)
+                        if exc.status_code in {403, 409}:
+                            self._platform_owned_jobs.discard(job_code)
+                    continue
+                with self._platform_lock:
+                    self._platform_ownership_errors.pop(job_code, None)
+            finally:
+                operation_lock.release()
 
     def _run_platform_claim_heartbeats(self) -> None:
         while not self._platform_heartbeat_stop.wait(
@@ -826,6 +849,7 @@ class EpisodeQcWebApplication:
                 if job_code in self._platform_result_jobs:
                     continue
                 self._platform_result_jobs.add(job_code)
+                self._platform_ownership_errors.pop(job_code, None)
             self._platform_executor.submit(
                 self._reconcile_platform_result,
                 job_code,
@@ -833,32 +857,33 @@ class EpisodeQcWebApplication:
             )
 
     def _reconcile_platform_result(self, job_code: str, source: str) -> None:
-        try:
-            result = self._submit_platform_job_once(job_code)
-        except Exception as exc:
+        with self._platform_claim_lock(job_code):
             try:
-                self._quality_cache_manager().record_result_sync_error(
+                result = self._submit_platform_job_once(job_code)
+            except Exception as exc:
+                try:
+                    self._quality_cache_manager().record_result_sync_error(
+                        job_code,
+                        str(exc),
+                    )
+                except Exception:
+                    LOGGER.exception("failed to record QC result patrol error job=%s", job_code)
+                LOGGER.warning(
+                    "QC result patrol failed source=%s job=%s: %s",
+                    source,
                     job_code,
-                    str(exc),
+                    exc,
                 )
-            except Exception:
-                LOGGER.exception("failed to record QC result patrol error job=%s", job_code)
-            LOGGER.warning(
-                "QC result patrol failed source=%s job=%s: %s",
-                source,
-                job_code,
-                exc,
-            )
-        else:
-            LOGGER.info(
-                "QC result patrol synced source=%s job=%s flow_status=%s",
-                source,
-                job_code,
-                (result.get("job") or {}).get("status"),
-            )
-        finally:
-            with self._platform_lock:
-                self._platform_result_jobs.discard(job_code)
+            else:
+                LOGGER.info(
+                    "QC result patrol synced source=%s job=%s flow_status=%s",
+                    source,
+                    job_code,
+                    (result.get("job") or {}).get("status"),
+                )
+            finally:
+                with self._platform_lock:
+                    self._platform_result_jobs.discard(job_code)
 
     def _sync_platform_review_progress(self, job_code: str) -> dict[str, object] | None:
         with self._platform_lock:
@@ -932,10 +957,18 @@ class EpisodeQcWebApplication:
             return
 
         def sync() -> None:
+            operation_lock = self._platform_claim_lock(job_code)
+            if not operation_lock.acquire(blocking=False):
+                return
             try:
+                with self._platform_lock:
+                    if job_code in self._platform_result_jobs:
+                        return
                 self._sync_platform_review_progress(job_code)
             except Exception as exc:
                 LOGGER.warning("Flow QC progress sync failed for %s: %s", job_code, exc)
+            finally:
+                operation_lock.release()
 
         self._platform_progress_executor.submit(sync)
 
@@ -1056,15 +1089,22 @@ class EpisodeQcWebApplication:
         }
 
     def submit_platform_job(self, job_code: str) -> dict[str, object]:
+        operation_lock = self._platform_claim_lock(job_code)
         with self._platform_lock:
-            if job_code in self._platform_result_jobs:
-                raise ValueError("质检结果正在自动同步，请稍后刷新")
             self._platform_result_jobs.add(job_code)
-        try:
-            return self._submit_platform_job_once(job_code)
-        finally:
+            self._platform_ownership_errors.pop(job_code, None)
+        with operation_lock:
+            # A background reconciliation may have completed while this
+            # manual request waited. Re-submit idempotently instead of
+            # returning a misleading HTTP 400 to the reviewer.
             with self._platform_lock:
-                self._platform_result_jobs.discard(job_code)
+                self._platform_result_jobs.add(job_code)
+                self._platform_ownership_errors.pop(job_code, None)
+            try:
+                return self._submit_platform_job_once(job_code)
+            finally:
+                with self._platform_lock:
+                    self._platform_result_jobs.discard(job_code)
 
     def _submit_platform_job_once(self, job_code: str) -> dict[str, object]:
         self._assert_flow_enabled()

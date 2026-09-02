@@ -184,6 +184,135 @@ def test_web_application_renews_only_owned_unfinished_platform_jobs(tmp_path: Pa
         assert server.application._platform_ownership_errors == {}
 
 
+def test_web_application_skips_heartbeat_while_result_is_syncing(tmp_path: Path):
+    class FakeFlowClient:
+        def __init__(self):
+            self.heartbeats = []
+
+        def heartbeat(self, job_code):
+            self.heartbeats.append(job_code)
+            return {"code": job_code}
+
+    with running_server(tmp_path) as (server, _base_url):
+        client = FakeFlowClient()
+        server.application._flow_client = client
+        server.application._platform_owned_jobs.update(
+            {"QCJ-ACTIVE", "QCJ-SUBMITTING"}
+        )
+        server.application._platform_result_jobs.add("QCJ-SUBMITTING")
+
+        server.application._heartbeat_platform_claims_once()
+
+        assert client.heartbeats == ["QCJ-ACTIVE"]
+
+
+def test_platform_submit_waits_for_an_inflight_heartbeat(tmp_path: Path, monkeypatch):
+    heartbeat_started = threading.Event()
+    release_heartbeat = threading.Event()
+    submit_started = threading.Event()
+    submitted = []
+
+    class FakeFlowClient:
+        def heartbeat(self, job_code):
+            assert job_code == "QCJ-RACE"
+            heartbeat_started.set()
+            assert release_heartbeat.wait(timeout=2)
+            return {"code": job_code}
+
+    with running_server(tmp_path) as (server, _base_url):
+        server.application._flow_client = FakeFlowClient()
+        server.application._platform_owned_jobs.add("QCJ-RACE")
+
+        def submit_once(job_code):
+            submit_started.set()
+            submitted.append(job_code)
+            return {"job": {"status": "completed"}}
+
+        monkeypatch.setattr(
+            server.application,
+            "_submit_platform_job_once",
+            submit_once,
+        )
+        heartbeat_thread = threading.Thread(
+            target=server.application._heartbeat_platform_claims_once
+        )
+        heartbeat_thread.start()
+        assert heartbeat_started.wait(timeout=1)
+
+        submit_thread = threading.Thread(
+            target=server.application.submit_platform_job,
+            args=("QCJ-RACE",),
+        )
+        submit_thread.start()
+        assert not submit_started.wait(timeout=0.05)
+
+        release_heartbeat.set()
+        heartbeat_thread.join(timeout=2)
+        submit_thread.join(timeout=2)
+
+        assert submitted == ["QCJ-RACE"]
+        assert not heartbeat_thread.is_alive()
+        assert not submit_thread.is_alive()
+
+
+def test_platform_submit_waits_for_existing_result_sync_instead_of_failing(
+    tmp_path: Path,
+    monkeypatch,
+):
+    automatic_sync_started = threading.Event()
+    release_automatic_sync = threading.Event()
+    manual_submit_started = threading.Event()
+    manual_results = []
+    manual_errors = []
+
+    with running_server(tmp_path) as (server, _base_url):
+        job_code = "QCJ-AUTO-SYNC"
+        operation_lock = server.application._platform_claim_lock(job_code)
+        server.application._platform_result_jobs.add(job_code)
+
+        def automatic_sync():
+            with operation_lock:
+                automatic_sync_started.set()
+                assert release_automatic_sync.wait(timeout=2)
+                with server.application._platform_lock:
+                    server.application._platform_result_jobs.discard(job_code)
+
+        def submit_once(value):
+            manual_submit_started.set()
+            return {"job": {"code": value, "status": "completed"}}
+
+        monkeypatch.setattr(
+            server.application,
+            "_submit_platform_job_once",
+            submit_once,
+        )
+        automatic_thread = threading.Thread(target=automatic_sync)
+        automatic_thread.start()
+        assert automatic_sync_started.wait(timeout=1)
+
+        def manual_submit():
+            try:
+                manual_results.append(server.application.submit_platform_job(job_code))
+            except Exception as exc:  # pragma: no cover - asserted below
+                manual_errors.append(exc)
+
+        manual_thread = threading.Thread(target=manual_submit)
+        manual_thread.start()
+        assert not manual_submit_started.wait(timeout=0.05)
+
+        release_automatic_sync.set()
+        automatic_thread.join(timeout=2)
+        manual_thread.join(timeout=2)
+
+        assert manual_errors == []
+        assert manual_results == [
+            {"job": {"code": job_code, "status": "completed"}}
+        ]
+        assert job_code not in server.application._platform_result_jobs
+        assert not automatic_thread.is_alive()
+        assert not manual_thread.is_alive()
+
+
 def test_web_application_stops_heartbeats_after_flow_reports_lost_ownership(tmp_path: Path):
     class FakeFlowClient:
         def heartbeat(self, _job_code):

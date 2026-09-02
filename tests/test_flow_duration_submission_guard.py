@@ -123,7 +123,59 @@ def test_submit_clamps_only_full_episode_annotation_to_flow_duration(
     assert annotation["end_offset_ns"] == LOCAL_DURATION_NS
 
 
-def test_submit_rejects_true_annotation_overrun_instead_of_silently_clamping(
+def test_submit_clamps_episode_scope_created_before_local_duration_refresh(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    previous_local_duration_ns = LOCAL_DURATION_NS - 25_000_000
+    annotation = {
+        "annotation_id": "ann-full-episode-before-rescan",
+        "label_code": "task_incomplete",
+        "scope": "episode",
+        "start_offset_ns": 0,
+        "end_offset_ns": previous_local_duration_ns,
+        "target_type": "global",
+    }
+    application, cache = _application_for_submission(
+        tmp_path,
+        monkeypatch,
+        flow_duration_seconds="30.156",
+        annotation=annotation,
+    )
+
+    application._submit_platform_job_once("QCJ-DURATION-GUARD")
+
+    submitted = cache.submissions[0][0]["annotations"][0]
+    assert submitted["end_offset_ns"] == FLOW_DURATION_NS
+    assert annotation["end_offset_ns"] == previous_local_duration_ns
+
+
+def test_submit_rejects_corrupt_episode_scope_beyond_local_duration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    annotation = {
+        "annotation_id": "ann-corrupt-full-episode",
+        "label_code": "task_incomplete",
+        "scope": "episode",
+        "start_offset_ns": 0,
+        "end_offset_ns": LOCAL_DURATION_NS + 1,
+        "target_type": "global",
+    }
+    application, cache = _application_for_submission(
+        tmp_path,
+        monkeypatch,
+        flow_duration_seconds="30.156",
+        annotation=annotation,
+    )
+
+    with pytest.raises(ValueError, match="真实越界"):
+        application._submit_platform_job_once("QCJ-DURATION-GUARD")
+
+    assert cache.submissions == []
+
+
+def test_submit_clamps_time_range_that_ends_exactly_at_local_episode_tail(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -134,6 +186,58 @@ def test_submit_rejects_true_annotation_overrun_instead_of_silently_clamping(
         "start_offset_ns": 10_000_000_000,
         "end_offset_ns": LOCAL_DURATION_NS,
         "target_type": "camera",
+    }
+    application, cache = _application_for_submission(
+        tmp_path,
+        monkeypatch,
+        flow_duration_seconds=30.156,
+        annotation=annotation,
+    )
+
+    application._submit_platform_job_once("QCJ-DURATION-GUARD")
+
+    submitted = cache.submissions[0][0]["annotations"][0]
+    assert submitted["start_offset_ns"] == 10_000_000_000
+    assert submitted["end_offset_ns"] == FLOW_DURATION_NS
+    assert annotation["end_offset_ns"] == LOCAL_DURATION_NS
+
+
+def test_submit_rejects_true_time_range_overrun_before_local_episode_tail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    annotation = {
+        "annotation_id": "ann-time-range-overrun",
+        "label_code": "camera_blocked",
+        "scope": "time_range",
+        "start_offset_ns": 10_000_000_000,
+        "end_offset_ns": LOCAL_DURATION_NS - 10_000_000,
+        "target_type": "camera",
+    }
+    application, cache = _application_for_submission(
+        tmp_path,
+        monkeypatch,
+        flow_duration_seconds=30.156,
+        annotation=annotation,
+    )
+
+    with pytest.raises(ValueError, match="真实越界"):
+        application._submit_platform_job_once("QCJ-DURATION-GUARD")
+
+    assert cache.submissions == []
+
+
+def test_submit_rejects_time_point_beyond_flow_duration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    annotation = {
+        "annotation_id": "ann-time-point-overrun",
+        "label_code": "close_door_success",
+        "scope": "time_point",
+        "start_offset_ns": LOCAL_DURATION_NS,
+        "end_offset_ns": LOCAL_DURATION_NS,
+        "target_type": "mocap",
     }
     application, cache = _application_for_submission(
         tmp_path,

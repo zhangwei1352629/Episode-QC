@@ -1660,10 +1660,10 @@ function applyEgoDraftShortcut(kind) {
   if (!writeEgoDraft(draft)) return;
   if (kind === "new_object") {
     els.egoObjectName.focus();
-    toast("已保留步骤、执行部位和位置；请填写新物品及本段人工语义", "success", 4200);
+    toast("已继承上一条描述、步骤、执行部位和位置；请填写新物品并按本段修改描述", "success", 4600);
   } else {
     els.egoSemanticDescription.focus();
-    toast("已沿用上一条物品属性；请核对当前步骤并填写本段人工语义", "success", 4200);
+    toast("已继承上一条描述和物品属性；请核对当前步骤并按本段修改描述", "success", 4600);
   }
 }
 

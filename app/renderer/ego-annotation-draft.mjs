@@ -22,7 +22,6 @@ export function createEgoDraft(labelCode, values = {}) {
 
 export function sameStepNewObjectDraft(previous) {
   const draft = createEgoDraft(previous?.labelCode, previous?.values);
-  draft.values.semantic_description = "";
   draft.values.object_name = "";
   draft.values.object_color = "";
   draft.values.exception_type = "";
@@ -32,7 +31,6 @@ export function sameStepNewObjectDraft(previous) {
 
 export function reuseSameObjectDraft(previous, labelCode = "") {
   const draft = createEgoDraft(labelCode || previous?.labelCode, previous?.values);
-  draft.values.semantic_description = "";
   draft.values.exception_type = "";
   draft.values.recovery_action = "";
   return draft;

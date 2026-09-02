@@ -1,7 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
-test("同一步骤新物品保留步骤、手和位置，但清空物品、人工语义及单条异常", async () => {
+test("同一步骤新物品继承人工语义、步骤、手和位置，但清空物品及单条异常", async () => {
   const { sameStepNewObjectDraft } = await import("../renderer/ego-annotation-draft.mjs");
   const draft = sameStepNewObjectDraft({
     labelCode: "transfer_clothing",
@@ -23,12 +23,12 @@ test("同一步骤新物品保留步骤、手和位置，但清空物品、人�
   assert.equal(draft.values.target_name, "洗衣机滚筒");
   assert.equal(draft.values.object_name, "");
   assert.equal(draft.values.object_color, "");
-  assert.equal(draft.values.semantic_description, "");
+  assert.equal(draft.values.semantic_description, "左手把黑色上衣从椅子放入洗衣机");
   assert.equal(draft.values.exception_type, "");
   assert.equal(draft.values.recovery_action, "");
 });
 
-test("沿用同一物品可以切换固定步骤，并且不复用人工语义和单条异常", async () => {
+test("沿用同一物品可以切换固定步骤，并继承人工语义但不复用单条异常", async () => {
   const { reuseSameObjectDraft } = await import("../renderer/ego-annotation-draft.mjs");
   const draft = reuseSameObjectDraft({
     labelCode: "pick_clothing",
@@ -48,7 +48,7 @@ test("沿用同一物品可以切换固定步骤，并且不复用人工语义�
   assert.equal(draft.values.object_name, "黑色上衣");
   assert.equal(draft.values.object_color, "黑色");
   assert.equal(draft.values.body_part, "left_hand");
-  assert.equal(draft.values.semantic_description, "");
+  assert.equal(draft.values.semantic_description, "左手拿起黑色上衣");
   assert.equal(draft.values.exception_type, "");
   assert.equal(draft.values.recovery_action, "");
 });

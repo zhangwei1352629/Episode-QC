@@ -60,3 +60,55 @@ test("只有声明人工语义字段的固定动作标签进入语义复用流�
   assert.equal(labelUsesEgoSemanticFields({ fields: [{ code: "body_part" }] }), false);
   assert.equal(labelUsesEgoSemanticFields({ fields: [{ code: "camera_issue" }] }), false);
 });
+
+test("沿用来源是任务顺序中的上一条 Episode，而不是筛选列表或上一个标签", async () => {
+  const {
+    egoDraftForLabel,
+    previousEpisodeForCurrent,
+  } = await import("../renderer/ego-annotation-draft.mjs");
+  const episodes = [
+    { id: "ep-001", episode_name: "EP0001" },
+    { id: "ep-002", episode_name: "EP0002" },
+    { id: "ep-003", episode_name: "EP0003" },
+  ];
+  const previous = previousEpisodeForCurrent(episodes, "ep-003");
+  assert.equal(previous.id, "ep-002");
+
+  const draft = egoDraftForLabel([
+    {
+      label_code: "phase_pick_clothes",
+      start_offset_ns: 10,
+      attributes: {
+        semantic_description: "左手从椅子拿起黑色衣服",
+        body_part: "left_hand",
+        object_name: "黑色衣服",
+      },
+    },
+    {
+      label_code: "phase_open_washer_door",
+      start_offset_ns: 20,
+      attributes: {
+        semantic_description: "右手打开洗衣机门",
+        body_part: "right_hand",
+        object_name: "洗衣机门",
+      },
+    },
+  ], "phase_pick_clothes");
+
+  assert.equal(draft.labelCode, "phase_pick_clothes");
+  assert.equal(draft.values.semantic_description, "左手从椅子拿起黑色衣服");
+  assert.equal(draft.values.body_part, "left_hand");
+  assert.equal(draft.values.object_name, "黑色衣服");
+});
+
+test("上一条 Episode 没有当前步骤描述时不回退到其他标签", async () => {
+  const { egoDraftForLabel } = await import("../renderer/ego-annotation-draft.mjs");
+  const draft = egoDraftForLabel([
+    {
+      label_code: "phase_open_washer_door",
+      attributes: { semantic_description: "右手打开洗衣机门" },
+    },
+  ], "phase_pick_clothes");
+
+  assert.equal(draft, null);
+});

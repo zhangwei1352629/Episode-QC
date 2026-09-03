@@ -40,3 +40,24 @@ export function labelUsesEgoSemanticFields(label) {
   const fields = new Set((label?.fields || []).map((field) => field?.code));
   return fields.has("semantic_description");
 }
+
+export function previousEpisodeForCurrent(episodes = [], currentEpisodeId = "") {
+  const index = episodes.findIndex((episode) => episode?.id === currentEpisodeId);
+  return index > 0 ? episodes[index - 1] : null;
+}
+
+export function egoDraftForLabel(annotations = [], labelCode = "") {
+  const normalizedLabelCode = String(labelCode || "");
+  if (!normalizedLabelCode) return null;
+  for (let index = annotations.length - 1; index >= 0; index -= 1) {
+    const annotation = annotations[index];
+    const annotationLabelCode = String(
+      annotation?.label_code || annotation?.label_slug || "",
+    );
+    if (annotationLabelCode !== normalizedLabelCode) continue;
+    const values = annotation?.attributes || {};
+    if (!String(values.semantic_description || "").trim()) continue;
+    return createEgoDraft(normalizedLabelCode, values);
+  }
+  return null;
+}

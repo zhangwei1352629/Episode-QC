@@ -27,7 +27,9 @@ import {
 } from "./range-selection.mjs";
 import {
   createEgoDraft,
+  egoDraftForLabel,
   labelUsesEgoSemanticFields,
+  previousEpisodeForCurrent,
   reuseSameObjectDraft,
   sameStepNewObjectDraft,
 } from "./ego-annotation-draft.mjs";
@@ -141,7 +143,9 @@ const state = {
   expandedFlowTaskKeys: new Set(),
   timelineView: "effective",
   selectedEgoStepCode: null,
-  lastEgoDraft: null,
+  previousEgoDetail: null,
+  previousEgoDetailEpisodeId: null,
+  previousEgoDetailTaskId: null,
 };
 
 const g1Viewer = new G1Viewer(els.motionCanvas, (status, error) => {
@@ -1044,6 +1048,9 @@ async function openEpisode(episodeId) {
   state.detail = null;
   state.playbackEpisodeId = null;
   state.currentEpisodeId = episodeId;
+  state.previousEgoDetail = null;
+  state.previousEgoDetailEpisodeId = null;
+  state.previousEgoDetailTaskId = null;
   window.episodeQc.updateWorkspaceSettings({ lastEpisodeId: episodeId, taskId: state.currentTaskId }).catch(() => {});
   state.selectionStartNs = null;
   state.selectionEndNs = null;
@@ -1577,7 +1584,9 @@ function editEgoFieldElements() {
 
 function clearEgoDraft() {
   state.selectedEgoStepCode = null;
-  state.lastEgoDraft = null;
+  state.previousEgoDetail = null;
+  state.previousEgoDetailEpisodeId = null;
+  state.previousEgoDetailTaskId = null;
   Object.values(egoFieldElements()).forEach((element) => { element.value = ""; });
   renderEgoDraftControls();
 }
@@ -1612,11 +1621,20 @@ function renderEgoDraftControls() {
     : "请从下方选择步骤";
   els.saveEgoAnnotation.disabled = !label || !state.detail;
   els.saveEgoAnnotation.textContent = label ? `保存：${label.name}` : "保存本段标注";
+  const previousEpisode = previousEpisodeForCurrent(
+    state.episodes,
+    state.currentEpisodeId,
+  );
   const canReuse = Boolean(
-    state.lastEgoDraft && (!label || labelUsesEgoSemanticFields(label)),
+    previousEpisode && label && labelUsesEgoSemanticFields(label),
   );
   els.egoNewObject.disabled = !canReuse;
   els.egoReuseObject.disabled = !canReuse;
+  const reuseTitle = previousEpisode
+    ? `从上一条数据 ${previousEpisode.episode_name || previousEpisode.relative_path || previousEpisode.id} 的同一步骤继承描述`
+    : "当前是第一条数据，没有可继承的上一条 Episode";
+  els.egoNewObject.title = reuseTitle;
+  els.egoReuseObject.title = reuseTitle;
   const semanticField = label?.fields?.find((field) => field.code === "semantic_description");
   els.egoSemanticField.hidden = Boolean(label) && !semanticField;
   els.egoSemanticDescription.required = Boolean(semanticField?.required);
@@ -1643,27 +1661,75 @@ function saveSelectedEgoAnnotation() {
   );
 }
 
-function applyEgoDraftShortcut(kind) {
-  if (!state.lastEgoDraft) return toast("还没有可复用的上一条标注", "error");
+async function previousEpisodeEgoDraft(labelCode) {
+  const currentEpisodeId = state.currentEpisodeId;
+  const currentTaskId = state.currentTaskId;
+  const previousEpisode = previousEpisodeForCurrent(
+    state.episodes,
+    currentEpisodeId,
+  );
+  if (!previousEpisode) return { previousEpisode: null, draft: null };
+  if (
+    state.previousEgoDetailEpisodeId !== previousEpisode.id
+    || state.previousEgoDetailTaskId !== currentTaskId
+  ) {
+    const detail = await window.episodeQc.getEpisode(previousEpisode.id);
+    if (
+      state.currentEpisodeId !== currentEpisodeId
+      || state.currentTaskId !== currentTaskId
+    ) return { previousEpisode, draft: null, stale: true };
+    state.previousEgoDetail = detail;
+    state.previousEgoDetailEpisodeId = previousEpisode.id;
+    state.previousEgoDetailTaskId = currentTaskId;
+  }
+  return {
+    previousEpisode,
+    draft: egoDraftForLabel(
+      state.previousEgoDetail?.annotations || [],
+      labelCode,
+    ),
+  };
+}
+
+async function applyEgoDraftShortcut(kind) {
   const selectedLabel = (state.labelSchema?.labels || []).find(
     (label) => label.code === state.selectedEgoStepCode,
   );
-  if (selectedLabel && !labelUsesEgoSemanticFields(selectedLabel)) {
-    return toast("当前选择的不是语义动作步骤，不能复用物品字段", "error");
+  if (!selectedLabel || !labelUsesEgoSemanticFields(selectedLabel)) {
+    return toast("请先选择要继承的语义动作步骤", "error");
+  }
+  let source;
+  try {
+    source = await previousEpisodeEgoDraft(selectedLabel.code);
+  } catch (error) {
+    return toast(`读取上一条数据失败：${error.message || error}`, "error", 6500);
+  }
+  if (source.stale) return;
+  if (!source.previousEpisode) {
+    return toast("当前是第一条数据，没有可继承的上一条 Episode", "error");
+  }
+  if (!source.draft) {
+    const previousName = source.previousEpisode.episode_name
+      || source.previousEpisode.relative_path
+      || source.previousEpisode.id;
+    return toast(`上一条数据 ${previousName} 没有“${selectedLabel.name}”的标注描述`, "error", 5200);
   }
   const draft = kind === "new_object"
-    ? sameStepNewObjectDraft(state.lastEgoDraft)
+    ? sameStepNewObjectDraft(source.draft)
     : reuseSameObjectDraft(
-      state.lastEgoDraft,
-      state.selectedEgoStepCode || state.lastEgoDraft.labelCode,
+      source.draft,
+      selectedLabel.code,
     );
   if (!writeEgoDraft(draft)) return;
+  const previousName = source.previousEpisode.episode_name
+    || source.previousEpisode.relative_path
+    || source.previousEpisode.id;
   if (kind === "new_object") {
     els.egoObjectName.focus();
-    toast("已继承上一条描述、步骤、执行部位和位置；请填写新物品并按本段修改描述", "success", 4600);
+    toast(`已从上一条数据 ${previousName} 继承同一步骤描述；请填写新物品并按本段修改`, "success", 4800);
   } else {
     els.egoSemanticDescription.focus();
-    toast("已继承上一条描述和物品属性；请核对当前步骤并按本段修改描述", "success", 4600);
+    toast(`已从上一条数据 ${previousName} 继承同一步骤描述和物品属性；请核对后修改`, "success", 4800);
   }
 }
 
@@ -1713,7 +1779,6 @@ async function createAnnotation(labelCode, { saveSelectedEgoStep = false } = {})
     const saved = await window.episodeQc.saveAnnotation({ payload });
     state.detail.annotations.push(saved);
     if (egoDraft) {
-      state.lastEgoDraft = egoDraft;
       state.selectedEgoStepCode = label.code;
       els.egoSemanticDescription.value = "";
       els.egoExceptionType.value = "";

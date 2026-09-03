@@ -125,7 +125,7 @@ test("Ego 身体部位表单在标签面板内滚动且不覆盖下方区域", (
   assert.match(css, /\.ego-fields-grid select option\s*\{[^}]*color:\s*#eef3f6;[^}]*background-color:\s*#10151a/s);
 });
 
-test("Ego 固定步骤先选择后保存，并支持人工语义和两种安全复用", () => {
+test("Ego 固定步骤先选择后保存，并从上一条 Episode 的同一步骤安全复用", () => {
   const html = fs.readFileSync(path.resolve(__dirname, "../renderer/index.html"), "utf8");
   const renderer = fs.readFileSync(path.resolve(__dirname, "../renderer/renderer.js"), "utf8");
 
@@ -138,6 +138,9 @@ test("Ego 固定步骤先选择后保存，并支持人工语义和两种安全�
   assert.match(renderer, /semantic_description: els\.egoSemanticDescription/);
   assert.match(renderer, /sameStepNewObjectDraft/);
   assert.match(renderer, /reuseSameObjectDraft/);
+  assert.match(renderer, /previousEpisodeForCurrent/);
+  assert.match(renderer, /egoDraftForLabel/);
+  assert.match(renderer, /await window\.episodeQc\.getEpisode\(previousEpisode\.id\)/);
 });
 
 test("Ego 质检编辑器可以修正固定步骤、人工语义和结构化属性", () => {

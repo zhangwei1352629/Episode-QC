@@ -1331,10 +1331,11 @@ class EpisodeQcWebApplication:
         return {"enabled": True, "connected": True, **connection, "jobs": jobs}
 
     def _local_task_for_job(self, job_code: str) -> dict[str, object] | None:
+        tasks = self._write_workspace(lambda: list_qc_tasks(self.paths.db_path))
         return next(
             (
                 task
-                for task in list_qc_tasks(self.paths.db_path)
+                for task in tasks
                 if task.get("flow_job_code") == job_code
             ),
             None,

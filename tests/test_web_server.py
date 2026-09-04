@@ -378,6 +378,31 @@ def test_sqlite_lock_retry_retries_only_locked_operations(monkeypatch):
         )
 
 
+def test_local_platform_task_lookup_retries_transient_sqlite_lock(
+    tmp_path: Path, monkeypatch
+):
+    attempts = []
+    delays = []
+
+    def list_tasks(_db_path):
+        attempts.append(True)
+        if len(attempts) == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return [{"id": "task-local", "flow_job_code": "QCJ-LOCKED"}]
+
+    with running_server(tmp_path) as (server, _base_url):
+        monkeypatch.setattr(web_server, "list_qc_tasks", list_tasks)
+        monkeypatch.setattr(web_server.time, "sleep", delays.append)
+
+        assert server.application._local_task_for_job("QCJ-LOCKED") == {
+            "id": "task-local",
+            "flow_job_code": "QCJ-LOCKED",
+        }
+
+    assert len(attempts) == 2
+    assert delays == [web_server.SQLITE_LOCK_RETRY_DELAYS_SECONDS[0]]
+
+
 def test_result_reconciliation_schedules_only_locally_completed_unsynced_jobs(
     tmp_path: Path,
     monkeypatch,

@@ -1713,8 +1713,8 @@ def _refresh_task_status(
         """
         SELECT COUNT(*) AS total,
                SUM(CASE WHEN import_status = 'ready' THEN 1 ELSE 0 END) AS ready,
-               SUM(CASE WHEN import_status != 'ready' THEN 1 ELSE 0 END) AS errors,
                SUM(CASE WHEN review_status IN ('completed', 'reviewed') THEN 1 ELSE 0 END) AS completed,
+               SUM(CASE WHEN quality_decision IS NOT NULL AND quality_decision != '' THEN 1 ELSE 0 END) AS decided,
                SUM(CASE WHEN review_status IN ('in_progress', 'needs_recheck') THEN 1 ELSE 0 END) AS active
         FROM episode e
         JOIN data_source ds ON ds.id = e.data_source_id
@@ -1724,13 +1724,15 @@ def _refresh_task_status(
     ).fetchone()
     total = int(counts["total"] or 0)
     ready = int(counts["ready"] or 0)
-    errors = int(counts["errors"] or 0)
     completed = int(counts["completed"] or 0)
+    decided = int(counts["decided"] or 0)
     active = int(counts["active"] or 0)
-    if total == 0 or ready == 0:
+    if total == 0:
         status = "failed"
-    elif completed == total and errors == 0:
+    elif completed == total and decided == total:
         status = "completed"
+    elif ready == 0:
+        status = "failed"
     elif active or completed:
         status = "in_progress"
     else:

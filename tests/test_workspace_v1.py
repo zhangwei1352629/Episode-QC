@@ -1035,6 +1035,46 @@ def test_v1_bad_episode_does_not_block_valid_episode(tmp_path: Path):
     assert "EndOfFile" in errors[0]["import_error"] or "magic" in errors[0]["import_error"].lower()
 
 
+def test_v1_explicitly_rejected_import_failure_allows_task_completion(tmp_path: Path):
+    root = tmp_path / "dataset"
+    _write_sample_episode(root / "episode_000001")
+    broken = root / "episode_000002"
+    broken.mkdir(parents=True)
+    (broken / "episode.mcap").write_bytes(b"not an mcap")
+    db_path = tmp_path / "workspace.db"
+
+    scanned = scan_data_source(db_path, root)
+    ready_episode = next(
+        item for item in scanned["episodes"] if item["import_status"] == "ready"
+    )
+    failed_episode = next(
+        item for item in scanned["episodes"] if item["import_status"] == "failed"
+    )
+
+    update_episode_review(
+        db_path,
+        ready_episode["id"],
+        review_status="completed",
+        quality_decision="pass",
+    )
+    incomplete_task = list_qc_tasks(db_path)[0]
+    assert incomplete_task["status"] == "in_progress"
+    assert incomplete_task["review_completed_at"] is None
+
+    update_episode_review(
+        db_path,
+        failed_episode["id"],
+        review_status="completed",
+        quality_decision="reject",
+    )
+    completed_task = list_qc_tasks(db_path)[0]
+
+    assert completed_task["error_count"] == 1
+    assert completed_task["completed_count"] == 2
+    assert completed_task["status"] == "completed"
+    assert completed_task["review_completed_at"]
+
+
 def test_v1_rescan_skips_unchanged_ready_episode(tmp_path: Path):
     root = tmp_path / "dataset"
     _write_sample_episode(root / "episode_000001")

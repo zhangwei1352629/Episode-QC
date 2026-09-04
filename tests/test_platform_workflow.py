@@ -891,6 +891,45 @@ class FakeFlowClient:
         return {**self.job, "status": "completed", "submitted": values}
 
 
+def test_cache_job_merges_state_only_flow_response_into_claimed_detail(tmp_path: Path):
+    asset_root = tmp_path / "nas" / "AST-STATE-ONLY"
+    episode_root = asset_root / "episodes" / "episode_000001"
+    episode_root.mkdir(parents=True)
+    primary = episode_root / "motion.bvh"
+    primary.write_bytes(b"state-only-flow-response")
+    job = {
+        "code": "QCJ-STATE-ONLY",
+        "asset_id": "AST-STATE-ONLY",
+        "source_uri": str(asset_root),
+        "label_schema": {"schema_version": "1", "labels": []},
+        "episodes": [
+            {
+                "episode_id": "AST-STATE-ONLY-EP0001",
+                "relative_path": "episodes/episode_000001",
+                "primary_file": "motion.bvh",
+                "checksum_sha256": hashlib.sha256(primary.read_bytes()).hexdigest(),
+            }
+        ],
+    }
+    publish_asset_manifest(asset_root, job, ["episodes/episode_000001/motion.bvh"])
+
+    class StateOnlyFlowClient(FakeFlowClient):
+        def report_cache(self, job_code, **values):
+            assert job_code == self.job["code"]
+            self.cache_reports.append(values)
+            return {"code": job_code, **values}
+
+    cached = QualityCacheManager(tmp_path / "cache", reserve_bytes=0).cache_job(
+        StateOnlyFlowClient(job),
+        job,
+    )
+
+    assert cached["job"]["status"] == "cache_ready"
+    assert cached["job"]["label_schema"] == job["label_schema"]
+    assert cached["job"]["episodes"] == job["episodes"]
+    assert cached["job"]["asset_manifest"] == job["asset_manifest"]
+
+
 def test_cache_job_materializes_flow_manifest_for_ego_without_writing_source(
     tmp_path: Path,
 ):

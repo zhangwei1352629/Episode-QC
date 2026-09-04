@@ -728,7 +728,11 @@ class QualityCacheManager:
             },
         )
         return {
-            "job": response or claimed,
+            # Flow deliberately returns only mutable state from the frequent
+            # cache endpoint. Preserve the immutable detail fetched at claim
+            # time and overlay the latest state instead of discarding labels,
+            # Episodes and the asset manifest.
+            "job": {**claimed, **(response or {})},
             "cache_dir": str(ready_root),
             "primary_files": [str(ready_root / item["path"]) for item in primary_files],
             "total_bytes": total_bytes,

@@ -43,6 +43,7 @@ from episode_qc.workspace import (
     save_annotation,
     scan_data_source,
     sync_flow_previous_reviews,
+    sync_flow_task_label_schema,
     undo_annotation_change,
     update_episode_review,
     update_workspace_settings,
@@ -162,6 +163,147 @@ def test_flow_label_schema_installs_exact_snapshot_and_accepts_its_label(tmp_pat
     assert installed["label_set_id"] == "task-quality"
     assert installed["active"] is True
     assert annotation["label_code"] == "body_sway"
+
+
+def _trash_bin_label_schema(version: str, code: str) -> dict[str, object]:
+    return {
+        "schema": {
+            "schema_type": "annotation_label_schema",
+            "schema_version": version,
+            "label_set_id": "ego_340d6877910ea72f7313f7666f3ab027",
+            "label_set_name": "冰箱与垃圾桶",
+            "language": "zh-CN",
+        },
+        "severity_levels": [{"code": "normal", "name": "一般", "order": 1}],
+        "actions": [{"code": "keep", "name": "保留"}],
+        "groups": [{"code": "phase", "name": "固定步骤", "order": 1}],
+        "labels": [
+            {
+                "code": code,
+                "name": "踩踏板打开垃圾桶盖",
+                "group": "phase",
+                "enabled": True,
+                "annotation_scopes": ["time_range"],
+                "target_types": ["global"],
+                "default_severity": "normal",
+                "default_action": "keep",
+                "fields": [
+                    {"code": "description", "name": "描述", "type": "text", "required": True}
+                ],
+            }
+        ],
+    }
+
+
+def _flow_job_for_schema(code: str, schema: dict[str, object]) -> dict[str, object]:
+    return {
+        "code": code,
+        "annotation_mode": "library",
+        "label_set_id": schema["schema"]["label_set_id"],
+        "label_schema_version": schema["schema"]["schema_version"],
+        "label_schema_hash": canonical_json_sha256(schema),
+        "label_schema": schema,
+    }
+
+
+def test_flow_task_label_schema_migrates_reviewed_code_without_losing_annotation(
+    tmp_path: Path,
+):
+    root = tmp_path / "cached-flow"
+    _write_sample_episode(root / "episode_000001")
+    db_path = tmp_path / "workspace.db"
+    old_schema = _trash_bin_label_schema("2.0.0", "phase_open_trash_bin")
+    old_job = _flow_job_for_schema("QCJ-LABEL-MIGRATION", old_schema)
+    old_label_set = install_flow_label_schema(db_path, old_job)
+    scanned = scan_data_source(
+        db_path,
+        root,
+        task_code=old_job["code"],
+        origin="flow",
+        flow_job_code=old_job["code"],
+        label_set_id=str(old_label_set["id"]),
+        task_metadata={"flow_job": old_job},
+    )
+    episode_id = str(scanned["episodes"][0]["id"])
+    saved = save_annotation(
+        db_path,
+        {
+            "episode_id": episode_id,
+            "label_code": "phase_open_trash_bin",
+            "scope": "time_range",
+            "start_offset_ns": 100,
+            "end_offset_ns": 200,
+            "target_type": "global",
+            "comment": "左脚踩下垃圾桶踏板",
+            "attributes": {"description": "使用左脚踩踏板打开垃圾桶盖"},
+        },
+    )
+    new_schema = _trash_bin_label_schema("2.0.2", "phase_step_trash_bin_pedal")
+    new_job = _flow_job_for_schema(old_job["code"], new_schema)
+
+    result = sync_flow_task_label_schema(db_path, new_job)
+
+    migrated = episode_detail(db_path, episode_id)["annotations"][0]
+    task = list_qc_tasks(db_path)[0]
+    assert result["changed"] is True
+    assert result["replacements"] == {
+        "phase_open_trash_bin->phase_step_trash_bin_pedal": 1
+    }
+    assert migrated["annotation_id"] == saved["annotation_id"]
+    assert migrated["label_code"] == "phase_step_trash_bin_pedal"
+    assert migrated["label_schema_version"] == "2.0.2"
+    assert migrated["start_offset_ns"] == 100
+    assert migrated["end_offset_ns"] == 200
+    assert migrated["comment"] == "左脚踩下垃圾桶踏板"
+    assert migrated["attributes"] == {"description": "使用左脚踩踏板打开垃圾桶盖"}
+    assert task["local_label_schema_version"] == "2.0.2"
+    assert task["metadata"]["flow_job"]["label_schema_hash"] == new_job[
+        "label_schema_hash"
+    ]
+
+
+def test_flow_task_label_schema_unknown_replacement_rolls_back_task_and_annotations(
+    tmp_path: Path,
+):
+    root = tmp_path / "cached-flow"
+    _write_sample_episode(root / "episode_000001")
+    db_path = tmp_path / "workspace.db"
+    old_schema = _trash_bin_label_schema("2.0.0", "phase_unknown_old")
+    old_job = _flow_job_for_schema("QCJ-UNKNOWN-MIGRATION", old_schema)
+    old_label_set = install_flow_label_schema(db_path, old_job)
+    scanned = scan_data_source(
+        db_path,
+        root,
+        task_code=old_job["code"],
+        origin="flow",
+        flow_job_code=old_job["code"],
+        label_set_id=str(old_label_set["id"]),
+    )
+    episode_id = str(scanned["episodes"][0]["id"])
+    saved = save_annotation(
+        db_path,
+        {
+            "episode_id": episode_id,
+            "label_code": "phase_unknown_old",
+            "scope": "time_range",
+            "start_offset_ns": 100,
+            "end_offset_ns": 200,
+            "target_type": "global",
+            "attributes": {"description": "未知旧动作"},
+        },
+    )
+    new_schema = _trash_bin_label_schema("2.0.3", "phase_unknown_new")
+    new_job = _flow_job_for_schema(old_job["code"], new_schema)
+
+    with pytest.raises(ValueError, match="没有已确认的迁移规则"):
+        sync_flow_task_label_schema(db_path, new_job)
+
+    annotation = episode_detail(db_path, episode_id)["annotations"][0]
+    task = list_qc_tasks(db_path)[0]
+    assert annotation["annotation_id"] == saved["annotation_id"]
+    assert annotation["label_code"] == "phase_unknown_old"
+    assert annotation["label_schema_version"] == "2.0.0"
+    assert task["local_label_schema_version"] == "2.0.0"
 
 
 def test_flow_label_schema_rejects_different_local_schema_at_same_version(tmp_path: Path):

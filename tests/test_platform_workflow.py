@@ -2248,6 +2248,66 @@ def test_partial_label_reference_is_rejected_before_result_publication(
     assert client.results == []
 
 
+def test_stale_label_code_is_rejected_before_any_result_file_or_nas_publication(
+    tmp_path: Path, monkeypatch
+):
+    cache = QualityCacheManager(tmp_path / "qc-cache", reserve_bytes=0)
+    job = {
+        "code": "QCJ-STALE-LABEL",
+        "asset_id": "AST-STALE-LABEL",
+        "label_set_id": "task-quality",
+        "label_schema_version": "1.0.0",
+        "label_schema_hash": canonical_json_sha256(FLOW_SCHEMA),
+        "label_schema": FLOW_SCHEMA,
+        "episodes": [{"episode_id": "AST-STALE-LABEL-EP0001"}],
+    }
+    state_path = tmp_path / "qc-cache" / "ready" / job["code"] / ".qc-cache.json"
+    QualityCacheManager._write_json_atomic(
+        state_path,
+        {
+            "schema_version": 3,
+            "job_code": job["code"],
+            "asset_id": job["asset_id"],
+            "cache_complete": True,
+            "episodes": [
+                {"episode_id": "AST-STALE-LABEL-EP0001", "status": "ready"}
+            ],
+        },
+    )
+    publish_calls = []
+    monkeypatch.setattr(
+        cache, "_publish_result", lambda *args: publish_calls.append(args)
+    )
+    client = FakeFlowClient(job)
+
+    with pytest.raises(QualityCacheError, match="已阻止写入 NAS"):
+        cache.submit_result(
+            client,
+            job,
+            episode_results=[
+                {
+                    "episode_id": "AST-STALE-LABEL-EP0001",
+                    "decision": "pass_with_labels",
+                    "annotation_count": 1,
+                    "annotations": [
+                        {
+                            "label_code": "phase_open_trash_bin",
+                            "scope": "time_range",
+                            "start_offset_ns": 100,
+                            "end_offset_ns": 200,
+                            "target_type": "global",
+                            "attributes": {},
+                        }
+                    ],
+                }
+            ],
+        )
+
+    assert not (tmp_path / "qc-cache" / "results-pending" / job["code"]).exists()
+    assert publish_calls == []
+    assert client.results == []
+
+
 def test_cache_job_accepts_partial_job_coverage_and_copies_only_covered_files(tmp_path: Path):
     """Catches partial Flow QC Jobs being rejected or downloading unscoped Episode files."""
     asset_root = tmp_path / "nas" / "AST-PARTIAL-001"

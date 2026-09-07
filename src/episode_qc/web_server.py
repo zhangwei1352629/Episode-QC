@@ -57,6 +57,7 @@ from episode_qc.workspace import (
     save_annotation,
     scan_data_source,
     sync_flow_previous_reviews,
+    sync_flow_task_label_schema,
     undo_annotation_change,
     update_episode_review,
     update_workspace_settings,
@@ -79,6 +80,26 @@ NAS_UNAVAILABLE_MESSAGE = (
     "NAS 当前不可用；可继续查看本机已有任务，依赖 NAS 的领取、缓存、导入和提交操作将在恢复后可用。"
 )
 LOGGER = logging.getLogger(__name__)
+
+
+def _task_label_snapshot_mismatch(
+    job: dict[str, object], task: dict[str, object] | None
+) -> bool:
+    """Compare a local task binding with the immutable Flow job reference."""
+
+    if task is None or str(job.get("annotation_mode") or "library") == "open":
+        return False
+    flow_key = str(job.get("label_set_id") or "").strip()
+    flow_version = str(job.get("label_schema_version") or "").strip()
+    if not flow_key and not flow_version:
+        return False
+    local_key = str(task.get("local_label_set_key") or "").strip()
+    local_version = str(task.get("local_label_schema_version") or "").strip()
+    if (flow_key, flow_version) != (local_key, local_version):
+        return True
+    flow_hash = str(job.get("label_schema_hash") or "").strip()
+    local_hash = str(task.get("local_label_schema_hash") or "").strip()
+    return bool(flow_hash and local_hash and flow_hash != local_hash)
 
 
 def _positive_duration_ns(value: object) -> int | None:
@@ -1074,19 +1095,69 @@ class EpisodeQcWebApplication:
         task = self._local_task_for_job(job_code)
         if task is None:
             raise ValueError("质检任务尚未完整缓存到本地")
+        manager = self._quality_cache_manager()
+        task, label_sync = self._sync_platform_task_label_schema(
+            job, task, manager=manager
+        )
         if task.get("status") in {"submitted", "archived"}:
-            return {"job": job, "local_task": task, "started": False}
+            return {
+                "job": job,
+                "local_task": task,
+                "started": False,
+                **({"label_sync": label_sync} if label_sync else {}),
+            }
         if job.get("status") == "in_progress":
-            return {"job": job, "local_task": task, "started": False}
+            return {
+                "job": job,
+                "local_task": task,
+                "started": False,
+                **({"label_sync": label_sync} if label_sync else {}),
+            }
         if job.get("status") == "pending":
             raise ValueError("质检任务领取已失效，请先重新领取")
-        manager = self._quality_cache_manager()
         manager.start_review(client, job_code)
         return {
             "job": self._platform_job(client, job_code),
             "local_task": task,
             "started": True,
+            **({"label_sync": label_sync} if label_sync else {}),
         }
+
+    def _sync_platform_task_label_schema(
+        self,
+        job: dict[str, object],
+        task: dict[str, object],
+        *,
+        manager: QualityCacheManager,
+    ) -> tuple[dict[str, object], dict[str, object] | None]:
+        """Rebind stale local labels before review or any result publication."""
+
+        if not _task_label_snapshot_mismatch(job, task):
+            return task, None
+        job_code = str(job.get("code") or "").strip()
+        summary = manager.cache_summary(job_code)
+        if task.get("status") in {"submitted", "archived"} or (
+            summary and summary.get("result_synced") is True
+        ):
+            raise ValueError("本地任务已有正式提交结果，禁止自动迁移标签版本")
+        if summary and summary.get("pending_result"):
+            raise ValueError(
+                "本地已有待同步结果，已阻止迁移和覆盖；请先人工核对并归档该结果"
+            )
+        backup = self._write_workspace(
+            lambda: backup_workspace_database(
+                self.paths.db_path,
+                self.paths.root / "backups",
+                reason=f"label-sync-{job_code}",
+            )
+        )
+        result = self._write_workspace(
+            lambda: sync_flow_task_label_schema(self.paths.db_path, job)
+        )
+        refreshed = self._local_task_for_job(job_code)
+        if refreshed is None:
+            raise ValueError("标签版本迁移后本地任务不可见")
+        return refreshed, {**result, "workspace_backup": backup.name}
 
     def submit_platform_job(self, job_code: str) -> dict[str, object]:
         operation_lock = self._platform_claim_lock(job_code)
@@ -1128,6 +1199,9 @@ class EpisodeQcWebApplication:
             ensure_work_session_before_submit = True
             reclaim_before_submit = True
         manager = self._quality_cache_manager()
+        task, _label_sync = self._sync_platform_task_label_schema(
+            job, task, manager=manager
+        )
         mappings = self._workspace_episode_mappings(job, task)
         if mappings:
             mapping_writer = getattr(manager, "record_local_episodes", None)
@@ -1302,11 +1376,23 @@ class EpisodeQcWebApplication:
                 and item.get("status") not in {"completed", "waiting_data"}
             )
             cache_summary = cache_summary or {}
+            label_snapshot_mismatch = _task_label_snapshot_mismatch(
+                item, local_task
+            )
             jobs.append(
                 {
                     **item,
                     "local_task_id": local_task.get("id") if local_task else None,
                     "local_task_status": local_task.get("status") if local_task else None,
+                    "local_label_set_id": (
+                        local_task.get("local_label_set_key") if local_task else None
+                    ),
+                    "local_label_schema_version": (
+                        local_task.get("local_label_schema_version")
+                        if local_task
+                        else None
+                    ),
+                    "label_snapshot_mismatch": label_snapshot_mismatch,
                     "local_caching": code in caching,
                     "cache_state_missing": cache_state_missing,
                     "cache_recovery_available": cache_recovery_available,

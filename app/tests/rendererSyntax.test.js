@@ -64,6 +64,8 @@ test("Flow 任务中心包含登录、领取、缓存和提交入口", () => {
   assert.match(html, /Flow 任务池/);
   assert.match(html, /id="task-center-toast-stack"/);
   assert.match(renderer, /startPlatformJob/);
+  assert.match(renderer, /label_snapshot_mismatch/);
+  assert.match(renderer, /同步标签并打开/);
   assert.match(webApi, /\/api\/platform\/reviewers/);
   assert.match(webApi, /\/api\/platform\/login/);
   assert.match(webApi, /\/api\/platform\/jobs/);

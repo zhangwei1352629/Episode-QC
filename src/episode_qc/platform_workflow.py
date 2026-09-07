@@ -353,6 +353,62 @@ def canonical_json_sha256(value: object) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _validate_annotations_against_frozen_schema(
+    job: dict, annotations: list[dict]
+) -> None:
+    """Reject stale library annotations before creating or publishing a result."""
+
+    if not annotations:
+        return
+    schema = job.get("label_schema")
+    if not isinstance(schema, dict):
+        raise QualityCacheError("Flow 任务缺少冻结标签快照，已阻止发布带标注的结果")
+    header = schema.get("schema")
+    if not isinstance(header, dict):
+        raise QualityCacheError("Flow 冻结标签快照格式无效")
+    if (
+        str(header.get("label_set_id") or "") != str(job.get("label_set_id") or "")
+        or str(header.get("schema_version") or "")
+        != str(job.get("label_schema_version") or "")
+        or canonical_json_sha256(schema) != str(job.get("label_schema_hash") or "")
+    ):
+        raise QualityCacheError("Flow 冻结标签快照与任务引用不一致")
+    definitions = {
+        str(item.get("code")): item
+        for item in schema.get("labels", [])
+        if isinstance(item, dict) and item.get("code") and item.get("enabled", True)
+    }
+    for annotation in annotations:
+        code = str(annotation.get("label_code") or "")
+        definition = definitions.get(code)
+        if definition is None:
+            raise QualityCacheError(
+                f"标签 {code or '<空>'} 不属于当前 Flow 标签集或已禁用；已阻止写入 NAS"
+            )
+        scope = str(annotation.get("scope") or "")
+        if scope not in set(definition.get("annotation_scopes") or []):
+            raise QualityCacheError(
+                f"标签 {code} 不支持范围 {scope}；已阻止写入 NAS"
+            )
+        target = str(annotation.get("target_type") or "")
+        if target not in set(definition.get("target_types") or []):
+            raise QualityCacheError(
+                f"标签 {code} 不支持目标 {target}；已阻止写入 NAS"
+            )
+        attributes = annotation.get("attributes") or {}
+        if not isinstance(attributes, dict):
+            raise QualityCacheError(f"标签 {code} 的结构化属性必须是对象")
+        for field in definition.get("fields") or []:
+            if (
+                isinstance(field, dict)
+                and field.get("required")
+                and not attributes.get(field.get("code"))
+            ):
+                raise QualityCacheError(
+                    f"标签 {code} 缺少必填字段 {field.get('name') or field.get('code')}"
+                )
+
+
 class QualityCacheManager:
     def __init__(
         self,
@@ -884,6 +940,8 @@ class QualityCacheManager:
                 if has_direct_annotations
                 else []
             )
+            if label_set is not None and not open_mode:
+                _validate_annotations_against_frozen_schema(job, annotations)
             annotation_count = int(episode_result.get("annotation_count") or 0)
             if label_set is None and not open_mode and annotation_count > 0:
                 raise QualityCacheError("无 Flow 标签库引用的质检结果只允许零标注")

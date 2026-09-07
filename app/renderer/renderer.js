@@ -622,11 +622,14 @@ function renderFlowJobItem(job) {
     : "";
   const ownership = flowJobOwnershipLabel(job);
   const ownershipLabel = ownership ? ` · ${ownership}` : "";
+  const labelMismatch = job.label_snapshot_mismatch
+    ? ` · 标签待同步：本地 ${job.local_label_schema_version || "未知"} / Flow ${job.label_schema_version || "未知"}`
+    : "";
   return `
     <div class="flow-task-item">
       <div>
         <strong>${escapeHtml(job.asset_id || job.code)}</strong>
-        <small>${escapeHtml(job.code)} · ${escapeHtml(flowJobAssetTypeName(job))} · ${escapeHtml(flowJobStatusName(job.status))}${escapeHtml(progress)}${escapeHtml(blockedReason)}${escapeHtml(ownershipLabel)}</small>
+        <small>${escapeHtml(job.code)} · ${escapeHtml(flowJobAssetTypeName(job))} · ${escapeHtml(flowJobStatusName(job.status))}${escapeHtml(progress)}${escapeHtml(blockedReason)}${escapeHtml(ownershipLabel)}${escapeHtml(labelMismatch)}</small>
         <span>${escapeHtml(job.collector || "未知采集员")} · ${job.required_episode_count || job.episodes?.length || 0} Episode · ${formatBytes(job.asset_size_bytes)}</span>
       </div>
       <button type="button" data-flow-job-code="${escapeHtml(job.code)}" data-flow-action="${action.name}" ${action.disabled ? "disabled" : ""}>${escapeHtml(action.label)}</button>
@@ -652,6 +655,9 @@ function flowJobAction(job) {
   }
   if (job.local_task_id && job.cache_complete === false && !job.local_caching) {
     return { name: "claim", label: "继续缓存", disabled: false };
+  }
+  if (job.local_task_id && job.label_snapshot_mismatch) {
+    return { name: "open", label: "同步标签并打开", disabled: false };
   }
   if (job.local_task_id) return { name: "open", label: job.local_task_status === "submitted" ? "已提交" : "打开任务", disabled: false };
   if (job.local_caching) return { name: "none", label: flowJobProgressLabel(job), disabled: true };
@@ -740,7 +746,7 @@ async function handleFlowTaskAction(event) {
   if (!job) return;
   if (button.dataset.flowAction === "open" && job.local_task_id) {
     try {
-      if (!["completed", "submitted", "archived"].includes(job.local_task_status)) {
+      if (job.label_snapshot_mismatch || !["completed", "submitted", "archived"].includes(job.local_task_status)) {
         await window.episodeQc.startPlatformJob(job.code);
       }
       await switchTask(job.local_task_id);

@@ -122,6 +122,16 @@ SIMPLE_GROUP_COLORS = (
     "#3B82F6", "#F59E0B", "#8B5CF6", "#10B981", "#F97316", "#64748B"
 )
 
+# Explicit, reviewed semantic replacements between immutable Flow label
+# snapshots.  Never infer a replacement merely because a code disappeared:
+# an unknown change must stop and ask for manual handling.
+FLOW_LABEL_CODE_MIGRATIONS = {
+    (
+        "ego_340d6877910ea72f7313f7666f3ab027",
+        "phase_open_trash_bin",
+    ): "phase_step_trash_bin_pedal",
+}
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -1629,6 +1639,9 @@ def _task_rows(
     rows: list[dict[str, object]] = []
     query = f"""
         SELECT t.*, ds.id AS data_source_id, ds.root_path, ds.last_scanned_at,
+               tls.label_set_key AS local_label_set_key,
+               tls.version AS local_label_schema_version,
+               tls.source_hash AS local_label_schema_hash,
                COUNT(e.id) AS episode_count,
                SUM(CASE WHEN e.import_status = 'ready' THEN 1 ELSE 0 END) AS ready_count,
                SUM(CASE WHEN e.import_status != 'ready' THEN 1 ELSE 0 END) AS error_count,
@@ -1638,6 +1651,7 @@ def _task_rows(
         FROM qc_task t
         LEFT JOIN data_source ds ON ds.task_id = t.id
         LEFT JOIN episode e ON e.data_source_id = ds.id
+        LEFT JOIN label_set tls ON tls.id = t.label_set_id
         {where}
         GROUP BY t.id
         ORDER BY t.updated_at DESC, t.created_at DESC
@@ -2933,6 +2947,216 @@ def install_flow_label_schema(
         "source_hash": source_hash,
         "active": True,
     }
+
+
+def sync_flow_task_label_schema(
+    db_path: str | Path, job: dict[str, object]
+) -> dict[str, object]:
+    """Safely move one local Flow task to its current frozen label snapshot.
+
+    Existing annotations keep their timing, descriptions, attributes and
+    reviewer facts. Codes are changed only through an explicit semantic
+    migration above; every other removed or incompatible label aborts the
+    transaction without changing the task or its annotations.
+    """
+
+    job_code = str(job.get("code") or "").strip()
+    if not job_code:
+        raise ValueError("Flow 质检任务缺少任务编号")
+    if str(job.get("annotation_mode") or "library") == "open":
+        return {"changed": False, "job_code": job_code, "annotation_count": 0}
+
+    installed = install_flow_label_schema(db_path, job)
+    target_label_set_id = str(installed.get("id") or "")
+    if not target_label_set_id:
+        return {"changed": False, "job_code": job_code, "annotation_count": 0}
+
+    with connect_workspace(db_path) as connection:
+        connection.execute("BEGIN")
+        task = connection.execute(
+            """
+            SELECT t.*, ls.label_set_key AS current_label_set_key,
+                   ls.version AS current_label_schema_version,
+                   ls.source_hash AS current_label_schema_hash
+            FROM qc_task t
+            LEFT JOIN label_set ls ON ls.id = t.label_set_id
+            WHERE t.flow_job_code = ?
+            """,
+            (job_code,),
+        ).fetchone()
+        if task is None:
+            raise KeyError(f"本地不存在 Flow 质检任务: {job_code}")
+
+        metadata = _loads(task["metadata_json"], {})
+        metadata = dict(metadata) if isinstance(metadata, dict) else {}
+        metadata["flow_job"] = job
+        if str(task["label_set_id"] or "") == target_label_set_id:
+            connection.execute(
+                "UPDATE qc_task SET metadata_json = ?, updated_at = ? WHERE id = ?",
+                (_json(metadata), _now(), task["id"]),
+            )
+            return {
+                "changed": False,
+                "job_code": job_code,
+                "annotation_count": 0,
+                "label_set_id": installed["label_set_id"],
+                "version": installed["version"],
+            }
+
+        target_label_set = connection.execute(
+            "SELECT * FROM label_set WHERE id = ?",
+            (target_label_set_id,),
+        ).fetchone()
+        current_key = str(task["current_label_set_key"] or "")
+        target_key = str(target_label_set["label_set_key"] or "")
+        if current_key and current_key != target_key:
+            raise ValueError(
+                f"本地任务标签集 {current_key} 与 Flow 标签集 {target_key} 不同，禁止自动改绑"
+            )
+
+        definitions = {
+            str(row["code"]): row
+            for row in connection.execute(
+                "SELECT * FROM label_definition WHERE label_set_id = ? AND enabled = 1",
+                (target_label_set_id,),
+            )
+        }
+        schema = _loads(target_label_set["raw_schema_json"], {})
+        severities = {
+            str(item.get("code"))
+            for item in schema.get("severity_levels", [])
+            if isinstance(item, dict) and item.get("code")
+        }
+        actions = {
+            str(item.get("code"))
+            for item in schema.get("actions", [])
+            if isinstance(item, dict) and item.get("code")
+        }
+        annotations = connection.execute(
+            """
+            SELECT a.*
+            FROM annotation a
+            JOIN episode e ON e.id = a.episode_id
+            JOIN data_source ds ON ds.id = e.data_source_id
+            WHERE ds.task_id = ? AND a.deleted_at IS NULL
+            ORDER BY a.id
+            """,
+            (task["id"],),
+        ).fetchall()
+        migrated: list[tuple[sqlite3.Row, sqlite3.Row, dict[str, object]]] = []
+        replacements: dict[str, int] = {}
+        for annotation in annotations:
+            old_code = str(annotation["label_code"] or "")
+            target_code = old_code if old_code in definitions else str(
+                FLOW_LABEL_CODE_MIGRATIONS.get((target_key, old_code), "")
+            )
+            label = definitions.get(target_code)
+            if label is None:
+                raise ValueError(
+                    f"标签 {old_code} 在 Flow {installed['version']} 中不存在，且没有已确认的迁移规则"
+                )
+            episode = connection.execute(
+                "SELECT * FROM episode WHERE id = ?",
+                (annotation["episode_id"],),
+            ).fetchone()
+            payload = {
+                "label_code": target_code,
+                "scope": annotation["scope"],
+                "start_offset_ns": annotation["start_offset_ns"],
+                "end_offset_ns": annotation["end_offset_ns"],
+                "target_type": annotation["target_type"],
+                "target_key": annotation["target_key"],
+                "severity": annotation["severity"],
+                "action": annotation["action"],
+                "comment": annotation["comment"],
+                "attributes": _loads(annotation["attributes_json"], {}),
+            }
+            normalized = _validate_annotation_payload(payload, episode, label)
+            if annotation["severity"] and str(annotation["severity"]) not in severities:
+                raise ValueError(
+                    f"标签 {old_code} 的严重程度 {annotation['severity']} 不属于 Flow {installed['version']}"
+                )
+            if annotation["action"] and str(annotation["action"]) not in actions:
+                raise ValueError(
+                    f"标签 {old_code} 的处理动作 {annotation['action']} 不属于 Flow {installed['version']}"
+                )
+            migrated.append((annotation, label, normalized))
+            if target_code != old_code:
+                replacements[f"{old_code}->{target_code}"] = (
+                    replacements.get(f"{old_code}->{target_code}", 0) + 1
+                )
+
+        now = _now()
+        for annotation, label, normalized in migrated:
+            before = _annotation_row(annotation)
+            label_snapshot = {
+                "label_name": str(label["name"]),
+                "label_slug": str(label["code"]),
+                "annotation_type": "quality",
+                "label_set_id": target_key,
+                "label_schema_version": str(target_label_set["version"]),
+            }
+            connection.execute(
+                """
+                UPDATE annotation
+                SET label_set_key = ?, label_schema_version = ?, label_code = ?,
+                    annotation_schema_version = ?, label_name = ?, label_slug = ?,
+                    label_snapshot_json = ?, scope = ?, start_offset_ns = ?,
+                    end_offset_ns = ?, target_type = ?, target_key = ?,
+                    severity = ?, action = ?, comment = ?, attributes_json = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    target_key,
+                    target_label_set["version"],
+                    normalized["label_code"],
+                    target_label_set["version"],
+                    label["name"],
+                    label["code"],
+                    _json(label_snapshot),
+                    normalized["scope"],
+                    normalized["start_offset_ns"],
+                    normalized["end_offset_ns"],
+                    normalized["target_type"],
+                    normalized.get("target_key"),
+                    normalized.get("severity") or label["default_severity"],
+                    normalized.get("action") or label["default_action"],
+                    normalized.get("comment", ""),
+                    _json(normalized.get("attributes", {})),
+                    now,
+                    annotation["id"],
+                ),
+            )
+            updated = connection.execute(
+                "SELECT * FROM annotation WHERE id = ?", (annotation["id"],)
+            ).fetchone()
+            _record_change(
+                connection,
+                str(annotation["id"]),
+                "label_schema_migration",
+                before,
+                _annotation_row(updated),
+                f"flow-label-migration:{job_code}:{annotation['id']}",
+            )
+
+        connection.execute(
+            """
+            UPDATE qc_task
+            SET label_set_id = ?, metadata_json = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (target_label_set_id, _json(metadata), now, task["id"]),
+        )
+        return {
+            "changed": True,
+            "job_code": job_code,
+            "annotation_count": len(migrated),
+            "replacements": replacements,
+            "from_version": str(task["current_label_schema_version"] or ""),
+            "label_set_id": target_key,
+            "version": str(target_label_set["version"]),
+        }
 
 
 def _active_label_schema(connection: sqlite3.Connection) -> dict[str, object] | None:

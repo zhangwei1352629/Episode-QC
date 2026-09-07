@@ -87,6 +87,62 @@ def flow_label_job(*, code: str, schema: dict[str, object]) -> dict[str, object]
     }
 
 
+def test_flow_label_snapshot_mismatch_compares_local_binding_to_flow_reference():
+    task = {
+        "local_label_set_key": "ego-labels",
+        "local_label_schema_version": "2.0.0",
+        "local_label_schema_hash": "a" * 64,
+    }
+    job = {
+        "annotation_mode": "library",
+        "label_set_id": "ego-labels",
+        "label_schema_version": "2.0.2",
+        "label_schema_hash": "b" * 64,
+    }
+
+    assert web_server._task_label_snapshot_mismatch(job, task) is True
+    assert web_server._task_label_snapshot_mismatch(
+        {**job, "label_schema_version": "2.0.0", "label_schema_hash": "a" * 64},
+        task,
+    ) is False
+    assert web_server._task_label_snapshot_mismatch(
+        {**job, "annotation_mode": "open"}, task
+    ) is False
+
+
+def test_flow_label_sync_refuses_pending_result_before_backup_or_mutation(
+    tmp_path: Path, monkeypatch
+):
+    job = {
+        "code": "QCJ-PENDING-STALE-LABEL",
+        "annotation_mode": "library",
+        "label_set_id": "ego-labels",
+        "label_schema_version": "2.0.2",
+        "label_schema_hash": "b" * 64,
+    }
+    task = {
+        "status": "completed",
+        "local_label_set_key": "ego-labels",
+        "local_label_schema_version": "2.0.0",
+        "local_label_schema_hash": "a" * 64,
+    }
+
+    class FakeManager:
+        def cache_summary(self, _job_code):
+            return {"pending_result": True, "result_synced": False}
+
+    with running_server(tmp_path) as (server, _base_url):
+        monkeypatch.setattr(
+            server.application,
+            "_write_workspace",
+            lambda *_args, **_kwargs: pytest.fail("pending result must stop before backup"),
+        )
+        with pytest.raises(ValueError, match="待同步结果"):
+            server.application._sync_platform_task_label_schema(
+                job, task, manager=FakeManager()
+            )
+
+
 @contextmanager
 def running_server(
     tmp_path: Path,

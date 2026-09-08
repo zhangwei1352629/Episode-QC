@@ -1104,12 +1104,6 @@ class QualityCacheManager:
             label_set=label_set,
         )
         partitioned_initial_job = self._is_partitioned_initial_job(job)
-        if not partitioned_initial_job:
-            self._publish_latest_result_copy(
-                job,
-                local_result,
-                result_sha256=result_sha256,
-            )
         if hasattr(client, "report_work") and job.get("status") != "completed":
             client.report_work(job_code, action="heartbeat")
         response = client.submit_result(
@@ -1134,6 +1128,16 @@ class QualityCacheManager:
                 versioned_result_path,
                 expected_sha256=result_sha256,
             )
+            # Only an accepted, readable result may replace the asset's current
+            # result. Keep pending state on failure so the existing patrol can
+            # replay the same result ID after a lost response or mirror failure.
+            if not partitioned_initial_job and job.get("affects_current_result", True):
+                latest_result_path = self._publish_latest_result_copy(
+                    job, local_result, result_sha256=result_sha256
+                )
+                self._verify_result_file_readback(
+                    latest_result_path, expected_sha256=result_sha256
+                )
             aggregate_result_path = (
                 self._publish_asset_aggregate_if_complete(response)
                 if partitioned_initial_job

@@ -668,11 +668,6 @@ def test_existing_cached_job_rebuilds_previous_review_mapping_when_cache_state_i
             assert job_code == job["code"]
             return job
 
-    class MissingCacheState:
-        def local_episode_mappings(self, job_code):
-            assert job_code == job["code"]
-            raise QualityCacheError("cache state is missing")
-
     monkeypatch.setattr(
         web_server,
         "workspace_state",
@@ -700,7 +695,7 @@ def test_existing_cached_job_rebuilds_previous_review_mapping_when_cache_state_i
             "id": "task-local",
             "flow_job_code": job["code"],
         }
-        server.application._quality_cache_manager = lambda: MissingCacheState()
+        server.application._quality_cache_manager = lambda: QualityCacheManager(tmp_path / "missing-cache")
 
         assert server.application._platform_job(FakeClient(), job["code"]) == job
 
@@ -1312,6 +1307,78 @@ def test_web_exposes_missing_cache_state_and_backs_up_before_recovery(
             "cache_recovery": True,
             "workspace_backup": backup_path.name,
         }
+
+
+def test_web_recovers_missing_cache_for_active_flow_job(
+    tmp_path: Path,
+    monkeypatch,
+):
+    job = {
+        "code": "QCJ-WEB-RECOVER-ACTIVE-CACHE",
+        "status": "in_progress",
+        "lease_expired": True,
+    }
+    events = []
+
+    class FakeFlowClient:
+        def jobs(self):
+            return [dict(job)]
+
+        def claim(self, job_code):
+            events.append(("claim", job_code))
+            return dict(job)
+
+    class MissingCacheState:
+        def cache_summary(self, _job_code):
+            return None
+
+        def has_pre_cache_failure(self, _job_code):
+            return False
+
+    backup_path = tmp_path / "workspace-backups" / "recovery.db"
+    monkeypatch.setattr(
+        web_server,
+        "backup_workspace_database",
+        lambda *_args, **_kwargs: events.append(("backup", job["code"])) or backup_path,
+        raising=False,
+    )
+    with running_server(tmp_path) as (server, _base_url):
+        local_task = {
+            "id": "task-local",
+            "status": "in_progress",
+            "flow_job_code": job["code"],
+        }
+        server.application._flow_client = FakeFlowClient()
+        monkeypatch.setattr(
+            server.application,
+            "_local_task_for_job",
+            lambda _job_code: local_task,
+        )
+        monkeypatch.setattr(
+            server.application,
+            "_quality_cache_manager",
+            lambda: MissingCacheState(),
+        )
+        monkeypatch.setattr(
+            server.application._platform_executor,
+            "submit",
+            lambda *args: events.append(("submit", args[2])),
+        )
+
+        response = server.application.claim_platform_job(job["code"])
+
+    assert events == [
+        ("backup", job["code"]),
+        ("claim", job["code"]),
+        ("submit", job["code"]),
+    ]
+    assert response == {
+        "accepted": True,
+        "job": job,
+        "caching": True,
+        "cache_recovery": True,
+        "workspace_backup": backup_path.name,
+    }
 
 
 def test_web_starts_completed_local_task_when_flow_needs_review_session(tmp_path: Path, monkeypatch):

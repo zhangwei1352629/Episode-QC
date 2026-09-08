@@ -1540,10 +1540,12 @@ class EpisodeQcWebApplication:
         if local_task is not None and has_previous_review:
             manager = self._quality_cache_manager()
             mapping_reader = getattr(manager, "local_episode_mappings", None)
+            cache_state_available = True
             try:
                 mappings = mapping_reader(job_code) if mapping_reader else []
             except (OSError, QualityCacheError):
                 mappings = []
+                cache_state_available = False
             workspace_mappings = self._workspace_episode_mappings(
                 job,
                 local_task,
@@ -1552,7 +1554,7 @@ class EpisodeQcWebApplication:
             if workspace_mappings:
                 mappings = workspace_mappings
                 mapping_writer = getattr(manager, "record_local_episodes", None)
-                if mapping_writer:
+                if mapping_writer and cache_state_available:
                     mapping_writer(job_code, mappings)
             elif (
                 str(local_task.get("id") or "").strip()

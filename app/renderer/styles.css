@@ -171,6 +171,7 @@ body.episodes-collapsed .episode-sidebar, body.labels-collapsed .label-sidebar {
 .playback-readout { min-width: 142px; display: grid; gap: 2px; font-variant-numeric: tabular-nums; }
 .clock { font-size: 11px; white-space: nowrap; }
 .frame-position { color: var(--accent); font-size: 9px; white-space: nowrap; }
+#annotation-limit { max-width: 260px; color: var(--warning); font-size: 9px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .cache-status { justify-self: end; font-size: 10px; color: var(--muted); }
 .cache-status.busy { color: var(--warning); }
 .cache-status.ready { color: #70c98b; }

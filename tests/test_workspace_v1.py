@@ -198,6 +198,7 @@ def _trash_bin_label_schema(version: str, code: str) -> dict[str, object]:
 def _flow_job_for_schema(code: str, schema: dict[str, object]) -> dict[str, object]:
     return {
         "code": code,
+        "episodes": [{"episode_id": "EP1", "relative_path": "episode_000001", "duration_seconds": "2.03"}],
         "annotation_mode": "library",
         "label_set_id": schema["schema"]["label_set_id"],
         "label_schema_version": schema["schema"]["schema_version"],
@@ -278,6 +279,7 @@ def test_flow_task_label_schema_unknown_replacement_rolls_back_task_and_annotati
         origin="flow",
         flow_job_code=old_job["code"],
         label_set_id=str(old_label_set["id"]),
+        task_metadata={"flow_job": old_job},
     )
     episode_id = str(scanned["episodes"][0]["id"])
     saved = save_annotation(
@@ -690,6 +692,7 @@ def test_flow_incremental_history_is_editable_and_deleted_labels_do_not_return(
             {
                 "episode_id": "AST-INCREMENTAL-EP0001",
                 "relative_path": "episodes/episode_000001",
+                "duration_seconds": "2.03",
                 "review_history": histories,
                 "previous_review": histories[-1],
             }
@@ -703,6 +706,8 @@ def test_flow_incremental_history_is_editable_and_deleted_labels_do_not_return(
         }
     ]
 
+    from episode_qc.workspace import sync_flow_task_timing
+    sync_flow_task_timing(db_path, job)
     assert sync_flow_previous_reviews(db_path, job, mappings) == 1
     detail = episode_detail(db_path, local_episode_id)
     assert [item["label_code"] for item in detail["annotations"]] == [

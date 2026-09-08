@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
 import hmac
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -24,6 +23,7 @@ from typing import Any, Callable
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 import webbrowser
 
+from episode_qc.annotation_timing import positive_duration_ns as _positive_duration_ns
 from episode_qc.platform_workflow import (
     FlowClient,
     FlowClientError,
@@ -58,6 +58,7 @@ from episode_qc.workspace import (
     scan_data_source,
     sync_flow_previous_reviews,
     sync_flow_task_label_schema,
+    sync_flow_task_timing,
     undo_annotation_change,
     update_episode_review,
     update_workspace_settings,
@@ -102,19 +103,6 @@ def _task_label_snapshot_mismatch(
     return bool(flow_hash and local_hash and flow_hash != local_hash)
 
 
-def _positive_duration_ns(value: object) -> int | None:
-    """Convert a Flow duration to nanoseconds without binary-float drift."""
-
-    try:
-        seconds = Decimal(str(value))
-    except (InvalidOperation, TypeError, ValueError):
-        return None
-    if not seconds.is_finite() or seconds <= 0:
-        return None
-    duration_ns = int(seconds * Decimal(1_000_000_000))
-    return duration_ns if duration_ns > 0 else None
-
-
 def _flow_episode_durations_ns(job: dict[str, object]) -> dict[str, int]:
     episodes = job.get("episodes")
     if not isinstance(episodes, list):
@@ -146,6 +134,7 @@ def _annotations_for_flow_submission(
     submitted = [dict(annotation) for annotation in annotations]
     if flow_duration_ns is None:
         return submitted
+    errors = []
     for annotation in submitted:
         start_offset_ns = int(annotation.get("start_offset_ns") or 0)
         end_offset_ns = int(annotation.get("end_offset_ns") or 0)
@@ -183,11 +172,13 @@ def _annotations_for_flow_submission(
             or annotation.get("id")
             or "未命名标注"
         )
-        raise ValueError(
+        errors.append(
             f"Episode {episode_id} 的标注 {annotation_name} 存在真实越界："
             f"{start_offset_ns}..{end_offset_ns}ns，Flow 时长 {flow_duration_ns}ns；"
             "请修正标注范围后再提交"
         )
+    if errors:
+        raise ValueError("\n".join(errors))
     return submitted
 
 
@@ -1219,6 +1210,7 @@ class EpisodeQcWebApplication:
             raise ValueError("质检任务缺少本地 Episode 映射")
         flow_durations_ns = _flow_episode_durations_ns(job)
         episode_results = []
+        timing_errors = []
         for mapping in mappings:
             detail = episode_detail(self.paths.db_path, mapping["local_episode_id"])
             episode = detail["episode"]
@@ -1226,12 +1218,16 @@ class EpisodeQcWebApplication:
             if not decision or episode.get("review_status") not in {"completed", "reviewed"}:
                 raise ValueError(f"Episode {mapping['episode_id']} 尚未完成质检")
             platform_episode_id = str(mapping["episode_id"])
-            submitted_annotations = _annotations_for_flow_submission(
-                detail["annotations"],
-                episode_id=platform_episode_id,
-                local_duration_ns=int(episode.get("duration_ns") or 0),
-                flow_duration_ns=flow_durations_ns.get(platform_episode_id),
-            )
+            try:
+                submitted_annotations = _annotations_for_flow_submission(
+                    detail["annotations"],
+                    episode_id=platform_episode_id,
+                    local_duration_ns=int(episode.get("duration_ns") or 0),
+                    flow_duration_ns=flow_durations_ns.get(platform_episode_id),
+                )
+            except ValueError as error:
+                timing_errors.append(str(error))
+                continue
             episode_results.append(
                 {
                     "episode_id": platform_episode_id,
@@ -1267,6 +1263,8 @@ class EpisodeQcWebApplication:
                     },
                 }
             )
+        if timing_errors:
+            raise ValueError("提交前时长检查未通过：\n" + "\n".join(timing_errors))
         # A submit response can be lost after Flow has already committed the
         # result.  Retrying that submit must reconcile the completed result
         # instead of first posting progress, which Flow correctly rejects for
@@ -1532,6 +1530,8 @@ class EpisodeQcWebApplication:
             raise ValueError(f"Flow 中不存在或当前账号无权访问质检任务：{job_code}")
         local_task = self._local_task_for_job(job_code)
         episodes = job.get("episodes")
+        if local_task is not None and isinstance(episodes, list):
+            self._write_workspace(lambda: sync_flow_task_timing(self.paths.db_path, job))
         has_previous_review = isinstance(episodes, list) and any(
             isinstance(item, dict)
             and ("previous_review" in item or "review_history" in item)

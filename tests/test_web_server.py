@@ -2449,6 +2449,7 @@ Frame Time: 0.010000
                 "episode_id": "AST-WEB-001-EP0001",
                 "relative_path": "episodes/episode_000001",
                 "primary_file": "motion.bvh",
+                "duration_seconds": "0.01",
                 "checksum_sha256": checksum,
             }
         ],

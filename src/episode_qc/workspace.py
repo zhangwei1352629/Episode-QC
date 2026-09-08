@@ -15,6 +15,7 @@ import yaml
 from mcap.reader import make_reader
 
 from episode_qc.bvh import read_bvh_header
+from episode_qc.annotation_timing import annotation_timing, annotation_time_error
 from episode_qc.dohc_recording import (
     discover_dohc_episode_files,
     inspect_dohc_recording,
@@ -1587,7 +1588,7 @@ def _episode_rows(connection: sqlite3.Connection, where: str = "", parameters: t
     query = f"""
         SELECT e.*, ds.root_path AS source_root, ds.task_id,
                t.task_code, t.task_name, t.origin AS task_origin,
-               t.source_type, t.task_kind,
+               t.source_type, t.task_kind, t.metadata_json AS timing_metadata_json,
                SUM(CASE WHEN s.stream_type = 'camera' AND s.available = 1 THEN 1 ELSE 0 END) AS camera_count,
                MAX(CASE WHEN s.stream_type = 'mocap' AND s.available = 1 THEN 1 ELSE 0 END) AS mocap_available,
                COALESCE(changes.incremental_added_count, 0) AS incremental_added_count,
@@ -1614,6 +1615,11 @@ def _episode_rows(connection: sqlite3.Connection, where: str = "", parameters: t
     rows = []
     for row in connection.execute(query, parameters):
         value = dict(row)
+        metadata = _loads(value.pop("timing_metadata_json"), {})
+        value.update(annotation_timing(
+            value["duration_ns"], value["relative_path"], metadata.get("flow_job"),
+            requires_flow=value["task_origin"] == "flow",
+        ))
         value["camera_count"] = int(value["camera_count"] or 0)
         value["mocap_available"] = bool(value["mocap_available"])
         for key in (
@@ -3323,6 +3329,7 @@ def save_annotation(
         episode = connection.execute("SELECT * FROM episode WHERE id = ?", (episode_id,)).fetchone()
         if not episode:
             raise KeyError(f"Episode 不存在: {episode_id}")
+        episode = _episode_with_annotation_timing(connection, episode)
         workspace = connection.execute("SELECT * FROM workspace LIMIT 1").fetchone()
         task_label = connection.execute(
             """
@@ -3455,6 +3462,37 @@ def save_annotation(
         return saved
 
 
+def _episode_with_annotation_timing(connection: sqlite3.Connection, episode) -> dict:
+    value = dict(episode)
+    task = connection.execute(
+        "SELECT t.origin, t.metadata_json FROM data_source ds JOIN qc_task t ON t.id=ds.task_id WHERE ds.id=?",
+        (episode["data_source_id"],),
+    ).fetchone()
+    metadata = _loads(task["metadata_json"], {}) if task else {}
+    value.update(annotation_timing(
+        value["duration_ns"], value["relative_path"], metadata.get("flow_job"),
+        requires_flow=bool(task and task["origin"] == "flow"),
+    ))
+    if value["annotation_timing_error"]:
+        raise ValueError(value["annotation_timing_error"])
+    return value
+
+
+def _annotation_duration(episode) -> int:
+    key = "annotation_duration_ns" if "annotation_duration_ns" in episode.keys() else "duration_ns"
+    return int(episode[key] or 0)
+
+
+def sync_flow_task_timing(db_path: str | Path, job: dict) -> None:
+    """Refresh only the task's server snapshot; never rewrite media or annotations."""
+    with connect_workspace(db_path) as connection:
+        task = connection.execute("SELECT id, metadata_json FROM qc_task WHERE flow_job_code=?", (job["code"],)).fetchone()
+        if task:
+            metadata = _loads(task["metadata_json"], {})
+            metadata["flow_job"] = job
+            connection.execute("UPDATE qc_task SET metadata_json=? WHERE id=?", (_json(metadata), task["id"]))
+
+
 def _validate_annotation_payload(payload: dict[str, object], episode: sqlite3.Row, label: sqlite3.Row) -> dict[str, object]:
     value = dict(payload)
     scope = str(value.get("scope") or "")
@@ -3465,13 +3503,13 @@ def _validate_annotation_payload(payload: dict[str, object], episode: sqlite3.Ro
         raise ValueError(f"标签 {label['code']} 不支持范围 {scope}")
     if target not in VALID_TARGETS or target not in targets:
         raise ValueError(f"标签 {label['code']} 不支持目标 {target}")
-    duration = int(episode["duration_ns"] or 0)
+    duration = _annotation_duration(episode)
     start = int(value.get("start_offset_ns") or 0)
     end = int(value.get("end_offset_ns") or 0)
     if scope == "episode":
         start, end = 0, duration
     if start < 0 or end < start or end > duration:
-        raise ValueError(f"标注时间越界: {start}..{end}, Episode 时长 {duration}")
+        raise ValueError(f"标注时间越界: {start}..{end}ns，可标注终点 {duration / 1e9:.9f} 秒")
     if scope == "time_range" and end <= start:
         raise ValueError("区间标签要求结束时间大于开始时间")
     if scope == "time_point" and end != start:
@@ -3511,13 +3549,13 @@ def _validate_open_annotation_payload(
         raise ValueError(f"不支持的标注范围: {scope}")
     if target not in VALID_TARGETS:
         raise ValueError(f"不支持的标注对象: {target}")
-    duration = int(episode["duration_ns"] or 0)
+    duration = _annotation_duration(episode)
     start = int(value.get("start_offset_ns") or 0)
     end = int(value.get("end_offset_ns") or 0)
     if scope == "episode":
         start, end = 0, duration
     if start < 0 or end < start or end > duration:
-        raise ValueError(f"标注时间越界: {start}..{end}, Episode 时长 {duration}")
+        raise ValueError(f"标注时间越界: {start}..{end}ns，可标注终点 {duration / 1e9:.9f} 秒")
     if scope == "time_range" and end <= start:
         raise ValueError("区间标签要求结束时间大于开始时间")
     if scope == "time_point" and end != start:
@@ -3607,6 +3645,12 @@ def _restore_annotation_snapshot(connection: sqlite3.Connection, annotation_id: 
     if snapshot is None:
         connection.execute("UPDATE annotation SET deleted_at = ?, updated_at = ? WHERE id = ?", (_now(), _now(), annotation_id))
     else:
+        if not snapshot.get("deleted_at"):
+            episode = connection.execute("SELECT * FROM episode WHERE id=?", (episode_id,)).fetchone()
+            timed = _episode_with_annotation_timing(connection, episode)
+            error = annotation_time_error(snapshot, timed["annotation_duration_ns"])
+            if error:
+                raise ValueError(error)
         connection.execute(
             """
             UPDATE annotation SET label_set_key=?, label_schema_version=?, label_code=?,
@@ -3662,6 +3706,15 @@ def update_episode_review(
         duration = int(row["duration_ns"] or 0)
         playhead = max(0, min(playhead, duration))
         review_write = review_status is not None or quality_decision is not None
+        if review_write and status in {"completed", "reviewed"}:
+            timed = _episode_with_annotation_timing(connection, row)
+            errors = [
+                annotation_time_error(a, timed["annotation_duration_ns"])
+                for a in _list_annotations(connection, episode_id)
+            ]
+            errors = [error for error in errors if error]
+            if errors:
+                raise ValueError("请修正以下标注后完成质检：\n" + "\n".join(errors))
         reviewed_at = (
             now
             if review_write and status in {"completed", "reviewed"}

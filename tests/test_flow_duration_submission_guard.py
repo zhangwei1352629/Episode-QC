@@ -13,6 +13,35 @@ FLOW_DURATION_NS = 30_156_000_000
 LOCAL_DURATION_NS = 30_209_045_188
 
 
+def test_preflight_lists_all_bad_annotations_without_changing_them():
+    annotations = [
+        {"label_code": code, "scope": "time_range", "start_offset_ns": 1, "end_offset_ns": LOCAL_DURATION_NS - 1}
+        for code in ("long_idle", "turn_to_bed_foot")
+    ]
+    with pytest.raises(ValueError) as error:
+        web_server._annotations_for_flow_submission(
+            annotations, episode_id="EP1", local_duration_ns=LOCAL_DURATION_NS,
+            flow_duration_ns=FLOW_DURATION_NS,
+        )
+    assert "long_idle" in str(error.value) and "turn_to_bed_foot" in str(error.value)
+    assert all(a["end_offset_ns"] == LOCAL_DURATION_NS - 1 for a in annotations)
+
+
+def test_preflight_lists_errors_across_episodes_before_publication(tmp_path, monkeypatch):
+    annotation = {"scope": "time_range", "label_code": "long_idle", "start_offset_ns": 1, "end_offset_ns": LOCAL_DURATION_NS - 1}
+    app, cache = _application_for_submission(tmp_path, monkeypatch, flow_duration_seconds="30.156", annotation=annotation)
+    job = app._platform_job(None, "QCJ-DURATION-GUARD")
+    job["episodes"].append({"episode_id": "EP2", "duration_seconds": "30.156"})
+    app._workspace_episode_mappings = lambda *_: [
+        {"episode_id": code, "local_episode_id": code}
+        for code in ("AST-DURATION-GUARD-EP0001", "EP2")
+    ]
+    with pytest.raises(ValueError) as error:
+        app._submit_platform_job_once("QCJ-DURATION-GUARD")
+    assert "AST-DURATION-GUARD-EP0001" in str(error.value) and "EP2" in str(error.value)
+    assert cache.submissions == []
+
+
 class CapturingCache:
     def __init__(self) -> None:
         self.submissions: list[list[dict[str, object]]] = []

@@ -1,4 +1,5 @@
 import { G1Viewer } from "./g1-viewer.bundle.js";
+import { annotationDurationNs, annotationTimeError } from "./annotation-timing.mjs";
 import {
   labelSupportsTarget,
   resolveSelectedTarget,
@@ -1175,8 +1176,8 @@ function syncInteractiveState() {
   els.togglePlay.disabled = !playbackReady;
   els.playbackRate.disabled = !playbackReady;
   els.timelineRange.disabled = !hasEpisode;
-  els.markIn.disabled = !hasEpisode;
-  els.markOut.disabled = !hasEpisode;
+  els.markIn.disabled = !hasEpisode || !annotationDurationNs(state.detail?.episode);
+  els.markOut.disabled = els.markIn.disabled;
   els.loopSelection.disabled = !hasEpisode;
   els.undo.disabled = !hasEpisode;
   els.redo.disabled = !hasEpisode;
@@ -1403,9 +1404,10 @@ function renderClock() {
 }
 
 function markSelectionStart() {
+  warnAnnotationTail();
   const selection = beginRangeSelection({
     playheadNs: state.playheadNs,
-    durationNs: state.durationNs,
+    durationNs: annotationDurationNs(state.detail?.episode),
     grid: selectionFrameGrid(),
   });
   state.selectionStartNs = selection.startNs;
@@ -1414,10 +1416,11 @@ function markSelectionStart() {
 }
 
 function markSelectionEnd() {
+  warnAnnotationTail();
   const selection = completeRangeSelection({
     startNs: state.selectionStartNs,
     playheadNs: state.playheadNs,
-    durationNs: state.durationNs,
+    durationNs: annotationDurationNs(state.detail?.episode),
     grid: selectionFrameGrid(),
   });
   if (!selection.ok) {
@@ -1443,6 +1446,12 @@ function resetRangeSelection() {
 }
 
 function renderSelection() {
+  const episode = state.detail?.episode;
+  const limit = annotationDurationNs(episode);
+  const timingHint = episode?.annotation_timing_error ||
+    `可标注 0–${(limit / 1e9).toFixed(9).replace(/\.?0+$/, "")} 秒${limit < state.durationNs ? " · 尾部仅播放" : ""}`;
+  $("annotation-limit").textContent = !episode ? "" : episode.annotation_timing_error ? "Flow 时长未同步，暂不可标注" : timingHint;
+  $("annotation-limit").title = episode ? timingHint : "";
   const grid = selectionFrameGrid();
   if (state.selectionStartNs === null) {
     els.selectionLabel.textContent = "未选择区间";
@@ -1453,6 +1462,12 @@ function renderSelection() {
     const durationText = formatSeconds(state.selectionEndNs - state.selectionStartNs);
     const frameText = formatFrameRange(frameRangeForInterval(state.selectionStartNs, state.selectionEndNs, grid));
     els.selectionLabel.textContent = `${formatClock(state.selectionStartNs)} → ${formatClock(state.selectionEndNs)} · ${durationText}${frameText ? ` · ${frameText}` : ""}`;
+  }
+}
+
+function warnAnnotationTail() {
+  if (state.playheadNs > annotationDurationNs(state.detail?.episode)) {
+    toast("当前播放位置超出可标注范围，选区已限制到可标注终点", "info");
   }
 }
 
@@ -1762,8 +1777,10 @@ async function createAnnotation(labelCode, { saveSelectedEgoStep = false } = {})
     end = state.selectionEndNs;
   } else if (state.scope === "episode") {
     start = 0;
-    end = state.durationNs;
+    end = annotationDurationNs(state.detail.episode);
   }
+  const timingError = annotationTimeError(state.detail.episode, state.scope, start, end);
+  if (timingError) return toast(timingError, "error", 7000);
   const target = targetForLabel(label);
   if (!target) {
     const current = currentAnnotationTarget();
@@ -1816,8 +1833,10 @@ async function createOpenAnnotation(labelSlug = "") {
     end = state.selectionEndNs;
   } else if (state.scope === "episode") {
     start = 0;
-    end = state.durationNs;
+    end = annotationDurationNs(state.detail.episode);
   }
+  const timingError = annotationTimeError(state.detail.episode, state.scope, start, end);
+  if (timingError) return toast(timingError, "error", 7000);
   const target = currentAnnotationTarget();
   const attributes = {};
   const fieldValues = {
@@ -2011,7 +2030,7 @@ function renderAnnotationLanes(annotations, labels) {
     const blocks = items.map((annotation) => {
       const round = annotationRoundMeta(annotation);
       const startNs = annotation.scope === "episode" ? 0 : Math.max(0, Number(annotation.start_offset_ns) || 0);
-      const endNs = annotation.scope === "episode" ? state.durationNs : Math.max(startNs, Number(annotation.end_offset_ns) || 0);
+      const endNs = Math.max(startNs, Number(annotation.end_offset_ns) || 0);
       const left = state.durationNs ? Math.max(0, Math.min(100, (startNs / state.durationNs) * 100)) : 0;
       const width = state.durationNs ? Math.max(.7, Math.min(100 - left, ((endNs - startNs) / state.durationNs) * 100)) : .7;
       const pointClass = annotation.scope === "time_point" ? " annotation-point" : "";
@@ -2027,8 +2046,9 @@ function annotationTiming(annotation) {
     annotation.target_type === "camera" ? annotation.target_key : state.selectedCameraId,
   );
   if (annotation.scope === "episode") {
-    const total = Number(grid.frameCount || 0);
-    return `整条 · ${formatSeconds(state.durationNs)}${total ? ` · ${grid.exact ? "" : "约"}${total}帧` : ""}`;
+    const end = Number(annotation.end_offset_ns || 0);
+    const frameText = formatFrameRange(frameRangeForInterval(0, end, grid));
+    return `整条 · ${formatSeconds(end)}${frameText ? ` · ${frameText}` : ""}`;
   }
   if (annotation.scope === "time_point") {
     const frame = framePositionForTime(annotation.start_offset_ns, state.durationNs, grid);
@@ -2102,8 +2122,12 @@ function openAnnotationEditor(annotationId) {
   const annotation = state.detail?.annotations?.find((item) => item.annotation_id === annotationId);
   if (!annotation) return;
   els.editId.value = annotationId;
-  els.editStart.value = (annotation.start_offset_ns / 1e9).toFixed(3);
-  els.editEnd.value = (annotation.end_offset_ns / 1e9).toFixed(3);
+  els.editStart.value = (annotation.start_offset_ns / 1e9).toFixed(9);
+  els.editEnd.value = (annotation.end_offset_ns / 1e9).toFixed(9);
+  for (const input of [els.editStart, els.editEnd]) {
+    input.max = String(annotationDurationNs(state.detail?.episode) / 1e9);
+    input.step = "any";
+  }
   els.editStart.disabled = annotation.scope === "episode";
   els.editEnd.disabled = annotation.scope === "episode";
   fillSelect(els.editSeverity, state.labelSchema?.severity_levels || [], annotation.severity);
@@ -2191,6 +2215,8 @@ async function saveAnnotationEdit() {
   };
   setSaveState("saving", "保存中…");
   try {
+    const timingError = annotationTimeError(state.detail.episode, payload.scope, payload.start_offset_ns, payload.end_offset_ns);
+    if (timingError) throw new Error(timingError);
     const saved = await window.episodeQc.saveAnnotation({ annotationId: annotation.annotation_id, payload });
     state.detail.annotations = state.detail.annotations.map((item) => item.annotation_id === saved.annotation_id ? saved : item);
     renderAnnotations();
@@ -2631,7 +2657,8 @@ function beginTimelineSelection(event) {
   state.timelinePointer = {
     pointerId: event.pointerId,
     startX: event.clientX,
-    anchorNs,
+    anchorNs: Math.min(anchorNs, annotationDurationNs(state.detail?.episode)),
+    playbackAnchorNs: anchorNs,
     surface,
     previousStartNs: state.selectionStartNs,
     previousEndNs: state.selectionEndNs,
@@ -2655,7 +2682,7 @@ function updateTimelineSelection(event) {
   }
   const time = snapTimeToFrame(
     timelineTimeFromPointer(event, state.timelineSurface),
-    state.durationNs,
+    annotationDurationNs(state.detail?.episode),
     selectionFrameGrid(),
   );
   state.selectionStartNs = Math.min(state.timelineAnchorNs, time);
@@ -2673,13 +2700,13 @@ function endTimelineSelection(event) {
   state.timelineAnchorNs = null;
   state.timelineSurface = null;
   if (!wasSelecting) {
-    seekTo(pointer.anchorNs);
+    seekTo(pointer.playbackAnchorNs);
     return;
   }
   if (state.selectionEndNs === state.selectionStartNs) {
     const selection = singleFrameRange({
       timeNs: state.selectionStartNs,
-      durationNs: state.durationNs,
+      durationNs: annotationDurationNs(state.detail?.episode),
       grid: selectionFrameGrid(),
     });
     state.selectionStartNs = selection.startNs;

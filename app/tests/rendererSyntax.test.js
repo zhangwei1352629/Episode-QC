@@ -244,6 +244,6 @@ test("标注轨道单击只移动播放头且不会在 pointerdown 覆盖 I 点"
 
   assert.match(pointerDown, /state\.timelinePointer =/);
   assert.doesNotMatch(pointerDown, /state\.selectionStartNs =/);
-  assert.match(renderer, /if \(!wasSelecting\) \{\s*seekTo\(pointer\.anchorNs\);\s*return;/);
+  assert.match(renderer, /if \(!wasSelecting\) \{\s*seekTo\(pointer\.playbackAnchorNs\);\s*return;/);
   assert.match(renderer, /isTimelineDrag\(pointer\.startX, event\.clientX\)/);
 });

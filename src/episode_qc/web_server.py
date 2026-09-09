@@ -1208,6 +1208,10 @@ class EpisodeQcWebApplication:
             mappings = manager.local_episode_mappings(job_code)
         if not mappings:
             raise ValueError("质检任务缺少本地 Episode 映射")
+        from .ai_annotations import init as init_ai, sync_outbox
+        init_ai(self.paths.db_path)
+        for mapping in mappings:
+            sync_outbox(self.paths.db_path, client, job_code, mapping["local_episode_id"])
         flow_durations_ns = _flow_episode_durations_ns(job)
         episode_results = []
         timing_errors = []
@@ -2230,6 +2234,19 @@ class EpisodeQcRequestHandler(BaseHTTPRequestHandler):
         if method == "POST" and label_set_activate_match:
             self._discard_body()
             self._send_json(app.activate_label_set(label_set_activate_match.group(1)))
+            return
+        ai_match = re.fullmatch(r"/api/episodes/(ep_[a-f0-9]{24,32})/ai/(suggestions|start|review)", path)
+        if ai_match and method == "POST":
+            from . import ai_annotations
+            eid, action = ai_match.groups()
+            body = self._json_body()
+            if action == "start":
+                raise ValueError("请在 Flow 质检工作台启动 AI 标注")
+            if action == "review":
+                result = app._write_workspace(lambda: ai_annotations.review(app, eid, body))
+            else:
+                result = ai_annotations.fetch(app, eid, start=action == "start")
+            self._send_json(result)
             return
         if method == "POST" and path == "/api/annotations":
             self._send_json(app.save_annotation(self._json_body()))

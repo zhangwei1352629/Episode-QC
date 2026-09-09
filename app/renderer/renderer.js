@@ -1,3 +1,4 @@
+import { installAISuggestions } from "./ai-suggestions.mjs";
 import { G1Viewer } from "./g1-viewer.bundle.js";
 import { annotationDurationNs, annotationTimeError } from "./annotation-timing.mjs";
 import {
@@ -1046,6 +1047,11 @@ function renderEpisodeList() {
   syncInteractiveState();
 }
 
+let renderAI;
+function refreshAI() {
+  if (!renderAI) renderAI=installAISuggestions({container:els.annotationList,api:window.episodeQc,episodeId:()=>state.currentEpisodeId,seek:seekTo,reload:reloadCurrentEpisode,notify:(s)=>toast(s,"error")});
+  renderAI();
+}
 async function openEpisode(episodeId) {
   if (!episodeId || episodeId === state.currentEpisodeId && state.cache) return;
   const token = ++state.loadToken;
@@ -1082,6 +1088,7 @@ async function openEpisode(episodeId) {
     state.playheadNs = Math.min(Number(detail.episode.last_playhead_ns || 0), state.durationNs);
     state.playbackEpisodeId = episodeId;
     renderEpisodeDetail();
+    refreshAI();
     setCacheStatus("busy", "首次打开：正在建立只读播放缓存…");
     const cache = await window.episodeQc.prepareEpisode(state.playbackEpisodeId);
     if (token !== state.loadToken) return;

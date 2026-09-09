@@ -100,6 +100,7 @@ function installWebApi() {
       { method: "POST", body: { rootPath, taskKind } },
     ),
     rescanTask: (taskId) => request(`/api/tasks/${encodeURIComponent(taskId)}/rescan`, { method: "POST" }),
+    aiSuggestions: (episodeId, action, body) => request(`/api/episodes/${encodeURIComponent(episodeId)}/ai/${action}`, { method: "POST", body }),
     getEpisode: (episodeId) => request(`/api/episodes/${encodeURIComponent(episodeId)}`),
     prepareEpisode: async (episodeId) => {
       const cache = await request(`/api/episodes/${encodeURIComponent(episodeId)}/cache`, { method: "POST" });

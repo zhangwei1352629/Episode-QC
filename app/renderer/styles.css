@@ -571,3 +571,7 @@ dialog::backdrop { background: rgba(0,0,0,.66); }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition-duration: .01ms !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; }
 }
+
+.ai-suggestions{padding:12px;border:1px dashed #729bad;margin-bottom:12px}.ai-suggestions button{margin:4px;padding:6px}.ai-candidate{padding:8px;border-bottom:1px solid #59636a}.ai-candidate p{font-size:12px}.ai-candidate input{width:110px;margin:4px}
+
+.ai-suggestions{max-height:260px;overflow:auto;font:inherit}.ai-suggestions summary{font:600 12px inherit;cursor:pointer}.ai-suggestions button{font:inherit;font-size:11px;background:#1b2b33;color:#dce8ec;border:1px solid #43565f;border-radius:5px}.ai-suggestions p{font-size:11px;line-height:1.5}.ai-candidate input{font:inherit;font-size:11px;color:inherit;background:#18252a;border:1px solid #43565f;width:100px}

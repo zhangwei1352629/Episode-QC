@@ -3322,6 +3322,7 @@ def save_annotation(
     annotation_id: str | None = None,
     session_id: str = "default",
     expected_updated_at: str | None = None,
+    ai_candidate: tuple[str, str] | None = None,
 ) -> dict[str, object]:
     initialize_workspace(db_path)
     with connect_workspace(db_path) as connection:
@@ -3393,7 +3394,20 @@ def save_annotation(
         if old_row and expected_updated_at is not None and old_row["updated_at"] != expected_updated_at:
             raise WorkspaceConflictError("该标注已在另一个页面中更新，请刷新后重试")
         before = _annotation_row(old_row) if old_row else None
+        if ai_candidate:
+            ai_row = connection.execute("SELECT state, annotation_id FROM ai_candidate WHERE run_id=? AND candidate_id=? AND episode_id=?", (*ai_candidate, episode_id)).fetchone()
+            if not ai_row:
+                raise ValueError("AI候选不存在")
+            if ai_row["annotation_id"]:
+                existing = connection.execute("SELECT * FROM annotation WHERE id=? AND deleted_at IS NULL", (ai_row["annotation_id"],)).fetchone()
+                if existing:
+                    return _annotation_row(existing)
         actual_id = annotation_id or _new_id("ann")
+        if ai_candidate:
+            connection.execute("UPDATE ai_candidate SET state='accepted', annotation_id=? WHERE run_id=? AND candidate_id=?", (actual_id, *ai_candidate))
+            event_id = hashlib.sha256(_new_id("aireview").encode()).hexdigest()
+            event = {"event_id":event_id,"run_id":ai_candidate[0],"candidate_id":ai_candidate[1],"action":"accepted","annotation_id":actual_id,"details":{"start_offset_ns":normalized["start_offset_ns"],"end_offset_ns":normalized["end_offset_ns"]}}
+            connection.execute("INSERT INTO ai_review_outbox(event_id,episode_id,body) VALUES(?,?,?)",(event_id,episode_id,_json(event)))
         created_at = old_row["created_at"] if old_row else now
         connection.execute(
             """
@@ -3707,6 +3721,10 @@ def update_episode_review(
         playhead = max(0, min(playhead, duration))
         review_write = review_status is not None or quality_decision is not None
         if review_write and status in {"completed", "reviewed"}:
+            if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='ai_candidate'").fetchone():
+                pending = connection.execute("SELECT 1 FROM ai_candidate c LEFT JOIN annotation a ON a.id=c.annotation_id AND a.deleted_at IS NULL WHERE c.episode_id=? AND c.state IN ('pending','accepted') AND a.id IS NULL LIMIT 1", (episode_id,)).fetchone()
+                if pending:
+                    raise ValueError("请先确认或排除本条已载入的AI候选，再完成整条人工检查")
             timed = _episode_with_annotation_timing(connection, row)
             errors = [
                 annotation_time_error(a, timed["annotation_duration_ns"])

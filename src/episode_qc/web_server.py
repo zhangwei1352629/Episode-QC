@@ -487,6 +487,7 @@ class EpisodeQcWebApplication:
         self._platform_progress: dict[str, dict[str, object]] = {}
         self._platform_result_jobs: set[str] = set()
         self._platform_lock = threading.RLock()
+        self._platform_refresh_lock = threading.Lock()
         self._platform_claim_locks: dict[str, threading.Lock] = {}
         self._workspace_write_lock = threading.RLock()
         self._flow_client_factory = FlowClient
@@ -667,6 +668,16 @@ class EpisodeQcWebApplication:
         return {"connected": False, "jobs": []}
 
     def get_platform_jobs(self) -> dict[str, object]:
+        # A timed-out browser request may still be running here. Do not start
+        # another expensive refresh from another tab or the next polling tick.
+        if not self._platform_refresh_lock.acquire(blocking=False):
+            raise ValueError("任务列表正在刷新，请稍候")
+        try:
+            return self._get_platform_jobs_once()
+        finally:
+            self._platform_refresh_lock.release()
+
+    def _get_platform_jobs_once(self) -> dict[str, object]:
         if not self.flow_enabled:
             return {"enabled": False, "connected": False, "jobs": []}
         client = self._require_flow_client(allow_missing=True)

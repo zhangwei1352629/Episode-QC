@@ -24,7 +24,7 @@ from episode_qc.dohc_recording import (
 from episode_qc.source_paths import resolve_source_directory
 
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 TASK_KINDS = {"robot_teleoperation", "ego_omniego"}
 ANNOTATION_MODES = {"library", "open"}
 OPEN_ANNOTATION_TYPES = {"action", "pose_quality", "camera_quality", "exception", "object_state", "other"}
@@ -211,6 +211,16 @@ def _initialize_workspace(
     name: str = "Mocap QC 工作区",
     reviewer_name: str = "",
 ) -> dict[str, object]:
+    # Readers must remain readers under WAL while an importer holds the writer
+    # lock. Run schema/migration writes once per schema revision, not per API.
+    try:
+        current = connection.execute("SELECT * FROM workspace LIMIT 1").fetchone()
+    except sqlite3.OperationalError as exc:
+        if "no such table" not in str(exc):
+            raise
+        current = None
+    if current is not None and int(current["schema_version"] or 0) == SCHEMA_VERSION:
+        return dict(current)
     _execute_schema_statements(
         connection,
         """

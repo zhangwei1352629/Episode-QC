@@ -770,7 +770,7 @@ def test_v1_import_playback_annotation_and_export_round_trip(tmp_path: Path):
     workspace = initialize_workspace(db_path, reviewer_name="测试员")
     result = scan_data_source(db_path, source_root)
 
-    assert workspace["schema_version"] == 7
+    assert workspace["schema_version"] == 8
     assert result["discovered"] == 1
     assert result["ready"] == 1
     episode_id = result["episodes"][0]["id"]
@@ -1153,7 +1153,7 @@ def test_schema_v1_data_source_is_migrated_to_qc_task(tmp_path: Path):
     workspace = initialize_workspace(db_path)
     tasks = list_qc_tasks(db_path)
 
-    assert workspace["schema_version"] == 7
+    assert workspace["schema_version"] == 8
     assert len(tasks) == 1
     assert tasks[0]["task_name"] == "旧资产"
     assert tasks[0]["local_source_path"] == str(source_root)

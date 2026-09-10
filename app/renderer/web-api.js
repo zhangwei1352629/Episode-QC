@@ -12,7 +12,10 @@ function installWebApi() {
   const token = incomingToken || window.sessionStorage.getItem("episodeQcToken") || "";
   const cacheByEpisode = new Map();
 
-  async function request(path, { method = "GET", body, binary = false } = {}) {
+  async function request(path, { method = "GET", body, binary = false, timeoutMs = 0 } = {}) {
+    const controller = new AbortController();
+    const timer = timeoutMs ? setTimeout(() => controller.abort(), timeoutMs) : null;
+    try {
     const headers = { "X-Episode-QC-Token": token };
     if (body !== undefined) headers["Content-Type"] = "application/json";
     const response = await fetch(path, {
@@ -20,6 +23,7 @@ function installWebApi() {
       headers,
       body: body === undefined ? undefined : JSON.stringify(body),
       cache: "no-store",
+      signal: controller.signal,
     });
     if (!response.ok) {
       let message = `${response.status} ${response.statusText}`;
@@ -27,7 +31,10 @@ function installWebApi() {
       throw new Error(message);
     }
     if (response.status === 204) return null;
-    return binary ? response : response.json();
+    return binary ? response : await response.json();
+    } finally {
+      if (timer !== null) clearTimeout(timer);
+    }
   }
 
   function frameMetadata(response) {
@@ -49,7 +56,7 @@ function installWebApi() {
       `/api/tasks/history${keepTaskId ? `?keep_task_id=${encodeURIComponent(keepTaskId)}` : ""}`,
       { method: "DELETE" },
     ),
-    getPlatformJobs: () => request("/api/platform/jobs"),
+    getPlatformJobs: () => request("/api/platform/jobs", { timeoutMs: 12000 }),
     getPlatformReviewers: (baseUrl) => request("/api/platform/reviewers", {
       method: "POST",
       body: { baseUrl },

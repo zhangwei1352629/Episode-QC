@@ -555,6 +555,16 @@ def test_missing_primary_is_reported_before_playback_preparation(tmp_path: Path,
             server.application.prepare_episode("ep_missing")
 
 
+def test_platform_refresh_rejects_overlap_and_releases_gate(tmp_path, monkeypatch):
+    with running_server(tmp_path) as (server, _):
+        app = server.application
+        with app._platform_refresh_lock:
+            with pytest.raises(ValueError, match="正在刷新"):
+                app.get_platform_jobs()
+        monkeypatch.setattr(app, "_get_platform_jobs_once", lambda: {"jobs": []})
+        assert app.get_platform_jobs() == {"jobs": []}
+
+
 def test_cleanup_failure_does_not_stop_the_web_server(tmp_path: Path, monkeypatch, caplog):
     def fail_cleanup(_manager):
         raise RuntimeError("cleanup disk error")

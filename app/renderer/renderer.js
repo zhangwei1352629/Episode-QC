@@ -523,7 +523,10 @@ function renderHeaderContext() {
   els.headerReviewRound.textContent = `当前 R${episode ? currentReviewRound(episode) : 1}`;
 }
 
+let platformRefreshInFlight = false;
 async function refreshPlatformJobs({ quiet = false } = {}) {
+  if (platformRefreshInFlight) return;
+  platformRefreshInFlight = true;
   try {
     const payload = await window.episodeQc.getPlatformJobs();
     state.platform = payload;
@@ -551,6 +554,8 @@ async function refreshPlatformJobs({ quiet = false } = {}) {
   } catch (error) {
     if (!quiet) toast(error.message || String(error), "error", 6500);
     els.flowTaskStatus.textContent = "连接失败";
+  } finally {
+    platformRefreshInFlight = false;
   }
 }
 

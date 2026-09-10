@@ -37,6 +37,7 @@ from episode_qc.playback import (
     public_cache_manifest,
 )
 from episode_qc.source_paths import resolve_source_directory
+from episode_qc.playback_queue import PlaybackQueue
 from episode_qc.workspace import (
     backup_workspace_database,
     delete_annotation,
@@ -49,6 +50,7 @@ from episode_qc.workspace import (
     delete_label_set,
     initialize_workspace,
     list_qc_tasks,
+    playback_window,
     list_label_sets,
     mark_qc_task_submitted,
     preview_label_schema,
@@ -471,14 +473,15 @@ class EpisodeQcWebApplication:
         self.events = EventHub()
         self.playback = PlaybackRegistry(paths.cache_root)
         self.pending_label_schema: Path | None = None
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="episode-qc-cache")
+        self._playback_queue = PlaybackQueue(self._prepare_background_cache)
+        self._foreground_episode_id = ""
+        self._playback_prepare_locks: dict[str, threading.Lock] = {}
         self._platform_executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="episode-qc-platform"
         )
         self._platform_progress_executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="episode-qc-progress"
         )
-        self._jobs: set[str] = set()
         self._jobs_lock = threading.Lock()
         self._platform_jobs: set[str] = set()
         self._platform_owned_jobs: set[str] = set()
@@ -530,7 +533,7 @@ class EpisodeQcWebApplication:
         self._platform_heartbeat_thread.join(timeout=5)
         self._platform_result_reconcile_stop.set()
         self._platform_result_reconcile_thread.join(timeout=5)
-        self._executor.shutdown(wait=False, cancel_futures=True)
+        self._playback_queue.close()
         self._platform_executor.shutdown(wait=False, cancel_futures=True)
         self._platform_progress_executor.shutdown(wait=False, cancel_futures=True)
 
@@ -1407,6 +1410,8 @@ class EpisodeQcWebApplication:
                     **item,
                     "local_task_id": local_task.get("id") if local_task else None,
                     "local_task_status": local_task.get("status") if local_task else None,
+                    "playback_ready_count": local_task.get("playback_ready_count", 0) if local_task else 0,
+                    "playback_preparing_count": local_task.get("playback_preparing_count", 0) if local_task else 0,
                     "local_label_set_id": (
                         local_task.get("local_label_set_key") if local_task else None
                     ),
@@ -1639,8 +1644,9 @@ class EpisodeQcWebApplication:
                 if viewer_profile == "ego_omniego" or asset_type == "egocentric"
                 else "robot_teleoperation"
             )
-            indexed = self._write_workspace(
-                lambda: scan_data_source(
+            # Parsing is outside the annotation writer lock; the scanner
+            # commits each newly indexed Episode in a short transaction.
+            indexed = scan_data_source(
                     self.paths.db_path,
                     str(values["cache_dir"]),
                     profile_path=profile_path,
@@ -1665,7 +1671,7 @@ class EpisodeQcWebApplication:
                         job.get("annotation_schema_version")
                         or ("ego_open_v1" if task_kind == "ego_omniego" else "")
                     ),
-                )
+                    episode_files=values.get("primary_files"),
             )
             indexed_by_path = {
                 str(Path(item["relative_path"]).as_posix()).strip("./"): item
@@ -1711,13 +1717,23 @@ class EpisodeQcWebApplication:
             if not mappings:
                 raise QualityCacheError("本地缓存尚未索引到已验证的 Flow Episode")
             manager.record_local_episodes(job_code, mappings)
+            try:
+                anchor = self._foreground_episode_id or str((indexed.get("task") or {}).get("last_episode_id") or indexed["episodes"][0]["id"])
+                self._schedule_read_ahead(anchor)
+            except Exception:
+                LOGGER.exception("Read-ahead scheduling failed; source caching continues")
             if any(
                 "previous_review" in item or "review_history" in item
                 for item in job.get("episodes", [])
             ):
+                history_mappings = (
+                    [item for item in mappings if item["episode_id"] == values["episode_id"]]
+                    if values.get("primary_files") and values.get("episode_id")
+                    else mappings
+                )
                 self._write_workspace(
                     lambda: sync_flow_previous_reviews(
-                        self.paths.db_path, job, mappings
+                        self.paths.db_path, job, history_mappings
                     )
                 )
             local_ready = True
@@ -1887,15 +1903,15 @@ class EpisodeQcWebApplication:
         detail = episode_detail(self.paths.db_path, episode_id)
         if not Path(str(detail["episode"].get("mcap_path") or "")).is_file():
             raise ValueError("本地 Episode 原文件缺失，请返回任务列表恢复缓存；已有质检和标注不会删除")
-        result = prepare_episode_cache(
-            self.paths.db_path,
-            episode_id,
-            self.paths.cache_root,
-            mode="priority",
-        )
-        self.playback.set(episode_id, result)
-        if not result.get("complete"):
-            self._queue_full_cache(episode_id)
+        # Cancel obsolete queued work before serving the new foreground item.
+        with self._jobs_lock:
+            self._foreground_episode_id = episode_id
+            self._playback_queue.replace([])
+        result = self._prepare_playback_once(episode_id, "priority")
+        try:
+            self._schedule_read_ahead(episode_id, finish_current=not result.get("complete"))
+        except Exception:
+            LOGGER.exception("Read-ahead unavailable; foreground playback remains ready")
         return public_cache_manifest(result)
 
     def preview_labels(self, request: dict[str, object]) -> dict[str, object]:
@@ -2006,28 +2022,30 @@ class EpisodeQcWebApplication:
             task_id=request.get("taskId") if isinstance(request.get("taskId"), str) else None,
         )
 
-    def _queue_full_cache(self, episode_id: str) -> None:
+    def _prepare_playback_once(self, episode_id: str, mode: str) -> dict:
         with self._jobs_lock:
-            if episode_id in self._jobs:
-                return
-            self._jobs.add(episode_id)
-        self._executor.submit(self._prepare_full_cache, episode_id)
-
-    def _prepare_full_cache(self, episode_id: str) -> None:
-        try:
-            result = prepare_episode_cache(
-                self.paths.db_path,
-                episode_id,
-                self.paths.cache_root,
-                mode="full",
-            )
+            lock = self._playback_prepare_locks.setdefault(episode_id, threading.Lock())
+        with lock:
+            result = prepare_episode_cache(self.paths.db_path, episode_id, self.paths.cache_root, mode=mode)
             self.playback.set(episode_id, result)
+            return result
+
+    def _schedule_read_ahead(self, episode_id: str, *, finish_current: bool = False) -> None:
+        rows = playback_window(self.paths.db_path, episode_id)
+        jobs = [(row["id"], "priority") for row in rows if row["cache_status"] not in {"ready", "partial"}]
+        if finish_current or any(row["id"] == self._foreground_episode_id and row["cache_status"] == "partial" for row in rows):
+            jobs.append((episode_id, "full"))
+        with self._jobs_lock:
+            if self._foreground_episode_id and self._foreground_episode_id != episode_id:
+                return
+            self._playback_queue.replace(jobs)
+
+    def _prepare_background_cache(self, episode_id: str, mode: str) -> None:
+        try:
+            result = self._prepare_playback_once(episode_id, mode)
             self.events.publish({"episodeId": episode_id, "cache": public_cache_manifest(result)})
         except Exception as exc:
             self.events.publish({"episodeId": episode_id, "error": str(exc)})
-        finally:
-            with self._jobs_lock:
-                self._jobs.discard(episode_id)
 
 
 class EpisodeQcWebServer(ThreadingHTTPServer):

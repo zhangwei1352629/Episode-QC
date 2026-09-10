@@ -651,7 +651,7 @@ function flowJobProgressLabel(job) {
   const cachedEpisodes = Number(local.cached_episode_count ?? job.cached_episode_count ?? 0);
   const totalEpisodes = Number(local.total_episode_count ?? job.total_episode_count ?? 0);
   const progress = Number(job.cache_progress || local.progress || 0);
-  if (totalEpisodes > 0) return `已缓存 ${cachedEpisodes}/${totalEpisodes} Episode · ${progress}%`;
+  if (totalEpisodes > 0) return `原文件 ${cachedEpisodes}/${totalEpisodes} · 可播放 ${Number(job.playback_ready_count || 0)} · 播放准备中 ${Number(job.playback_preparing_count || 0)} · ${progress}%`;
   return `缓存 ${progress}%`;
 }
 
@@ -1043,7 +1043,7 @@ function renderEpisodeList() {
         <span class="review-dot"></span>
         <span class="episode-copy">
           <strong>${escapeHtml(episode.episode_name)}</strong>
-          <span title="${escapeHtml(episode.relative_path)}">${escapeHtml(episode.relative_path)}</span>
+          <span title="${escapeHtml(episode.relative_path)}">${escapeHtml(episode.relative_path)} · ${escapeHtml(({ ready: "可播放", partial: "主视角可播放", preparing: "播放准备中", failed: "播放准备失败", stale: "需重新准备播放" })[episode.cache_status] || "待准备播放")}</span>
           <span class="episode-badges"><em class="status-badge">${escapeHtml(episodeReviewStatusName(episode))}</em>${episode.quality_decision ? `<em class="decision-badge">${escapeHtml(decisionName(episode.quality_decision))}</em>` : ""}<em>${episode.camera_count} CAM</em><em>${episode.mocap_available ? "MOCAP" : "无 MOCAP"}</em><em>${episode.annotation_count} 有效标注</em>${previousBadge}</span>
         </span>
         <time>${formatDuration(episode.duration_sec || 0)}</time>

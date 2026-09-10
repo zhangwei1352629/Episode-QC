@@ -660,6 +660,7 @@ def scan_data_source(
     task_kind: str = "robot_teleoperation",
     annotation_mode: str | None = None,
     annotation_schema_version: str | None = None,
+    episode_files: list[str] | None = None,
 ) -> dict[str, object]:
     initialize_workspace(db_path)
     if task_kind not in TASK_KINDS:
@@ -677,6 +678,14 @@ def scan_data_source(
         raise ValueError("开放标注模式必须声明结构版本")
     requested_root_path = str(root_path)
     root = resolve_source_directory(root_path)
+    candidates = None
+    if episode_files is not None:
+        candidates = []
+        for item in episode_files:
+            candidate = (root / item).resolve()
+            if not candidate.is_relative_to(root) or not candidate.is_file():
+                raise ValueError("增量索引文件不存在或超出当前任务目录")
+            candidates.append(candidate)
     profile = _load_profile(profile_path)
     profile_id = str(((profile.get("profile") or {}) if isinstance(profile.get("profile"), dict) else {}).get("id") or "default_v1")
     profile_json = _json(profile)
@@ -778,7 +787,8 @@ def scan_data_source(
         source = connection.execute("SELECT * FROM data_source WHERE root_path = ?", (str(root),)).fetchone()
         source_id = source["id"]
 
-    candidates = _discover_episode_mcaps(root, profile, task_kind=task_kind)
+    if episode_files is None:
+        candidates = _discover_episode_mcaps(root, profile, task_kind=task_kind)
     indexed: list[dict[str, object]] = []
     seen_paths: set[str] = set()
     with connect_workspace(db_path) as connection:
@@ -803,19 +813,32 @@ def scan_data_source(
                     force_reindex=profile_changed,
                 )
             )
+            # Parsing the next MCAP must not retain the previous Episode's
+            # SQLite writer lock. Each indexed Episode is a short transaction.
+            connection.commit()
 
-        missing_rows = connection.execute("SELECT id, relative_path FROM episode WHERE data_source_id = ?", (source_id,)).fetchall()
+        missing_rows = (connection.execute("SELECT id, relative_path FROM episode WHERE data_source_id = ?", (source_id,)).fetchall()
+                        if episode_files is None else [])
         for row in missing_rows:
             if row["relative_path"] not in seen_paths:
                 connection.execute(
                     "UPDATE episode SET import_status = 'source_missing', import_error = ?, updated_at = ? WHERE id = ?",
                     ("源文件在本次重扫中未找到", _now(), row["id"]),
                 )
-        restored_annotations, restored_episode_states, import_warnings = _restore_task_annotations(
-            connection,
-            source_id,
-            root,
-        )
+        if episode_files is None:
+            restored_annotations, restored_episode_states, import_warnings = _restore_task_annotations(
+                connection, source_id, root,
+            )
+        else:
+            # A newly downloaded Episode is not an instruction to re-import
+            # old annotation exports or mark other Episodes as missing.
+            restored_annotations, restored_episode_states, import_warnings = 0, 0, []
+            updated_by_id = {item["id"]: item for item in indexed}
+            indexed = [updated_by_id[row["id"]] if row["id"] in updated_by_id
+                       else _existing_episode_index_result(connection, row, unchanged=True)
+                       for row in connection.execute(
+                           "SELECT * FROM episode WHERE data_source_id = ? ORDER BY relative_path", (source_id,)
+                       ).fetchall()]
 
     failures = [item for item in indexed if item["import_status"] != "ready"]
     with connect_workspace(db_path) as connection:
@@ -840,7 +863,8 @@ def scan_data_source(
         "task": task,
         "existing_task": bool(existing_source),
         "profile_id": profile_id,
-        "discovered": len(candidates),
+        "discovered": len(indexed),
+        "scanned_episode_count": len(candidates),
         "ready": len(indexed) - len(failures),
         "failed": len(failures),
         "unchanged": sum(1 for item in indexed if item.get("unchanged")),
@@ -1663,6 +1687,8 @@ def _task_rows(
                SUM(CASE WHEN e.import_status != 'ready' THEN 1 ELSE 0 END) AS error_count,
                SUM(CASE WHEN e.review_status IN ('completed', 'reviewed') THEN 1 ELSE 0 END) AS completed_count,
                SUM(CASE WHEN e.review_status IN ('in_progress', 'needs_recheck') THEN 1 ELSE 0 END) AS active_count,
+               SUM(CASE WHEN e.cache_status IN ('ready', 'partial') THEN 1 ELSE 0 END) AS playback_ready_count,
+               SUM(CASE WHEN e.cache_status = 'preparing' THEN 1 ELSE 0 END) AS playback_preparing_count,
                COALESCE(SUM(e.file_size), 0) AS source_size_bytes
         FROM qc_task t
         LEFT JOIN data_source ds ON ds.task_id = t.id
@@ -1682,6 +1708,8 @@ def _task_rows(
             "completed_count",
             "active_count",
             "source_size_bytes",
+            "playback_ready_count",
+            "playback_preparing_count",
         ):
             value[key] = int(value[key] or 0)
         rows.append(value)
@@ -1782,6 +1810,23 @@ def _refresh_task_status(
         """,
         (status, status, now, now, task_id),
     )
+
+
+def playback_window(db_path: str | Path, episode_id: str) -> list[dict[str, object]]:
+    """Current Episode plus at most two immediate successors in task order."""
+    initialize_workspace(db_path)
+    with connect_workspace(db_path) as connection:
+        task_id = _task_id_for_episode(connection, episode_id)
+        rows = [dict(row) for row in connection.execute(
+            "SELECT e.id, e.relative_path, e.data_group, e.mcap_path, e.cache_status, e.import_status "
+            "FROM episode e JOIN data_source ds ON ds.id=e.data_source_id WHERE ds.task_id=?", (task_id,)
+        )]
+    rows.sort(key=lambda row: (_natural_key(row["data_group"]), _natural_key(row["relative_path"])))
+    position = next((i for i, row in enumerate(rows) if row["id"] == episode_id), None)
+    if position is None:
+        return []
+    return [row for row in rows[position:position + 3]
+            if row["import_status"] == "ready" and Path(row["mcap_path"]).is_file()]
 
 
 def list_qc_tasks(db_path: str | Path) -> list[dict[str, object]]:

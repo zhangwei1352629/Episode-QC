@@ -83,6 +83,53 @@ FLOW_SCHEMA = {
 }
 
 
+def test_incremental_scan_only_parses_new_file_and_preserves_review(tmp_path, monkeypatch):
+    import episode_qc.workspace as workspace
+    root = tmp_path / "source"
+    first = _write_sample_episode(root / "episode_000001")
+    db = tmp_path / "workspace.db"
+    scan = scan_data_source(db, root)
+    first_id = scan["episodes"][0]["id"]
+    with connect_workspace(db) as connection:
+        connection.execute("UPDATE episode SET review_status='completed', quality_decision='pass' WHERE id=?", (first_id,))
+    second = _write_sample_episode(root / "episode_000002")
+    third = _write_sample_episode(root / "episode_000003")
+    calls = []
+    original = workspace._index_episode
+    def index(*args, **kwargs):
+        calls.append(args[4])
+        # Metadata parsing must not run with a SQLite write transaction open.
+        with connect_workspace(db) as writer:
+            writer.execute("BEGIN IMMEDIATE")
+            writer.execute("UPDATE episode SET reviewer_name='concurrent-reviewer' WHERE id=?", (first_id,))
+        return original(*args, **kwargs)
+    monkeypatch.setattr(workspace, "_index_episode", index)
+    monkeypatch.setattr(workspace, "_discover_episode_mcaps", lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("full scan")))
+    monkeypatch.setattr(workspace, "_restore_task_annotations", lambda *_: (_ for _ in ()).throw(AssertionError("restore during incremental import")))
+    scan = scan_data_source(db, root, episode_files=[str(second.relative_to(root)), str(third.relative_to(root))])
+    assert calls == [second.resolve(), third.resolve()]
+    assert len(scan["episodes"]) == 3
+    assert scan["scanned_episode_count"] == 2
+    assert [row["id"] for row in workspace.playback_window(db, first_id)] == [row["id"] for row in scan["episodes"]]
+    detail = episode_detail(db, first_id)["episode"]
+    assert detail["review_status"] == "completed"
+    assert detail["quality_decision"] == "pass"
+    assert detail["reviewer_name"] == "concurrent-reviewer"
+    assert detail["import_status"] == "ready"
+
+
+def test_incremental_scan_rejects_outside_path_before_changing_task(tmp_path):
+    root = tmp_path / "source"
+    _write_sample_episode(root / "episode_000001")
+    outside = _write_sample_episode(tmp_path / "outside")
+    db = tmp_path / "workspace.db"
+    scan_data_source(db, root)
+    before = list_qc_tasks(db)
+    with pytest.raises(ValueError, match="超出"):
+        scan_data_source(db, root, episode_files=[str(outside)])
+    assert list_qc_tasks(db) == before
+
+
 def test_workspace_connection_waits_for_long_running_transient_writer(tmp_path: Path):
     db_path = tmp_path / "workspace.db"
     initialize_workspace(db_path)

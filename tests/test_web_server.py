@@ -2614,7 +2614,7 @@ Frame Time: 0.010000
         assert job["status"] == "in_progress"
         assert visible_job["cached_episode_count"] == 1
         assert visible_job["total_episode_count"] == 1
-        assert "已缓存 ${cachedEpisodes}/${totalEpisodes} Episode" in (
+        assert "原文件 ${cachedEpisodes}/${totalEpisodes}" in (
             Path(__file__).resolve().parents[1] / "app" / "renderer" / "renderer.js"
         ).read_text(encoding="utf-8")
 

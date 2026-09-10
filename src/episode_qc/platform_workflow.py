@@ -2184,6 +2184,8 @@ class QualityCacheManager:
                 "episode_id": episode["episode_id"],
                 "relative_path": episode["relative_path"],
                 "cache_dir": str(ready_root),
+                "primary_files": [(PurePosixPath(episode["relative_path"]) /
+                                   episode["job_episode"]["primary_file"]).as_posix()],
                 "cached_episode_count": cached_episode_count,
                 "total_episode_count": total_episode_count,
                 "cache_complete": cache_complete,

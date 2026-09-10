@@ -1619,12 +1619,15 @@ def _camera_name(topic: str) -> str:
 
 
 def _episode_rows(connection: sqlite3.Connection, where: str = "", parameters: tuple[object, ...] = ()) -> list[dict[str, object]]:
+    # Aggregate narrow stream rows first. Grouping the joined episode rows
+    # duplicates large Flow history snapshots once per stream in SQLite's
+    # temporary sort, which can stall history sync for minutes on Windows.
     query = f"""
         SELECT e.*, ds.root_path AS source_root, ds.task_id,
                t.task_code, t.task_name, t.origin AS task_origin,
                t.source_type, t.task_kind, t.metadata_json AS timing_metadata_json,
-               SUM(CASE WHEN s.stream_type = 'camera' AND s.available = 1 THEN 1 ELSE 0 END) AS camera_count,
-               MAX(CASE WHEN s.stream_type = 'mocap' AND s.available = 1 THEN 1 ELSE 0 END) AS mocap_available,
+               COALESCE(stream_counts.camera_count, 0) AS camera_count,
+               COALESCE(stream_counts.mocap_available, 0) AS mocap_available,
                COALESCE(changes.incremental_added_count, 0) AS incremental_added_count,
                COALESCE(changes.incremental_modified_count, 0) AS incremental_modified_count,
                COALESCE(changes.incremental_removed_count, 0) AS incremental_removed_count,
@@ -1632,7 +1635,12 @@ def _episode_rows(connection: sqlite3.Connection, where: str = "", parameters: t
         FROM episode e
         JOIN data_source ds ON ds.id = e.data_source_id
         JOIN qc_task t ON t.id = ds.task_id
-        LEFT JOIN stream s ON s.episode_id = e.id
+        LEFT JOIN (
+            SELECT episode_id,
+                   SUM(CASE WHEN stream_type = 'camera' AND available = 1 THEN 1 ELSE 0 END) AS camera_count,
+                   MAX(CASE WHEN stream_type = 'mocap' AND available = 1 THEN 1 ELSE 0 END) AS mocap_available
+            FROM stream GROUP BY episode_id
+        ) stream_counts ON stream_counts.episode_id = e.id
         LEFT JOIN (
             SELECT episode_id,
                    SUM(CASE WHEN deleted_at IS NULL AND source != 'flow_incremental' THEN 1 ELSE 0 END) AS incremental_added_count,
@@ -1643,7 +1651,6 @@ def _episode_rows(connection: sqlite3.Connection, where: str = "", parameters: t
             GROUP BY episode_id
         ) changes ON changes.episode_id = e.id
         {where}
-        GROUP BY e.id
         ORDER BY e.data_group COLLATE NOCASE, e.relative_path COLLATE NOCASE
     """
     rows = []

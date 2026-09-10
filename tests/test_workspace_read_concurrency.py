@@ -1,6 +1,19 @@
 from episode_qc.workspace import initialize_workspace, connect_workspace
 
 
+def test_episode_query_aggregates_streams_without_grouping_wide_snapshots(tmp_path):
+    from episode_qc.workspace import _episode_rows
+    db = tmp_path / "workspace.db"
+    initialize_workspace(db)
+    with connect_workspace(db) as connection:
+        queries = []
+        connection.set_trace_callback(queries.append)
+        assert _episode_rows(connection) == []
+        query = next(q for q in queries if "stream_counts" in q)
+        assert "FROM stream GROUP BY episode_id" in query
+        assert "GROUP BY e.id" not in query
+
+
 def test_current_workspace_initialization_does_not_wait_for_writer(tmp_path):
     db = tmp_path / "workspace.db"
     before = initialize_workspace(db)

@@ -6,6 +6,8 @@ import json
 import re
 import sqlite3
 import uuid
+from functools import lru_cache
+from copy import deepcopy
 from datetime import datetime, timezone
 from fnmatch import fnmatch
 from pathlib import Path
@@ -1619,6 +1621,9 @@ def _camera_name(topic: str) -> str:
 
 
 def _episode_rows(connection: sqlite3.Connection, where: str = "", parameters: tuple[object, ...] = ()) -> list[dict[str, object]]:
+    # Do not aggregate every historical Episode for a single detail request.
+    single = where.strip() == "WHERE e.id = ?" and len(parameters) == 1
+    aggregate_filter = "WHERE episode_id = ?" if single else ""
     # Aggregate narrow stream rows first. Grouping the joined episode rows
     # duplicates large Flow history snapshots once per stream in SQLite's
     # temporary sort, which can stall history sync for minutes on Windows.
@@ -1639,7 +1644,7 @@ def _episode_rows(connection: sqlite3.Connection, where: str = "", parameters: t
             SELECT episode_id,
                    SUM(CASE WHEN stream_type = 'camera' AND available = 1 THEN 1 ELSE 0 END) AS camera_count,
                    MAX(CASE WHEN stream_type = 'mocap' AND available = 1 THEN 1 ELSE 0 END) AS mocap_available
-            FROM stream GROUP BY episode_id
+            FROM stream {aggregate_filter} GROUP BY episode_id
         ) stream_counts ON stream_counts.episode_id = e.id
         LEFT JOIN (
             SELECT episode_id,
@@ -1647,14 +1652,15 @@ def _episode_rows(connection: sqlite3.Connection, where: str = "", parameters: t
                    SUM(CASE WHEN deleted_at IS NULL AND source = 'flow_incremental' AND updated_at != created_at THEN 1 ELSE 0 END) AS incremental_modified_count,
                    SUM(CASE WHEN deleted_at IS NOT NULL AND source = 'flow_incremental' THEN 1 ELSE 0 END) AS incremental_removed_count,
                    SUM(CASE WHEN deleted_at IS NULL AND source = 'flow_incremental' AND updated_at = created_at THEN 1 ELSE 0 END) AS incremental_preserved_count
-            FROM annotation
+            FROM annotation {aggregate_filter}
             GROUP BY episode_id
         ) changes ON changes.episode_id = e.id
         {where}
         ORDER BY e.data_group COLLATE NOCASE, e.relative_path COLLATE NOCASE
     """
     rows = []
-    for row in connection.execute(query, parameters):
+    query_parameters = parameters * 3 if single else parameters
+    for row in connection.execute(query, query_parameters):
         value = dict(row)
         metadata = _loads(value.pop("timing_metadata_json"), {})
         value.update(annotation_timing(
@@ -3256,6 +3262,11 @@ def _active_label_schema(connection: sqlite3.Connection) -> dict[str, object] | 
     return _loads(row["raw_schema_json"], None) if row and row["raw_schema_json"] else None
 
 
+@lru_cache(maxsize=16)
+def _parsed_frozen_schema(raw):
+    return _loads(raw, None)
+
+
 def _label_schema_for_task(
     connection: sqlite3.Connection, task_id: str | None
 ) -> dict[str, object] | None:
@@ -3276,7 +3287,9 @@ def _label_schema_for_task(
                 str(row["annotation_schema_version"] or EGO_OPEN_SCHEMA_VERSION),
             )
         if row and row["raw_schema_json"]:
-            return _loads(row["raw_schema_json"], None)
+            # Key by the exact stored snapshot, not task ID. Publishing or
+            # rebinding cannot return stale labels; callers own their copy.
+            return deepcopy(_parsed_frozen_schema(row["raw_schema_json"]))
     return _active_label_schema(connection)
 
 

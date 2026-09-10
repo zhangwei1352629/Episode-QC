@@ -38,13 +38,14 @@ class IsolatedWork:
         self._pools = {kind: ProcessPoolExecutor(
             max_workers=1, mp_context=multiprocessing.get_context('spawn'),
             initializer=_lower_priority,
-        ) for kind in ('index', 'playback')}
+        ) for kind in ('index', 'playback', 'playback_background')}
 
     def call(self, kind, *args, **kwargs):
         # Caller owns queue admission and per-Episode serialization. Do not
         # silently retry writes in the HTTP process after a worker failure.
         pool = 'index' if kind == 'hash' else kind
-        return self._pools[pool].submit(_execute, kind, args, kwargs).result()
+        operation = 'playback' if kind == 'playback_background' else kind
+        return self._pools[pool].submit(_execute, operation, args, kwargs).result()
 
     def close(self):
         for pool in self._pools.values():

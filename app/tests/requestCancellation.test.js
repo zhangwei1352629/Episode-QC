@@ -27,6 +27,19 @@ test('navigation cancels old reads but never annotation/review writes', async()=
   const next=api.getEpisode('ep_new');calls[2].resolve(new Response('{}'));await next;
 });
 
+test('foreground requests cancel speculative reads, not writes', async()=>{
+  const calls=[];
+  const {api}=setup((url,options)=>new Promise((resolve,reject)=>{
+    calls.push({url,options,resolve});options.signal.addEventListener('abort',()=>reject(new Error('abort')));
+  }));
+  const warm=api.getEpisode('ep_next',{background:true});
+  assert.equal(calls[0].options.priority,'low');
+  const write=api.updateReview({episodeId:'ep_current',playheadNs:1});
+  await assert.rejects(warm,/取消或超时/);
+  assert.equal(calls[1].options.signal.aborted,false);
+  calls[1].resolve(new Response('{}'));await write;
+});
+
 test('timeout also covers stalled binary response bodies',async()=>{
   const {api,timers}=setup(async(url,options)=>({ok:true,status:200,headers:new Headers(),
     arrayBuffer:()=>new Promise((resolve,reject)=>options.signal.addEventListener('abort',()=>reject(new Error('abort'))))}));

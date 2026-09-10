@@ -1172,7 +1172,7 @@ class EpisodeQcWebApplication:
             raise ValueError("标签版本迁移后本地任务不可见")
         return refreshed, {**result, "workspace_backup": backup.name}
 
-    def submit_platform_job(self, job_code: str) -> dict[str, object]:
+    def submit_platform_job(self, job_code: str, *, delete_cache: bool = False) -> dict[str, object]:
         operation_lock = self._platform_claim_lock(job_code)
         with self._platform_lock:
             self._platform_result_jobs.add(job_code)
@@ -1185,10 +1185,38 @@ class EpisodeQcWebApplication:
                 self._platform_result_jobs.add(job_code)
                 self._platform_ownership_errors.pop(job_code, None)
             try:
-                return self._submit_platform_job_once(job_code)
+                if not delete_cache:
+                    return self._submit_platform_job_once(job_code)
+                # Keep annotation writes out of the submit/readback/delete window.
+                with self._workspace_write_lock:
+                    response = self._submit_platform_job_once(job_code)
+                    try:
+                        self._delete_verified_submitted_cache(job_code, response)
+                        response["cache_cleanup"] = {"status": "deleted"}
+                    except Exception as exc:
+                        LOGGER.exception("post-submit cache cleanup failed job=%s", job_code)
+                        response["cache_cleanup"] = {"status": "failed", "error": str(exc)}
+                    return response
             finally:
                 with self._platform_lock:
                     self._platform_result_jobs.discard(job_code)
+
+    def _delete_verified_submitted_cache(self, job_code, response):
+        manager = self._quality_cache_manager()
+        state_path = manager._state_path(job_code)
+        cache_root = manager.cache_root / "ready"
+        if state_path.parent.is_symlink() or state_path.parent.resolve().parent != cache_root.resolve():
+            raise ValueError("缓存路径异常，禁止删除")
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        submitted = response.get("job") or {}
+        fresh = self._require_flow_client().job(job_code)
+        if fresh.get("status") != "completed" or not state.get("result_synced"):
+            raise ValueError("Flow 结果尚未确认完成，未删除缓存")
+        for field in ("result_id", "result_sha256", "result_nas_path"):
+            if not fresh.get(field) or fresh[field] != submitted.get(field) or fresh[field] != state.get(field):
+                raise ValueError("本地与 Flow 结果不一致，未删除缓存")
+        manager._verify_result_readback(fresh["result_nas_path"], fresh["result_manifest"])
+        manager.evict(job_code)
 
     def _submit_platform_job_once(self, job_code: str) -> dict[str, object]:
         self._assert_flow_enabled()
@@ -2035,12 +2063,12 @@ class EpisodeQcWebApplication:
             task_id=request.get("taskId") if isinstance(request.get("taskId"), str) else None,
         )
 
-    def _prepare_playback_once(self, episode_id: str, mode: str) -> dict:
+    def _prepare_playback_once(self, episode_id: str, mode: str, *, background=False) -> dict:
         with self._jobs_lock:
             lock = self._playback_prepare_locks.setdefault(episode_id, threading.Lock())
         with lock:
             if self._isolated_work:
-                result = self._isolated_work.call('playback', self.paths.db_path, episode_id, self.paths.cache_root, mode=mode)
+                result = self._isolated_work.call('playback_background' if background else 'playback', self.paths.db_path, episode_id, self.paths.cache_root, mode=mode)
             else:
                 result = prepare_episode_cache(self.paths.db_path, episode_id, self.paths.cache_root, mode=mode)
             self.playback.set(episode_id, result)
@@ -2048,7 +2076,8 @@ class EpisodeQcWebApplication:
 
     def _schedule_read_ahead(self, episode_id: str, *, finish_current: bool = False) -> None:
         rows = playback_window(self.paths.db_path, episode_id)
-        jobs = [(row["id"], "priority") for row in rows if row["cache_status"] not in {"ready", "partial"}]
+        successors = [row for row in rows if row["id"] != episode_id][:1]
+        jobs = [(row["id"], "priority") for row in successors if row["cache_status"] not in {"ready", "partial"}]
         if finish_current or any(row["id"] == self._foreground_episode_id and row["cache_status"] == "partial" for row in rows):
             jobs.append((episode_id, "full"))
         with self._jobs_lock:
@@ -2058,7 +2087,14 @@ class EpisodeQcWebApplication:
 
     def _prepare_background_cache(self, episode_id: str, mode: str) -> None:
         try:
-            result = self._prepare_playback_once(episode_id, mode)
+            result = self._prepare_playback_once(episode_id, mode, background=True)
+            try:
+                cameras = result.get("cameras") or []
+                if cameras:
+                    self.playback.camera_frame(episode_id, cameras[0]["stream_id"], 0)
+                self.playback.action_frame(episode_id, "policy", 0)
+            except (OSError, KeyError, ValueError):
+                LOGGER.debug("Optional first-frame warmup unavailable for %s", episode_id, exc_info=True)
             self.events.publish({"episodeId": episode_id, "cache": public_cache_manifest(result)})
         except Exception as exc:
             self.events.publish({"episodeId": episode_id, "error": str(exc)})
@@ -2113,6 +2149,8 @@ class EpisodeQcRequestHandler(BaseHTTPRequestHandler):
             super().log_message(format_string, *args)
 
     def _dispatch(self, method: str) -> None:
+        request_started = time.perf_counter()
+        self._request_started = request_started
         try:
             parsed = urlsplit(self.path)
             self._assert_allowed_host()
@@ -2150,6 +2188,11 @@ class EpisodeQcRequestHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             traceback.print_exc()
             self._send_json({"error": f"{type(exc).__name__}: {exc}"}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        finally:
+            path = urlsplit(self.path).path
+            if re.fullmatch(r"/api/episodes/ep_[a-f0-9]+(?:/cache|/ai/suggestions)?", path):
+                LOGGER.info("episode_load method=%s path=%s elapsed_ms=%.1f", method, path,
+                            (time.perf_counter() - request_started) * 1000)
 
     def _assert_api_access(self, parsed: Any) -> None:
         origin = self.headers.get("Origin")
@@ -2258,8 +2301,11 @@ class EpisodeQcRequestHandler(BaseHTTPRequestHandler):
             self._send_json(app.start_platform_job(platform_start_match.group(1)))
             return
         if method == "POST" and platform_submit_match:
-            self._discard_body()
-            self._send_json(app.submit_platform_job(platform_submit_match.group(1)))
+            payload = self._json_body()
+            delete_cache = payload.get("delete_cache", False)
+            if not isinstance(delete_cache, bool):
+                raise ValueError("delete_cache 必须是布尔值")
+            self._send_json(app.submit_platform_job(platform_submit_match.group(1), delete_cache=delete_cache))
             return
         if method == "POST" and path in {"/api/sources", "/api/tasks/import"}:
             self._send_json(app.add_source(self._json_body()))
@@ -2461,6 +2507,8 @@ class EpisodeQcRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def _send_security_headers(self) -> None:
+        if hasattr(self, "_request_started"):
+            self.send_header("Server-Timing", f"app;dur={(time.perf_counter() - self._request_started) * 1000:.1f}")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("X-Frame-Options", "DENY")
         self.send_header(

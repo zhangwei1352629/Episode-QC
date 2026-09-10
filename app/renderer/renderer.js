@@ -806,14 +806,22 @@ async function submitCurrentFlowTask() {
   const task = state.currentTask;
   if (!task?.flow_job_code || task.status !== "completed") return;
   if (!window.confirm(`确认把 ${task.flow_job_code} 的全部 Episode 质检结论提交到 Flow？`)) return;
+  const deleteCache = window.confirm("提交成功并核验结果后，是否删除此批次的本地数据缓存？\n确定：成功后删除缓存；取消：提交但保留缓存。\n标注、质检记录和 NAS 数据均保留；提交失败不删除缓存。");
   setBusyButton(els.submitFlowTask, true, "提交中…");
   try {
-    await window.episodeQc.submitPlatformJob(task.flow_job_code);
-    await refreshWorkspace();
-    await refreshPlatformJobs({ quiet: true });
-    toast(`质检结果已提交到 Flow：${task.flow_job_code}`, "success", 6000);
+    const response = await window.episodeQc.submitPlatformJob(task.flow_job_code, { deleteCache });
+    const cleanup = response?.cache_cleanup;
+    const notice = cleanup?.status === "deleted"
+      ? "提交成功，本地数据缓存已删除，标注记录已保留"
+      : cleanup?.status === "failed"
+        ? `提交成功，但缓存未完整删除：${cleanup.error}。可稍后重试清理`
+        : "提交成功，本地缓存已保留";
+    toast(notice, cleanup?.status === "failed" ? "error" : "success", 8000);
+    await Promise.all([refreshWorkspace(), refreshPlatformJobs({ quiet: true })]).catch((error) => {
+      toast(`结果已提交，但页面刷新失败，请手动刷新：${error.message || error}`, "error", 8000);
+    });
   } catch (error) {
-    toast(error.message || String(error), "error", 7000);
+    toast(`提交请求失败：${error.message || String(error)}。提交失败不会删除缓存；如连接中断，结果及清理状态可能尚未返回，请刷新核对。`, "error", 9000);
   } finally {
     renderTaskContext();
   }
@@ -1067,15 +1075,31 @@ function renderEpisodeList() {
 let renderAI;
 function refreshAI() {
   if (!renderAI) renderAI=installAISuggestions({container:els.annotationList,api:window.episodeQc,episodeId:()=>state.currentEpisodeId,seek:seekTo,reload:reloadCurrentEpisode,applyDetail:(eid,detail)=>{if(eid===state.currentEpisodeId){state.detail=detail;renderEpisodeDetail();}},notify:(s)=>toast(s,"error")});
-  renderAI();
+  return renderAI();
+}
+let nextEpisodeWarmup = null;
+function scheduleNextEpisodeWarmup(token) {
+  clearTimeout(nextEpisodeWarmup);
+  nextEpisodeWarmup = setTimeout(() => {
+    if (token !== state.loadToken || state.playing) return;
+    const index = state.episodes.findIndex((e) => e.id === state.currentEpisodeId);
+    const next = index >= 0 ? state.episodes[index + 1] : null;
+    // Warm SQLite pages and immutable schema only. Never display cached
+    // annotations: another reviewer or AI import may have updated them.
+    if (next) window.episodeQc.getEpisode(next.id, { background: true }).catch(() => {});
+  }, 1500);
 }
 async function openEpisode(episodeId) {
   if (!episodeId || episodeId === state.currentEpisodeId && state.cache) return;
   const token = ++state.loadToken;
+  clearTimeout(nextEpisodeWarmup);
+  const started = performance.now();
+  const timing = { episodeId };
+  const stamp = (stage) => { timing[stage] = Math.round(performance.now() - started); };
   window.episodeQc.cancelEpisodeReads?.();
   state.visualGeneration = (state.visualGeneration || 0) + 1;
   state.visualPending = false;
-  if (state.currentEpisodeId) await savePlayhead();
+  if (state.currentEpisodeId) void savePlayhead();
   if (token !== state.loadToken) return;
   state.playing = false;
   state.cache = null;
@@ -1103,7 +1127,13 @@ async function openEpisode(episodeId) {
   renderEpisodeList();
   setCacheStatus("busy", "读取 Episode 元信息…");
   try {
+    // Attach both rejection handlers immediately; a cancelled prepare must
+    // never cause an unhandled rejection while detail is still loading.
+    const prepared = window.episodeQc.prepareEpisode(episodeId).then(
+      (value) => { stamp("playbackReadyMs"); return { value }; }, (error) => ({ error }),
+    );
     const detail = await window.episodeQc.getEpisode(episodeId);
+    stamp("detailMs");
     if (token !== state.loadToken) return;
     state.detail = detail;
     state.selectedBaseTarget = detail.episode.mocap_available ? "mocap" : "global";
@@ -1112,9 +1142,11 @@ async function openEpisode(episodeId) {
     state.playheadNs = Math.min(Number(detail.episode.last_playhead_ns || 0), state.durationNs);
     state.playbackEpisodeId = episodeId;
     renderEpisodeDetail();
-    refreshAI();
+    Promise.resolve(refreshAI()).then(() => stamp("aiMs")).catch(() => {});
     setCacheStatus("busy", "首次打开：正在建立只读播放缓存…");
-    const cache = await window.episodeQc.prepareEpisode(state.playbackEpisodeId);
+    const outcome = await prepared;
+    if (outcome.error) throw outcome.error;
+    const cache = outcome.value;
     if (token !== state.loadToken) return;
     state.cache = cache;
     syncInteractiveState();
@@ -1128,6 +1160,12 @@ async function openEpisode(episodeId) {
       : "默认相机与 Policy 已就绪 · 其余流后台缓存中…";
     setCacheStatus("ready", `${cacheMessage}${cache.decode_errors?.length ? ` · ${cache.decode_errors.length} 个解析提示` : ""}`);
     await requestVisualFrames(true);
+    if (token !== state.loadToken) return;
+    stamp("visualRequestsMs");
+    requestAnimationFrame(() => { if (token === state.loadToken) stamp("paintOpportunityMs"); });
+    state.switchTimings = [...(state.switchTimings || []), timing].slice(-20);
+    console.info("Episode switch timing", timing);
+    scheduleNextEpisodeWarmup(token);
   } catch (error) {
     if (token !== state.loadToken) return;
     setCacheStatus("error", "载入失败");
@@ -2431,11 +2469,15 @@ async function refreshTaskSummaries() {
   } catch { /* Episode 已保存，任务摘要稍后刷新即可 */ }
 }
 
+const playheadSaves = new Map();
 async function savePlayhead() {
   if (!state.currentEpisodeId) return;
-  try {
-    await window.episodeQc.updateReview({ episodeId: state.currentEpisodeId, playheadNs: Math.round(state.playheadNs), reviewer: els.reviewerName.value.trim() });
-  } catch { /* best-effort window close / switch save */ }
+  const payload = { episodeId: state.currentEpisodeId, playheadNs: Math.round(state.playheadNs), reviewer: els.reviewerName.value.trim() };
+  const previous = playheadSaves.get(payload.episodeId) || Promise.resolve();
+  const pending = previous.then(() => window.episodeQc.updateReview(payload)).catch(() => {});
+  playheadSaves.set(payload.episodeId, pending);
+  await pending;
+  if (playheadSaves.get(payload.episodeId) === pending) playheadSaves.delete(payload.episodeId);
 }
 
 function moveEpisode(direction) {

@@ -12,9 +12,15 @@ function installWebApi() {
   const token = incomingToken || window.sessionStorage.getItem("episodeQcToken") || "";
   const cacheByEpisode = new Map();
   const episodeReads = new Set();
+  const backgroundReads = new Set();
 
-  async function request(path, { method = "GET", body, binary = false, timeoutMs = null } = {}) {
+  async function request(path, { method = "GET", body, binary = false, timeoutMs = null, background = false } = {}) {
+    if (!background) {
+      for (const pending of backgroundReads) pending.abort();
+      backgroundReads.clear();
+    }
     const controller = new AbortController();
+    if (background) backgroundReads.add(controller);
     const cancellable = path.startsWith('/api/episodes/') && (method === 'GET' || path.endsWith('/cache') || path.endsWith('/ai/suggestions'));
     if (cancellable) episodeReads.add(controller);
     const waitMs = timeoutMs ?? (method === 'GET' ? 20000 : 0);
@@ -28,6 +34,7 @@ function installWebApi() {
       body: body === undefined ? undefined : JSON.stringify(body),
       cache: "no-store",
       signal: controller.signal,
+      priority: background ? "low" : "auto",
     });
     if (!response.ok) {
       let message = `${response.status} ${response.statusText}`;
@@ -45,6 +52,7 @@ function installWebApi() {
     } finally {
       if (timer !== null) clearTimeout(timer);
       episodeReads.delete(controller);
+      backgroundReads.delete(controller);
     }
   }
 
@@ -92,9 +100,9 @@ function installWebApi() {
       `/api/platform/jobs/${encodeURIComponent(jobCode)}/start`,
       { method: "POST" },
     ),
-    submitPlatformJob: (jobCode) => request(
+    submitPlatformJob: (jobCode, { deleteCache = false } = {}) => request(
       `/api/platform/jobs/${encodeURIComponent(jobCode)}/submit`,
-      { method: "POST" },
+      { method: "POST", body: { delete_cache: deleteCache } },
     ),
     updateWorkspaceSettings: (value) => request("/api/workspace/settings", { method: "POST", body: value, timeoutMs:20000 }),
     addSource: async (taskKind = "robot_teleoperation") => {
@@ -120,7 +128,7 @@ function installWebApi() {
     ),
     rescanTask: (taskId) => request(`/api/tasks/${encodeURIComponent(taskId)}/rescan`, { method: "POST" }),
     aiSuggestions: (episodeId, action, body) => request(`/api/episodes/${encodeURIComponent(episodeId)}/ai/${action}`, { method: "POST", body, timeoutMs:120000 }),
-    getEpisode: (episodeId) => request(`/api/episodes/${encodeURIComponent(episodeId)}`),
+    getEpisode: (episodeId, { background = false } = {}) => request(`/api/episodes/${encodeURIComponent(episodeId)}`, { background }),
     prepareEpisode: async (episodeId) => {
       const cache = await request(`/api/episodes/${encodeURIComponent(episodeId)}/cache`, { method: "POST", timeoutMs:90000 });
       cacheByEpisode.set(episodeId, cache);

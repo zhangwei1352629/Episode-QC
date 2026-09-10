@@ -9,6 +9,9 @@ def test_spawned_index_uses_separate_process_and_propagates_errors(tmp_path):
     try:
         worker_pid = work._pools['index'].submit(os.getpid).result(timeout=15)
         assert worker_pid != os.getpid()
+        foreground_pid = work._pools['playback'].submit(os.getpid).result(timeout=15)
+        background_pid = work._pools['playback_background'].submit(os.getpid).result(timeout=15)
+        assert len({worker_pid, foreground_pid, background_pid, os.getpid()}) == 4
         root = tmp_path / 'source'
         root.mkdir()
         db = tmp_path / 'workspace.db'

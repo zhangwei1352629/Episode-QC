@@ -1249,6 +1249,18 @@ class QualityCacheManager:
             summary["cache_error"] = str(state["cache_error"])
         if state.get("result_sync_error"):
             summary["result_sync_error"] = str(state["result_sync_error"])
+        if is_ready_state and state.get("cache_complete"):
+            asset_root = state_path.parent / str(state.get("asset_directory") or "")
+            primary = state.get("primary_files") or []
+            missing = [str(item.get("path") or "") for item in primary
+                       if not (asset_root / str(item.get("path") or "")).is_file()]
+            if missing:
+                summary.update(
+                    cache_complete=False,
+                    cache_status="cache_files_missing",
+                    cache_error="本地原文件缺失，请恢复缓存；已有标注保留",
+                    missing_primary_file_count=len(missing),
+                )
         return summary
 
     def record_result_sync_error(self, job_code: str, error: str) -> None:
@@ -1306,7 +1318,21 @@ class QualityCacheManager:
         state = json.loads(state_path.read_text(encoding="utf-8"))
         if not state.get("result_synced"):
             raise QualityCacheError("质检结果尚未同步，禁止清理本地缓存")
+        # Keep an audit outside the directory being deleted. Failure to persist
+        # the intent must prevent deletion, not silently lose the evidence.
+        audit = self.cache_root / "cleanup-audit.jsonl"
+        record = {"job_code": job_code, "workstation": self.workspace_name,
+                  "actor": os.environ.get("USERNAME") or os.environ.get("USER") or "unknown",
+                  "time": datetime.now(timezone.utc).isoformat(),
+                  "reason": "explicit_cache_evict", "path": str(ready_root),
+                  "result_id": state.get("result_id"), "event": "delete_requested"}
+        with audit.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
         shutil.rmtree(ready_root)
+        with audit.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps({**record, "event": "delete_completed"}, ensure_ascii=False) + "\n")
 
     def evict_expired(
         self,
@@ -1350,14 +1376,10 @@ class QualityCacheManager:
             if synced_at.tzinfo is None or current < synced_at.astimezone(timezone.utc) + retention:
                 summary["skipped_jobs"].append(job_code)
                 continue
-            try:
-                freed_bytes = sum(path.stat().st_size for path in job_root.rglob("*") if path.is_file())
-                self.evict(job_code)
-            except (OSError, json.JSONDecodeError, QualityCacheError) as exc:
-                summary["failed_jobs"][job_code] = str(exc)
-                continue
-            summary["evicted_jobs"].append(job_code)
-            summary["freed_bytes"] += freed_bytes
+            # A local result_synced flag is not current Flow/NAS/workspace
+            # evidence. Fail closed until a verified cleanup workflow exists.
+            summary["skipped_jobs"].append(job_code)
+            summary["cleanup_paused_reason"] = "需人工核对 Flow、NAS 结果及本地未提交修改后清理"
         return summary
 
     def _publish_result(

@@ -2364,7 +2364,7 @@ def test_cache_job_accepts_partial_job_coverage_and_copies_only_covered_files(tm
     assert state["asset_manifest_sha256"] == canonical_json_sha256(full_manifest)
 
 
-def test_evict_expired_removes_synced_ready_cache_after_one_day(tmp_path: Path):
+def test_evict_expired_retains_cache_without_live_verification(tmp_path: Path):
     cache_root = tmp_path / "cache"
     manager = QualityCacheManager(cache_root, reserve_bytes=0)
     job_root = cache_root / "ready" / "QCJ-expired"
@@ -2377,9 +2377,28 @@ def test_evict_expired_removes_synced_ready_cache_after_one_day(tmp_path: Path):
 
     summary = manager.evict_expired(now=datetime(2026, 8, 10, 12, tzinfo=timezone.utc))
 
-    assert summary["evicted_jobs"] == ["QCJ-expired"]
-    assert summary["freed_bytes"] == expected_bytes
-    assert not job_root.exists()
+    assert summary["evicted_jobs"] == []
+    assert summary["freed_bytes"] == 0
+    assert summary["skipped_jobs"] == ["QCJ-expired"]
+    assert job_root.exists()
+
+
+def test_cache_summary_checks_primary_files_and_manual_cleanup_is_audited(tmp_path):
+    manager = QualityCacheManager(tmp_path / "cache", reserve_bytes=0)
+    root = manager.cache_root / "ready" / "QCJ-check"
+    asset = root / "AST-check"
+    asset.mkdir(parents=True)
+    state = {"job_code": "QCJ-check", "asset_directory": "AST-check",
+             "cache_complete": True, "primary_files": [{"path": "episode.mcap"}],
+             "result_synced": True}
+    (root / ".qc-cache.json").write_text(json.dumps(state))
+    assert manager.cache_summary("QCJ-check")["cache_status"] == "cache_files_missing"
+    (asset / "episode.mcap").write_bytes(b"data")
+    assert manager.cache_summary("QCJ-check")["cache_complete"] is True
+    manager.evict("QCJ-check")
+    events = [json.loads(line) for line in (manager.cache_root / "cleanup-audit.jsonl").read_text().splitlines()]
+    assert [e["event"] for e in events] == ["delete_requested", "delete_completed"]
+    assert all(e["job_code"] == "QCJ-check" for e in events)
 
 def test_evict_expired_keeps_nonobject_state_and_download_partial(tmp_path: Path):
     cache_root = tmp_path / "cache"

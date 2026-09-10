@@ -180,7 +180,7 @@ def running_server(
         server.server_close()
 
 
-def test_web_application_evicts_expired_platform_cache_on_startup(tmp_path: Path):
+def test_web_application_retains_expired_platform_cache_on_startup(tmp_path: Path):
     expired = tmp_path / "workspace" / "platform-cache" / "ready" / "QCJ-expired"
     expired.mkdir(parents=True)
     (expired / ".qc-cache.json").write_text(
@@ -193,7 +193,7 @@ def test_web_application_evicts_expired_platform_cache_on_startup(tmp_path: Path
     (expired / "asset.bin").write_bytes(b"synced-cache")
 
     with running_server(tmp_path):
-        assert not expired.exists()
+        assert expired.exists()
 
 
 def test_web_application_starts_and_closes_platform_cache_cleanup(tmp_path: Path, monkeypatch):
@@ -545,6 +545,14 @@ def test_result_reconciliation_persists_failure_and_releases_single_flight(
 
         assert recorded == [("QCJ-RETRY", "Flow offline")]
         assert "QCJ-RETRY" not in server.application._platform_result_jobs
+
+
+def test_missing_primary_is_reported_before_playback_preparation(tmp_path: Path, monkeypatch):
+    with running_server(tmp_path) as (server, _):
+        monkeypatch.setattr("episode_qc.web_server.episode_detail", lambda *_: {
+            "episode": {"mcap_path": str(tmp_path / "missing.mcap")}})
+        with pytest.raises(ValueError, match="恢复缓存"):
+            server.application.prepare_episode("ep_missing")
 
 
 def test_cleanup_failure_does_not_stop_the_web_server(tmp_path: Path, monkeypatch, caplog):
@@ -1292,6 +1300,8 @@ def test_web_exposes_missing_cache_state_and_backs_up_before_recovery(
         payload = server.application.get_platform_jobs()
         assert payload["jobs"][0]["cache_state_missing"] is True
         assert payload["jobs"][0]["cache_recovery_available"] is True
+        assert payload["jobs"][0]["cache_complete"] is False
+        assert payload["jobs"][0]["cache_progress"] == 0
 
         response = server.application.claim_platform_job(job["code"])
 

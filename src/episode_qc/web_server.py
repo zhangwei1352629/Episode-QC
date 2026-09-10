@@ -1373,11 +1373,20 @@ class EpisodeQcWebApplication:
                 local_task and code in missing_cache_state_jobs
             )
             cache_recovery_available = bool(
-                cache_state_missing
+                (cache_state_missing or (cache_summary or {}).get("cache_status") == "cache_files_missing")
+                and local_task
                 and local_task.get("status") not in {"submitted", "archived"}
                 and item.get("status") not in {"completed", "waiting_data"}
             )
             cache_summary = cache_summary or {}
+            if cache_state_missing and cache_recovery_available:
+                cache_summary = {
+                    **cache_summary,
+                    "cache_complete": False,
+                    "cache_status": "cache_files_missing",
+                    "cache_progress": 0,
+                    "cache_error": "本地缓存目录或状态文件缺失，请恢复缓存；已有标注保留",
+                }
             label_snapshot_mismatch = _task_label_snapshot_mismatch(
                 item, local_task
             )
@@ -1864,6 +1873,8 @@ class EpisodeQcWebApplication:
 
     def prepare_episode(self, episode_id: str) -> dict[str, object]:
         detail = episode_detail(self.paths.db_path, episode_id)
+        if not Path(str(detail["episode"].get("mcap_path") or "")).is_file():
+            raise ValueError("本地 Episode 原文件缺失，请返回任务列表恢复缓存；已有质检和标注不会删除")
         result = prepare_episode_cache(
             self.paths.db_path,
             episode_id,

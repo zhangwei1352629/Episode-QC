@@ -2116,6 +2116,7 @@ def _safe_previous_review(value: object) -> dict[str, object] | None:
         "job_type",
         "deleted_annotation_lineages",
         "round_number",
+        "round_kind",
     }
     safe = {key: value[key] for key in allowed_fields if key in value}
     if "deleted_annotation_lineages" in value:
@@ -2190,6 +2191,9 @@ def _incremental_lineage(review: dict[str, object], annotation: dict[str, object
         existing = attributes.get("_incremental_lineage_id")
         if isinstance(existing, str) and existing.strip():
             return existing.strip()
+        ai = attributes.get('ai_provenance')
+        if isinstance(ai, dict) and ai.get('run_id') and ai.get('candidate_id'):
+            return f"ai:{ai['run_id']}:{ai['candidate_id']}"
     annotation_identity = annotation.get("source_annotation_id") or annotation.get("id")
     return f"{review.get('job_code') or 'history'}:{annotation_identity}"
 
@@ -2200,6 +2204,7 @@ def _seed_incremental_annotations(
     job_code: str,
     local_episode_id: str,
     review_history: list[dict[str, object]],
+    inherit_ai: bool = False,
 ) -> int:
     """Materialize all compatible historical facts as copy-on-write annotations."""
 
@@ -2260,7 +2265,16 @@ def _seed_incremental_annotations(
 
     inserted = 0
     now = _now()
+    existing_lineages = set()
+    for existing in connection.execute('SELECT id, attributes_json FROM annotation WHERE episode_id=?', (local_episode_id,)):
+        existing_lineages.add(_incremental_lineage({}, {'id':existing['id'], 'attributes':_loads(existing['attributes_json'], {})}))
     for lineage, (review, annotation, origin_round_number) in effective.items():
+        if review.get('round_kind') == 'ai' and not inherit_ai:
+            continue
+        if lineage in existing_lineages:
+            continue  # Includes tombstones and legacy accepted AI candidates.
+        if review.get('round_kind') == 'ai' and episode['review_status'] in {'completed', 'reviewed'}:
+            continue  # Never silently change a finished human result.
         label_code = str(annotation.get("label_code") or "")
         label = definitions.get(label_code)
         if label is None:
@@ -2275,6 +2289,7 @@ def _seed_incremental_annotations(
             "annotation_id": annotation.get("id"),
             "round_number": review.get("round_number"),
             "origin_round_number": origin_round_number,
+            "round_kind": review.get('round_kind', 'human'),
             "schema_version": (review.get("label_set") or {}).get("schema_version")
             if isinstance(review.get("label_set"), dict)
             else None,
@@ -2337,6 +2352,8 @@ def sync_flow_previous_reviews(
     db_path: str | Path,
     job: dict[str, object],
     mappings: list[dict[str, object]],
+    *,
+    inherit_ai: bool = False,
 ) -> int:
     """Attach immutable history and create an editable incremental work copy."""
 
@@ -2412,6 +2429,7 @@ def sync_flow_previous_reviews(
                 job_code=job_code,
                 local_episode_id=local_episode_id,
                 review_history=review_history,
+                inherit_ai=inherit_ai,
             )
             updated += 1
     return updated

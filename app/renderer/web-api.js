@@ -11,10 +11,14 @@ function installWebApi() {
   }
   const token = incomingToken || window.sessionStorage.getItem("episodeQcToken") || "";
   const cacheByEpisode = new Map();
+  const episodeReads = new Set();
 
-  async function request(path, { method = "GET", body, binary = false, timeoutMs = 0 } = {}) {
+  async function request(path, { method = "GET", body, binary = false, timeoutMs = null } = {}) {
     const controller = new AbortController();
-    const timer = timeoutMs ? setTimeout(() => controller.abort(), timeoutMs) : null;
+    const cancellable = path.startsWith('/api/episodes/') && (method === 'GET' || path.endsWith('/cache') || path.endsWith('/ai/suggestions'));
+    if (cancellable) episodeReads.add(controller);
+    const waitMs = timeoutMs ?? (method === 'GET' ? 20000 : 0);
+    const timer = waitMs ? setTimeout(() => controller.abort(), waitMs) : null;
     try {
     const headers = { "X-Episode-QC-Token": token };
     if (body !== undefined) headers["Content-Type"] = "application/json";
@@ -31,9 +35,16 @@ function installWebApi() {
       throw new Error(message);
     }
     if (response.status === 204) return null;
-    return binary ? response : await response.json();
+    // Keep the timeout active until the entire body has arrived, not only headers.
+    return binary ? new Response(await response.arrayBuffer(), { status: response.status, headers: response.headers }) : await response.json();
+    } catch (error) {
+      if (controller.signal.aborted) throw new Error(cancellable
+        ? '读取已取消或超时，请重新选择当前条目；已保存的标注不受影响。'
+        : '请求等待超时，服务端结果待核对；请刷新确认后再重试。');
+      throw error;
     } finally {
       if (timer !== null) clearTimeout(timer);
+      episodeReads.delete(controller);
     }
   }
 
@@ -47,6 +58,7 @@ function installWebApi() {
   }
 
   const api = {
+    cancelEpisodeReads: () => { for (const controller of episodeReads) controller.abort(); episodeReads.clear(); },
     getHealth: () => request("/api/health"),
     getWorkspaceState: (taskId) => request(
       `/api/workspace${taskId ? `?task_id=${encodeURIComponent(taskId)}` : ""}`,
@@ -61,7 +73,7 @@ function installWebApi() {
       method: "POST",
       body: { baseUrl },
     }),
-    loginPlatform: (value) => request("/api/platform/login", { method: "POST", body: value }),
+    loginPlatform: (value) => request("/api/platform/login", { method: "POST", body: value, timeoutMs:120000 }),
     logoutPlatform: () => request("/api/platform/logout", { method: "POST" }),
     getLabelSets: () => request("/api/label-sets"),
     activateLabelSet: (labelSetId) => request(
@@ -84,7 +96,7 @@ function installWebApi() {
       `/api/platform/jobs/${encodeURIComponent(jobCode)}/submit`,
       { method: "POST" },
     ),
-    updateWorkspaceSettings: (value) => request("/api/workspace/settings", { method: "POST", body: value }),
+    updateWorkspaceSettings: (value) => request("/api/workspace/settings", { method: "POST", body: value, timeoutMs:20000 }),
     addSource: async (taskKind = "robot_teleoperation") => {
       const ego = taskKind === "ego_omniego";
       const storageKey = ego ? "episodeQcEgoSourcePath" : "episodeQcSourcePath";
@@ -107,10 +119,10 @@ function installWebApi() {
       { method: "POST", body: { rootPath, taskKind } },
     ),
     rescanTask: (taskId) => request(`/api/tasks/${encodeURIComponent(taskId)}/rescan`, { method: "POST" }),
-    aiSuggestions: (episodeId, action, body) => request(`/api/episodes/${encodeURIComponent(episodeId)}/ai/${action}`, { method: "POST", body }),
+    aiSuggestions: (episodeId, action, body) => request(`/api/episodes/${encodeURIComponent(episodeId)}/ai/${action}`, { method: "POST", body, timeoutMs:120000 }),
     getEpisode: (episodeId) => request(`/api/episodes/${encodeURIComponent(episodeId)}`),
     prepareEpisode: async (episodeId) => {
-      const cache = await request(`/api/episodes/${encodeURIComponent(episodeId)}/cache`, { method: "POST" });
+      const cache = await request(`/api/episodes/${encodeURIComponent(episodeId)}/cache`, { method: "POST", timeoutMs:90000 });
       cacheByEpisode.set(episodeId, cache);
       return cache;
     },
@@ -174,7 +186,7 @@ function installWebApi() {
     redo: () => request("/api/redo", { method: "POST" }),
     updateReview: ({ episodeId, ...value }) => request(
       `/api/episodes/${encodeURIComponent(episodeId)}/review`,
-      { method: "POST", body: value },
+      { method: "POST", body: value, timeoutMs:20000 },
     ),
     exportWorkspace: async (value) => {
       let outputParent = value?.outputParent;

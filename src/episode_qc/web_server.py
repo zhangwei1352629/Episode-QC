@@ -38,6 +38,8 @@ from episode_qc.playback import (
 )
 from episode_qc.source_paths import resolve_source_directory
 from episode_qc.playback_queue import PlaybackQueue
+from episode_qc.isolated_work import IsolatedWork
+from episode_qc.resource_budget import DownloadBudget
 from episode_qc.workspace import (
     backup_workspace_database,
     delete_annotation,
@@ -467,12 +469,15 @@ class EpisodeQcWebApplication:
         token: str | None = None,
         flow_enabled: bool = True,
         require_token: bool = True,
+        isolated_workers: bool = False,
     ) -> None:
         self.paths = paths
         self.token = token or secrets.token_urlsafe(32)
         self.events = EventHub()
         self.playback = PlaybackRegistry(paths.cache_root)
         self.pending_label_schema: Path | None = None
+        self._isolated_work = IsolatedWork() if isolated_workers else None
+        self._download_budget = DownloadBudget()
         self._playback_queue = PlaybackQueue(self._prepare_background_cache)
         self._foreground_episode_id = ""
         self._playback_prepare_locks: dict[str, threading.Lock] = {}
@@ -534,6 +539,8 @@ class EpisodeQcWebApplication:
         self._platform_result_reconcile_stop.set()
         self._platform_result_reconcile_thread.join(timeout=5)
         self._playback_queue.close()
+        if self._isolated_work is not None:
+            self._isolated_work.close()
         self._platform_executor.shutdown(wait=False, cancel_futures=True)
         self._platform_progress_executor.shutdown(wait=False, cancel_futures=True)
 
@@ -1342,6 +1349,8 @@ class EpisodeQcWebApplication:
             raise ValueError("当前为单机模式，Flow 功能未启用")
 
     def _platform_payload(self, response: dict[str, object]) -> dict[str, object]:
+        with self._platform_lock:
+            caching_at_start = set(self._platform_jobs)
         tasks = list_qc_tasks(self.paths.db_path)
         local_by_job = {
             str(task["flow_job_code"]): task
@@ -1363,7 +1372,9 @@ class EpisodeQcWebApplication:
                 else:
                     cache_by_job[job_code] = summary
         with self._platform_lock:
-            caching = set(self._platform_jobs)
+            # A worker can finish after we read an incomplete disk summary.
+            # Keep polling one more time rather than publish a false terminal state.
+            caching = caching_at_start | set(self._platform_jobs)
             progress_by_job = {
                 code: dict(values)
                 for code, values in self._platform_progress.items()
@@ -1613,6 +1624,7 @@ class EpisodeQcWebApplication:
         return QualityCacheManager(
             self.paths.root / "platform-cache",
             reserve_bytes=int(reserve_gb * 1024**3),
+            download_budget=self._download_budget,
         )
 
     def _cache_platform_job(self, client, job_code: str) -> None:
@@ -1646,7 +1658,8 @@ class EpisodeQcWebApplication:
             )
             # Parsing is outside the annotation writer lock; the scanner
             # commits each newly indexed Episode in a short transaction.
-            indexed = scan_data_source(
+            scan = (lambda *args, **kwargs: self._isolated_work.call('index', *args, **kwargs)) if self._isolated_work else scan_data_source
+            indexed = scan(
                     self.paths.db_path,
                     str(values["cache_dir"]),
                     profile_path=profile_path,
@@ -2026,7 +2039,10 @@ class EpisodeQcWebApplication:
         with self._jobs_lock:
             lock = self._playback_prepare_locks.setdefault(episode_id, threading.Lock())
         with lock:
-            result = prepare_episode_cache(self.paths.db_path, episode_id, self.paths.cache_root, mode=mode)
+            if self._isolated_work:
+                result = self._isolated_work.call('playback', self.paths.db_path, episode_id, self.paths.cache_root, mode=mode)
+            else:
+                result = prepare_episode_cache(self.paths.db_path, episode_id, self.paths.cache_root, mode=mode)
             self.playback.set(episode_id, result)
             return result
 
@@ -2102,6 +2118,8 @@ class EpisodeQcRequestHandler(BaseHTTPRequestHandler):
             self._assert_allowed_host()
             if parsed.path.startswith("/api/"):
                 self._assert_api_access(parsed)
+                if parsed.path.startswith('/api/episodes/') or parsed.path.startswith('/api/annotations'):
+                    self.application._download_budget.touch()
                 self._route_api(method, parsed.path, parse_qs(parsed.query))
             elif method == "GET":
                 if not self._redirect_entry_with_current_token(parsed):
@@ -2284,7 +2302,8 @@ class EpisodeQcRequestHandler(BaseHTTPRequestHandler):
             if action == "start":
                 raise ValueError("请在 Flow 质检工作台启动 AI 标注")
             if action == "review":
-                result = app._write_workspace(lambda: ai_annotations.review(app, eid, body))
+                # Network/source verification must not hold the annotation writer lock.
+                result = ai_annotations.review(app, eid, body)
             else:
                 result = ai_annotations.fetch(app, eid, start=action == "start")
             self._send_json(result)
@@ -2456,6 +2475,7 @@ def create_web_server(
     *,
     port: int = 0,
     token: str | None = None,
+    isolated_workers: bool = True,
     host: str = "127.0.0.1",
     public_hosts: tuple[str, ...] = (),
     flow_enabled: bool = True,
@@ -2478,6 +2498,7 @@ def create_web_server(
         token=token,
         flow_enabled=flow_enabled,
         require_token=require_token,
+        isolated_workers=isolated_workers,
     )
     return EpisodeQcWebServer(
         (bind_host, port),

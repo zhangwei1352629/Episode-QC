@@ -1,4 +1,4 @@
-// AI stays separate from saved annotations until a reviewer explicitly accepts it.
+// Frozen AI rounds seed editable human copies; original AI output stays immutable.
 export function installAISuggestions({ container, api, episodeId, seek, reload, notify }) {
   const panel=document.createElement('details');panel.className='ai-suggestions';container.before(panel);
   let generation=0;
@@ -13,6 +13,12 @@ export function installAISuggestions({ container, api, episodeId, seek, reload, 
     try {
       const data=await api.aiSuggestions(eid,start?'start':'suggestions',{});
       if(g!==generation||eid!==episodeId())return;
+      if(data.inherited_rounds){
+        await reload();
+        if(g!==generation||eid!==episodeId())return;
+        info.textContent=`AI 独立历史轮已载入时间轴 · 当前为人工复检，可修改、删除或补标；AI 原始记录保留。`;
+        return;
+      }
       const counts={};for(const c of data.coverage||[])counts[c.state]=(counts[c.state]||0)+1;
       info.textContent=(data.runs||[]).map(r=>({queued:'排队',running:'分析中',succeeded:'已就绪',failed:'失败',stale:'已过期'}[r.state]||r.state)).join(' / ')||'尚未生成，请在 Flow 质检工作台启动';
       info.textContent+=' · 无法判断 '+(counts.unknown||0)+' 项；未检出不等于合格。';

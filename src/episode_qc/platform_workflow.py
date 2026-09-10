@@ -417,12 +417,14 @@ class QualityCacheManager:
         reserve_bytes: int = 10 * 1024**3,
         workspace_name: str | None = None,
         chunk_size: int = 8 * 1024 * 1024,
+        download_budget=None,
     ):
         self.cache_root = Path(cache_root).expanduser().resolve()
         self.cache_root.mkdir(parents=True, exist_ok=True)
         self.reserve_bytes = int(reserve_bytes)
         self.workspace_name = workspace_name or socket.gethostname()
         self.chunk_size = chunk_size
+        self.download_budget = download_budget
 
     def cache_job(
         self,
@@ -495,12 +497,14 @@ class QualityCacheManager:
             except QualityCacheError:
                 state["asset_manifest_ready"] = False
         state_entries = {item["episode_id"]: item for item in state["episodes"]}
+        verified_episodes: dict = {}
         copied_bytes = self._progressive_cached_bytes(
             ready_root,
             partial_root,
             state_entries,
             episode_specs,
             manifest_file,
+            verified_episodes=verified_episodes,
         )
         if not state.get("cache_complete"):
             state["cache_status"] = (
@@ -608,6 +612,9 @@ class QualityCacheManager:
                     state["cache_status"] = "partially_ready"
                     self._write_progressive_state(state_path, state, copied_bytes)
             if was_ready:
+                receipt = verified_episodes.pop(episode['episode_id'], None)
+                if receipt and receipt[0] == self._file_signatures(ready_root, episode_files):
+                    verified = receipt[1]
                 verified = verified or self._verify_manifest_files(ready_root, episode_files)
             else:
                 episode_ready = False
@@ -2103,6 +2110,8 @@ class QualityCacheManager:
         state_entries: dict[str, dict],
         episode_specs: list[dict],
         manifest_file: dict,
+        *,
+        verified_episodes: dict | None = None,
     ) -> int:
         copied = 0
         manifest_path = ready_root / manifest_file["relative_path"]
@@ -2116,17 +2125,33 @@ class QualityCacheManager:
             episode_files = episode["files"]
             if entry.get("status") == "ready":
                 try:
-                    self._verify_manifest_files(ready_root, episode_files)
+                    before = self._file_signatures(ready_root, episode_files)
+                    verified = self._verify_manifest_files(ready_root, episode_files)
+                    after = self._file_signatures(ready_root, episode_files)
                 except QualityCacheError:
                     entry["status"] = "not_cached"
                     entry["primary_files"] = []
                 else:
+                    if verified_episodes is not None and before and before == after:
+                        verified_episodes[episode['episode_id']] = (after, verified)
                     copied += sum(int(item["size_bytes"]) for item in episode_files)
                     continue
             partial_bytes = self._existing_bytes(partial_root, episode_files)
             entry["cached_bytes"] = partial_bytes
             copied += partial_bytes
         return copied
+
+    @staticmethod
+    def _file_signatures(root: Path, files: list[dict]) -> tuple:
+        signatures = []
+        for item in files:
+            try:
+                stat = (root / item['relative_path']).stat()
+            except OSError:
+                return ()
+            signatures.append((item['relative_path'], stat.st_size, stat.st_mtime_ns,
+                               stat.st_ctime_ns, stat.st_ino, stat.st_dev))
+        return tuple(signatures)
 
     @staticmethod
     def _ready_episode_count(state: dict) -> int:
@@ -2611,6 +2636,8 @@ class QualityCacheManager:
                 chunk = input_file.read(self.chunk_size)
                 if not chunk:
                     break
+                if self.download_budget:
+                    self.download_budget.consume(len(chunk))
                 output_file.write(chunk)
                 copied_bytes += len(chunk)
                 callback(

@@ -1413,6 +1413,12 @@ def test_cache_job_resumes_from_the_first_verified_episode_after_a_restart(
         return resumed_copy(source, *args, **kwargs)
 
     monkeypatch.setattr(resumed_manager, "_copy_resumable", track_resumed_copy)
+    hashes = []
+    original_hash = platform_workflow.sha256_file
+    def track_hash(path, *args, **kwargs):
+        hashes.append(Path(path))
+        return original_hash(path, *args, **kwargs)
+    monkeypatch.setattr(platform_workflow, 'sha256_file', track_hash)
     resumed = resumed_manager.cache_job(FakeFlowClient(job), job)
     completed = json.loads(state_path.read_text(encoding="utf-8"))
 
@@ -1422,6 +1428,33 @@ def test_cache_job_resumes_from_the_first_verified_episode_after_a_restart(
     assert first_primary not in resumed_sources
     assert second_primary in resumed_sources
     assert not partial_path.exists()
+    first_cached = cache_root / 'ready' / job['code'] / job['asset_id'] / 'episodes/episode_000001/motion.bvh'
+    assert hashes.count(first_cached) == 1
+
+
+def test_verified_receipt_detects_changed_file(tmp_path):
+    primary = tmp_path / 'episode.mcap'
+    primary.write_bytes(b'original')
+    files = [{'relative_path': primary.name, 'size_bytes': 8,
+              'sha256': hashlib.sha256(b'original').hexdigest()}]
+    before = QualityCacheManager._file_signatures(tmp_path, files)
+    primary.write_bytes(b'modified')
+    assert QualityCacheManager._file_signatures(tmp_path, files) != before
+    with pytest.raises(QualityCacheError, match='SHA-256'):
+        QualityCacheManager._verify_manifest_files(tmp_path, files)
+
+
+def test_copy_resumable_uses_download_budget_without_extra_state_writes(tmp_path):
+    source, target = tmp_path / 'source', tmp_path / 'target'
+    source.write_bytes(b'0123456789')
+    budget = Mock()
+    manager = QualityCacheManager(tmp_path / 'cache', chunk_size=4, download_budget=budget)
+    progress = []
+    assert manager._copy_resumable(source, target, copied_bytes=0, total_bytes=10,
+                                  callback=progress.append, expected_size=10) == 10
+    assert [call.args[0] for call in budget.consume.call_args_list] == [4, 4, 2]
+    assert len(progress) == 3
+    assert target.read_bytes() == source.read_bytes()
 
 
 def test_cache_job_recovers_an_episode_moved_before_its_state_was_saved(tmp_path: Path):

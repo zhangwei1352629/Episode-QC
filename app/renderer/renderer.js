@@ -816,6 +816,10 @@ async function switchTask(taskId) {
     els.taskCenter.close();
     return;
   }
+  ++state.loadToken;
+  window.episodeQc.cancelEpisodeReads?.();
+  state.visualGeneration = (state.visualGeneration || 0) + 1;
+  state.visualPending = false;
   setSaveState("saving", "切换任务…");
   try {
     await savePlayhead();
@@ -1060,7 +1064,11 @@ function refreshAI() {
 async function openEpisode(episodeId) {
   if (!episodeId || episodeId === state.currentEpisodeId && state.cache) return;
   const token = ++state.loadToken;
+  window.episodeQc.cancelEpisodeReads?.();
+  state.visualGeneration = (state.visualGeneration || 0) + 1;
+  state.visualPending = false;
   if (state.currentEpisodeId) await savePlayhead();
+  if (token !== state.loadToken) return;
   state.playing = false;
   state.cache = null;
   state.detail = null;
@@ -1118,7 +1126,9 @@ async function openEpisode(episodeId) {
 
 async function reloadCurrentEpisode() {
   if (!state.currentEpisodeId) return;
-  const detail = await window.episodeQc.getEpisode(state.currentEpisodeId);
+  const episodeId = state.currentEpisodeId, token = state.loadToken;
+  const detail = await window.episodeQc.getEpisode(episodeId);
+  if (episodeId !== state.currentEpisodeId || token !== state.loadToken) return;
   state.detail = detail;
   state.labelSchema = detail.label_schema || state.labelSchema;
   renderEpisodeDetail();
@@ -1299,6 +1309,7 @@ async function requestVisualFrames(force = false) {
   if (!force && now - state.lastVisualRequest < 90) return;
   state.lastVisualRequest = now;
   state.visualPending = true;
+  const generation = state.visualGeneration || 0;
   const episodeId = state.currentEpisodeId;
   const playbackEpisodeId = state.playbackEpisodeId;
   const timeNs = Math.max(0, Math.min(state.durationNs, Math.round(state.playheadNs)));
@@ -1309,7 +1320,10 @@ async function requestVisualFrames(force = false) {
         streamId: camera.stream_id,
         timeNs,
       });
-      if (episodeId !== state.currentEpisodeId) return;
+      if (episodeId !== state.currentEpisodeId || generation !== (state.visualGeneration || 0)) {
+        if (frame.dataUrl?.startsWith('blob:')) URL.revokeObjectURL(frame.dataUrl);
+        return;
+      }
       const card = els.cameraGrid.querySelector(`[data-camera-id="${camera.stream_id}"]`);
       if (!card) return;
       const image = card.querySelector("img");
@@ -1327,7 +1341,7 @@ async function requestVisualFrames(force = false) {
     });
     const motionRequest = state.cache.motion?.available
       ? window.episodeQc.getMotionFrame({ episodeId: playbackEpisodeId, timeNs }).then((frame) => {
-          if (episodeId === state.currentEpisodeId) { state.motionFrame = frame; drawMotion(); }
+          if (episodeId === state.currentEpisodeId && generation === (state.visualGeneration || 0)) { state.motionFrame = frame; drawMotion(); }
         })
       : Promise.resolve();
     const requestedSource = state.motionSource;
@@ -1338,20 +1352,20 @@ async function requestVisualFrames(force = false) {
           sourceKey: requestedSource,
           timeNs,
         }).then((frame) => {
-          if (episodeId === state.currentEpisodeId && requestedSource === state.motionSource) {
+          if (episodeId === state.currentEpisodeId && generation === (state.visualGeneration || 0) && requestedSource === state.motionSource) {
             state.robotActionFrame = frame;
             drawMotion();
           }
         })
       : Promise.resolve();
     await Promise.all([...cameraRequests, motionRequest, actionRequest]);
-    if (episodeId === state.currentEpisodeId) {
+    if (episodeId === state.currentEpisodeId && generation === (state.visualGeneration || 0)) {
       setCacheStatus("ready", state.cache.reused ? "播放缓存已复用" : "播放缓存已就绪");
     }
   } catch (error) {
-    if (episodeId === state.currentEpisodeId) setCacheStatus("error", `帧读取失败：${error.message || error}`);
+    if (episodeId === state.currentEpisodeId && generation === (state.visualGeneration || 0)) setCacheStatus("error", `帧读取失败：${error.message || error}`);
   } finally {
-    state.visualPending = false;
+    if (generation === (state.visualGeneration || 0)) state.visualPending = false;
   }
 }
 
@@ -2088,7 +2102,8 @@ function annotationRoundMeta(annotation) {
   if (modified) {
     return { inherited: true, modified: true, originRound, lastRound: currentRound, tone: "modified", badge: `R${sourceRound}→R${currentRound} 已修改`, shortBadge: `R${sourceRound}→R${currentRound}` };
   }
-  return { inherited: true, modified: false, originRound, lastRound: sourceRound, tone: "inherited", badge: `已标注 · R${sourceRound}`, shortBadge: `R${sourceRound}` };
+  const ai = source?.round_kind === 'ai';
+  return { inherited: true, modified: false, originRound, lastRound: sourceRound, tone: "inherited", badge: `${ai ? 'AI 预标注 · 待人工复检' : '已标注'} · R${sourceRound}`, shortBadge: `${ai ? 'AI ' : ''}R${sourceRound}` };
 }
 
 function labelAnnotationStatus(annotations) {

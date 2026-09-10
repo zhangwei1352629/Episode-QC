@@ -165,6 +165,7 @@ def running_server(
     )
     server = create_web_server(
         paths,
+        isolated_workers=False,  # These HTTP unit tests patch in-process functions.
         token=TOKEN,
         public_hosts=public_hosts,
         flow_enabled=flow_enabled,
@@ -178,6 +179,21 @@ def running_server(
         server.shutdown()
         thread.join(timeout=5)
         server.server_close()
+
+
+def test_cache_finishing_during_payload_keeps_polling_until_fresh_summary(tmp_path, monkeypatch):
+    import episode_qc.web_server as module
+    from types import SimpleNamespace
+    with running_server(tmp_path) as (server, _url):
+        app = server.application
+        app._platform_jobs.add('QCJ-RACE')
+        monkeypatch.setattr(module, 'list_qc_tasks', lambda _: [{'flow_job_code':'QCJ-RACE','id':'task'}])
+        def summary(code):
+            app._platform_jobs.discard(code)
+            return {'cache_complete':False,'cache_status':'partially_ready'}
+        monkeypatch.setattr(app, '_quality_cache_manager', lambda: SimpleNamespace(cache_summary=summary))
+        payload=app._platform_payload({'jobs':[{'code':'QCJ-RACE'}]})
+        assert payload['jobs'][0]['local_caching'] is True
 
 
 def test_web_application_retains_expired_platform_cache_on_startup(tmp_path: Path):

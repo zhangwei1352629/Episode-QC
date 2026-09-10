@@ -83,6 +83,26 @@ FLOW_SCHEMA = {
 }
 
 
+def test_real_isolated_index_and_playback_preserve_review(tmp_path):
+    from episode_qc.isolated_work import IsolatedWork
+    root = tmp_path / 'source'
+    _write_sample_episode(root / 'episode_000001')
+    db = tmp_path / 'workspace.db'
+    work = IsolatedWork()
+    try:
+        indexed = work.call('index', db, root)
+        episode_id = indexed['episodes'][0]['id']
+        with connect_workspace(db) as connection:
+            connection.execute("UPDATE episode SET review_status='completed', quality_decision='pass' WHERE id=?", (episode_id,))
+        result = work.call('playback', db, episode_id, tmp_path / 'cache', mode='priority')
+        assert result['cameras']
+        detail = episode_detail(db, episode_id)
+        assert detail['episode']['review_status'] == 'completed'
+        assert detail['episode']['quality_decision'] == 'pass'
+    finally:
+        work.close()
+
+
 def test_incremental_scan_only_parses_new_file_and_preserves_review(tmp_path, monkeypatch):
     import episode_qc.workspace as workspace
     root = tmp_path / "source"

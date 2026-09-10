@@ -1,6 +1,6 @@
 """Separate candidate storage; accepting one writes through normal annotation validation."""
 import hashlib,json,uuid
-from .workspace import connect_workspace,episode_detail,save_annotation
+from .workspace import connect_workspace,episode_detail,save_annotation,sync_flow_previous_reviews
 
 def init(db):
     with connect_workspace(db) as c:
@@ -33,9 +33,24 @@ def fetch(app,eid,start=False):
     # Import only suggestions for the exact locally cached MCAP, not just a matching name.
     from pathlib import Path
     path=Path(detail['episode']['mcap_path'])
-    with path.open('rb') as source:
-        if hashlib.file_digest(source,'sha256').hexdigest()!=run['snapshot']['source_sha256']:
-            raise ValueError('本地MCAP与AI源文件不一致')
+    stat=path.stat()
+    signature=(str(path),stat.st_size,stat.st_mtime_ns,stat.st_ctime_ns,stat.st_ino,run['snapshot']['source_sha256'])
+    verified=getattr(app,'_ai_verified_sources',set())
+    if signature not in verified:
+        worker=getattr(app,'_isolated_work',None)
+        if worker:
+            digest=worker.call('hash',str(path))
+        else:
+            with path.open('rb') as source: digest=hashlib.file_digest(source,'sha256').hexdigest()
+        after=path.stat()
+        if digest!=run['snapshot']['source_sha256'] or (stat.st_size,stat.st_mtime_ns,stat.st_ctime_ns,stat.st_ino)!=(after.st_size,after.st_mtime_ns,after.st_ctime_ns,after.st_ino):
+            raise ValueError('本地MCAP与AI源文件不一致或校验期间发生变化')
+        if len(verified)>256:verified.clear()
+        verified.add(signature);app._ai_verified_sources=verified
+    remote_episode=next(e for e in job['episodes'] if e['episode_id']==remote_id)
+    ai_rounds=[r for r in remote_episode.get('review_history',[]) if r.get('round_kind')=='ai']
+    if ai_rounds:
+        app._write_workspace(lambda: sync_flow_previous_reviews(db,job,[{'episode_id':remote_id,'local_episode_id':eid}],inherit_ai=True))
     with connect_workspace(db) as c:
         for a in run['result']['annotations']:
             c.execute('INSERT OR IGNORE INTO ai_candidate(run_id,candidate_id,episode_id,payload) VALUES(?,?,?,?)',(run['id'],a['id'],eid,json.dumps(a,ensure_ascii=False)))
@@ -46,11 +61,13 @@ def fetch(app,eid,start=False):
             if item['annotation_id'] and not c.execute('SELECT 1 FROM annotation WHERE id=? AND deleted_at IS NULL',(item['annotation_id'],)).fetchone():item['state']='pending'
             values.append(item)
     sync_outbox(db,client,job['code'],eid)
-    return {'runs':[dict(id=r['id'],state=r['state'],error=r.get('error')) for r in runs],'candidates':values,'coverage':run['result']['coverage']}
+    return {'runs':[dict(id=r['id'],state=r['state'],error=r.get('error')) for r in runs],'candidates':values,'coverage':run['result']['coverage'],'inherited_rounds':len(ai_rounds)}
 
 def review(app,eid,body):
     # Recheck current Flow ownership/version before every acceptance.
     fresh=fetch(app,eid);cid=body.get('candidate_id');rid=body.get('run_id');action=body.get('action')
+    if fresh.get('inherited_rounds'):
+        raise ValueError('AI 已作为独立历史轮继承，请在时间轴修改或删除人工副本，不能再次导入候选')
     item=next((a for a in fresh['candidates'] if a['candidate_id']==cid and a['run_id']==rid),None)
     if not item:raise ValueError('候选不存在或已失效')
     if action not in ('accept','reject'):raise ValueError('不支持的复核动作')
@@ -69,7 +86,7 @@ def review(app,eid,body):
         if set(edit)!={'start_offset_ns','end_offset_ns'} or any(type(v)!=int for v in edit.values()):raise ValueError('边界必须为整数纳秒')
         payload.update(edit)
     payload['attributes']=dict(payload.get('attributes',{}),ai_provenance={'run_id':rid,'candidate_id':cid,'original_start_offset_ns':item['annotation']['start_offset_ns'],'original_end_offset_ns':item['annotation']['end_offset_ns'],'review_action':'edited' if edit else 'accepted'})
-    return save_annotation(db,payload,session_id=app.session_id,ai_candidate=(rid,cid))
+    return app._write_workspace(lambda: save_annotation(db,payload,session_id=app.session_id,ai_candidate=(rid,cid)))
 
 
 def sync_outbox(db,client,job_code,eid):

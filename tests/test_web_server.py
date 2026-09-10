@@ -565,6 +565,21 @@ def test_platform_refresh_rejects_overlap_and_releases_gate(tmp_path, monkeypatc
         assert app.get_platform_jobs() == {"jobs": []}
 
 
+def test_platform_poll_does_not_sync_history_or_take_writer_lock(tmp_path, monkeypatch):
+    with running_server(tmp_path) as (server, _):
+        app = server.application
+        class Client:
+            def jobs_response(self):
+                return {"jobs": [], "reviewer": "test"}
+        app._flow_client = Client()
+        def forbidden(*args):
+            raise AssertionError("read path attempted a write")
+        monkeypatch.setattr(app, "_sync_existing_platform_review_histories", forbidden)
+        monkeypatch.setattr(app, "_write_workspace", forbidden)
+        assert app._local_task_for_job("QCJ-absent") is None
+        assert app.get_platform_jobs()["jobs"] == []
+
+
 def test_cleanup_failure_does_not_stop_the_web_server(tmp_path: Path, monkeypatch, caplog):
     def fail_cleanup(_manager):
         raise RuntimeError("cleanup disk error")

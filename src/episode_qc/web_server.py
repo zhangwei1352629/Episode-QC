@@ -694,7 +694,8 @@ class EpisodeQcWebApplication:
             }
         response = client.jobs_response()
         self._refresh_platform_owned_jobs(response)
-        self._sync_existing_platform_review_histories(client, response)
+        # Polling must not wait on import/history writes. Login and the
+        # authoritative start/claim/submit paths still hydrate review history.
         return self._platform_payload(response)
 
     def _refresh_platform_owned_jobs(self, response: dict[str, object]) -> None:
@@ -1439,7 +1440,7 @@ class EpisodeQcWebApplication:
         return {"enabled": True, "connected": True, **connection, "jobs": jobs}
 
     def _local_task_for_job(self, job_code: str) -> dict[str, object] | None:
-        tasks = self._write_workspace(lambda: list_qc_tasks(self.paths.db_path))
+        tasks = _retry_sqlite_locked(lambda: list_qc_tasks(self.paths.db_path))
         return next(
             (
                 task

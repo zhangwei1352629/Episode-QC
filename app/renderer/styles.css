@@ -24,12 +24,15 @@
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
 html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; background: var(--bg); color: var(--text); }
+body { display: flex; flex-direction: column; }
+#flow-session-notice { flex: 0 0 auto; }
 button, input, select, textarea { font: inherit; }
 button { color: inherit; }
 button:disabled, select:disabled, input:disabled { cursor: not-allowed !important; opacity: .38; }
 
 .app-shell {
-  height: 100vh;
+  flex: 1 1 0;
+  min-height: 0;
   display: grid;
   grid-template-columns: var(--episode-width) minmax(560px, 1fr) var(--label-width);
   grid-template-rows: 60px minmax(0, 1fr) 58px;

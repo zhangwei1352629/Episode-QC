@@ -50,7 +50,9 @@ def test_ai_round_seeds_timeline_without_human_pass_and_preserves_edits(tmp_path
     app=SimpleNamespace(paths=SimpleNamespace(db_path=db),_write_workspace=lambda op:op())
     monkeypatch.setattr(ai,'context',lambda *_:(episode_detail(db,eid),client,job,'REMOTE1'))
     assert ai.fetch(app,eid)['inherited_rounds']==1
-    assert 'episode_id=REMOTE1' in client.request.call_args.args[1]
+    client.request.reset_mock()
+    assert ai.local_suggestions(app,eid)['local_cache_state']=='ready'
+    client.request.assert_not_called()
     detail=episode_detail(db,eid);assert detail['episode']['review_status']=='unreviewed'
     assert not detail['episode']['quality_decision'];assert detail['episode']['review_history_count']==1
     inherited=detail['annotations'][0];assert inherited['attributes']['_incremental_source']['round_kind']=='ai'
@@ -59,10 +61,12 @@ def test_ai_round_seeds_timeline_without_human_pass_and_preserves_edits(tmp_path
     save_annotation(db,payload,annotation_id=inherited['annotation_id'])
     ai.fetch(app,eid)
     assert episode_detail(db,eid)['annotations'][0]['comment']=='Human edited'
+    assert ai.local_suggestions(app,eid)['episode_detail']['annotations'][0]['comment']=='Human edited'
     human_copy=dict(episode_detail(db,eid)['annotations'][0],id='human-copy')
     assert history['annotations'][0]['comment']=='AI original'
     delete_annotation(db,inherited['annotation_id']);ai.fetch(app,eid)
     assert not episode_detail(db,eid)['annotations']
+    assert not ai.local_suggestions(app,eid)['episode_detail']['annotations']
     from episode_qc.workspace import update_episode_review
     update_episode_review(db,eid,review_status='completed')
     with connect_workspace(db) as c:

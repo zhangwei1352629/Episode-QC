@@ -507,12 +507,17 @@ class EpisodeQcWebApplication:
         self._platform_poll_executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="episode-qc-list-refresh"
         )
+        self._ai_cache_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="episode-qc-ai-cache")
+        self._ai_cache_jobs = set()
+        self._ai_cache_last = {}
+        self._ai_cache_stop = threading.Event()
         self._platform_claim_locks: dict[str, threading.Lock] = {}
         self._workspace_write_lock = threading.RLock()
         self._flow_client_factory = FlowClient
         self._flow_client: FlowClient | None = None
         self._flow_connection: dict[str, str] = {}
         self._flow_error = ""
+        self._flow_auth_error = ""
         self.flow_enabled = bool(flow_enabled)
         self.require_token = bool(require_token)
         self.session_id = f"web-{self.token[:12]}"
@@ -543,6 +548,7 @@ class EpisodeQcWebApplication:
         self._platform_result_reconcile_thread.start()
 
     def close(self) -> None:
+        self._ai_cache_stop.set()
         self._nas_status_monitor.close()
         self._platform_cache_cleanup.close()
         self._platform_heartbeat_stop.set()
@@ -555,6 +561,7 @@ class EpisodeQcWebApplication:
         self._platform_executor.shutdown(wait=False, cancel_futures=True)
         self._platform_progress_executor.shutdown(wait=False, cancel_futures=True)
         self._platform_poll_executor.shutdown(wait=False, cancel_futures=True)
+        self._ai_cache_executor.shutdown(wait=False, cancel_futures=True)
 
     def nas_status(self) -> dict[str, object]:
         return self._nas_status_monitor.status()
@@ -592,6 +599,12 @@ class EpisodeQcWebApplication:
                     key: value for key, value in previous.items()
                     if key not in {"annotations", "deleted_annotation_lineages"}
                 }
+        # A small status map distinguishes data-ready from AI-ready in the list.
+        with sqlite3.connect(self.paths.db_path) as connection:
+            exists = connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='ai_local_cache'").fetchone()
+            ai_states = dict(connection.execute('SELECT episode_id,state FROM ai_local_cache')) if exists else {}
+        for episode in state.get("episodes", []):
+            episode['ai_cache_state'] = ai_states.get(episode['id'], 'missing')
         return state
 
     def update_settings(self, request: dict[str, object]) -> dict[str, object]:
@@ -678,10 +691,12 @@ class EpisodeQcWebApplication:
                 "reviewer": str(response.get("reviewer") or reviewer_name),
             }
             self._flow_error = ""
+            self._flow_auth_error = ""
             self._platform_history_synced_jobs.clear()
         self._refresh_platform_owned_jobs(response)
         self._sync_existing_platform_review_histories(client, response)
         self._resume_incomplete_platform_caches(client, response)
+        self._schedule_owned_ai_caches()
         self._schedule_platform_result_reconciliation(
             client,
             response,
@@ -768,7 +783,12 @@ class EpisodeQcWebApplication:
                 ),
                 "default_username": os.environ.get("EPISODE_QC_FLOW_USERNAME", ""),
             }
-        response = client.jobs_response()
+        try:
+            response = client.jobs_response()
+        except FlowClientError as exc:
+            if exc.status_code == 401:
+                self._flow_auth_error = str(exc)
+            raise
         self._refresh_platform_owned_jobs(response)
         # Polling must not wait on import/history writes. Login and the
         # authoritative start/claim/submit paths still hydrate review history.
@@ -853,6 +873,8 @@ class EpisodeQcWebApplication:
                 try:
                     client.heartbeat(job_code)
                 except FlowClientError as exc:
+                    if exc.status_code == 401:
+                        self._flow_auth_error = str(exc)
                     with self._platform_lock:
                         self._platform_ownership_errors[job_code] = str(exc)
                         if exc.status_code in {403, 409}:
@@ -868,6 +890,38 @@ class EpisodeQcWebApplication:
             PLATFORM_CLAIM_HEARTBEAT_INTERVAL_SECONDS
         ):
             self._heartbeat_platform_claims_once()
+            self._schedule_owned_ai_caches()
+
+    def _schedule_owned_ai_caches(self):
+        with self._platform_lock:
+            client = self._flow_client
+            codes = set(self._platform_owned_jobs)
+        if client is None:
+            return
+        for code in codes:
+            self._schedule_ai_cache(client, code)
+
+    def _schedule_ai_cache(self, client, job_code):
+        with self._platform_lock:
+            if (self._ai_cache_stop.is_set() or client is not self._flow_client or job_code in self._ai_cache_jobs
+                    or time.monotonic() - self._ai_cache_last.get(job_code, -100) < 10):
+                return
+            self._ai_cache_jobs.add(job_code)
+        def work():
+            try:
+                from .ai_annotations import sync_job
+                sync_job(self, client, job_code)
+            except Exception:
+                LOGGER.exception("AI cache synchronization failed for %s", job_code)
+            finally:
+                with self._platform_lock:
+                    self._ai_cache_jobs.discard(job_code)
+                    self._ai_cache_last[job_code] = time.monotonic()
+        try:
+            self._ai_cache_executor.submit(work)
+        except RuntimeError:
+            with self._platform_lock:
+                self._ai_cache_jobs.discard(job_code)
 
     def _result_reconcile_interval_seconds(self) -> float:
         try:
@@ -1824,6 +1878,7 @@ class EpisodeQcWebApplication:
             if not mappings:
                 raise QualityCacheError("本地缓存尚未索引到已验证的 Flow Episode")
             manager.record_local_episodes(job_code, mappings)
+            self._schedule_ai_cache(client, job_code)
             try:
                 anchor = self._foreground_episode_id or str((indexed.get("task") or {}).get("last_episode_id") or indexed["episodes"][0]["id"])
                 self._schedule_read_ahead(anchor)
@@ -2329,6 +2384,11 @@ class EpisodeQcRequestHandler(BaseHTTPRequestHandler):
         if method == "GET" and path == "/api/tasks":
             self._send_json(app.get_tasks())
             return
+        if method == "GET" and path == "/api/platform/status":
+            self._send_json({"enabled": app.flow_enabled,
+                             "logged_in": app._flow_client is not None and not app._flow_auth_error,
+                             "error": app._flow_auth_error})
+            return
         if method == "DELETE" and path == "/api/tasks/history":
             keep_task_id = query.get("keep_task_id", [None])[0]
             self._send_json(app.clear_local_task_history(keep_task_id))
@@ -2417,7 +2477,7 @@ class EpisodeQcRequestHandler(BaseHTTPRequestHandler):
                 # Network/source verification must not hold the annotation writer lock.
                 result = ai_annotations.review(app, eid, body)
             else:
-                result = ai_annotations.fetch(app, eid, start=action == "start")
+                result = ai_annotations.local_suggestions(app, eid)
             self._send_json(result)
             return
         if method == "POST" and path == "/api/annotations":

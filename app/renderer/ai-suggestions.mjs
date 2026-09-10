@@ -5,7 +5,7 @@ export function installAISuggestions({ container, api, episodeId, seek, reload, 
   async function render(start=false) {
     const eid=episodeId(), g=++generation;panel.replaceChildren();if(!eid)return;
     const title=document.createElement('summary');title.textContent='AI 预标注 · 待人工复核';panel.append(title);
-    for(const [label,action] of [['刷新候选',false]]) {
+    for(const [label,action] of [['刷新本地 AI 结果',false]]) {
       const b=document.createElement('button');b.textContent=label;b.onclick=()=>render(action);panel.append(b);
     }
     const info=document.createElement('p');info.textContent='候选仅作提示；请检查完整视频并补标。';panel.append(info);
@@ -13,11 +13,16 @@ export function installAISuggestions({ container, api, episodeId, seek, reload, 
     try {
       const data=await api.aiSuggestions(eid,start?'start':'suggestions',{});
       if(g!==generation||eid!==episodeId())return;
+      if(data.local_cache_state && data.local_cache_state!=='ready') {
+        panel.open=true;
+        info.textContent=data.message||'AI 结果尚未缓存到本地，不代表没有标注。';
+        return;
+      }
       if(data.inherited_rounds){
         if(data.episode_detail && applyDetail) applyDetail(eid,data.episode_detail);
         else await reload();
         if(g!==generation||eid!==episodeId())return;
-        info.textContent=`AI 独立历史轮已载入时间轴 · 当前为人工复检，可修改、删除或补标；AI 原始记录保留。`;
+        info.textContent=`本地 AI 独立历史轮已载入时间轴 · 可离线修改、删除或补标；AI 原始记录保留。`;
         return;
       }
       const counts={};for(const c of data.coverage||[])counts[c.state]=(counts[c.state]||0)+1;

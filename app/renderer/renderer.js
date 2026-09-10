@@ -167,6 +167,8 @@ const g1Viewer = new G1Viewer(els.motionCanvas, (status, error) => {
 const WHOLE_BODY_JOINT = "whole_body";
 
 async function initialize() {
+  refreshFlowSessionNotice();
+  window.setInterval(refreshFlowSessionNotice, 15000);
   restoreWorkspaceLayout();
   bindEvents();
   syncInteractiveState();
@@ -428,6 +430,12 @@ function setCurrentAnnotationsExpanded(expanded, persist = true) {
 }
 
 function handleWorkerEvent(payload) {
+  if (payload?.type === "ai_cache") {
+    const row = state.episodes.find(item => item.id === payload.episodeId);
+    if (row) { row.ai_cache_state = payload.state; renderEpisodeList(); }
+    if (payload.episodeId === state.currentEpisodeId) refreshAI();
+    return;
+  }
   if (payload?.type === "platform_job") {
     const job = state.platform?.jobs?.find((item) => item.code === payload.jobCode);
     if (job?.local_caching) {
@@ -532,12 +540,27 @@ function renderHeaderContext() {
 }
 
 let platformRefreshInFlight = false;
+async function refreshFlowSessionNotice() {
+  const notice = $("flow-session-notice");
+  if (!notice || !window.episodeQc.getPlatformStatus) return;
+  try {
+    const status = await window.episodeQc.getPlatformStatus();
+    notice.hidden = status.enabled === false || status.logged_in;
+    notice.textContent = status.error
+      ? "Flow 登录已失效：请在任务中心重新登录。已缓存的数据和 AI 标注可继续离线质检；领取、续传和提交暂不可用。"
+      : "尚未登录 Flow：请在任务中心选择质检员登录。已缓存的数据和 AI 标注可离线使用；未缓存的 AI 结果不会自动出现。";
+  } catch {
+    notice.hidden = false;
+    notice.textContent = "暂时无法确认 QC 服务与登录状态，请检查连接；不要将 AI 加载失败视为没有标注。";
+  }
+}
 async function refreshPlatformJobs({ quiet = false } = {}) {
   if (platformRefreshInFlight) return;
   platformRefreshInFlight = true;
   try {
     const payload = await window.episodeQc.getPlatformJobs();
     state.platform = payload;
+    refreshFlowSessionNotice();
     renderPlatformJobs();
     const claimed = payload.jobs?.find(
       (item) => item.code === state.pendingFlowJobCode && item.local_task_id,
@@ -1069,7 +1092,7 @@ function renderEpisodeList() {
         <span class="review-dot"></span>
         <span class="episode-copy">
           <strong>${escapeHtml(episode.episode_name)}</strong>
-          <span title="${escapeHtml(episode.relative_path)}">${escapeHtml(episode.relative_path)} · ${escapeHtml(({ ready: "可播放", partial: "主视角可播放", preparing: "播放准备中", failed: "播放准备失败", stale: "需重新准备播放" })[episode.cache_status] || "待准备播放")}</span>
+          <span title="${escapeHtml(episode.relative_path)}">${escapeHtml(episode.relative_path)} · ${escapeHtml(({ ready: "可播放", partial: "主视角可播放", preparing: "播放准备中", failed: "播放准备失败", stale: "需重新准备播放" })[episode.cache_status] || "待准备播放")}${episode.task_origin === 'flow' ? ` · ${escapeHtml(({ready:'AI 已缓存',failed:'AI 缓存异常',stale:'AI 待核验',pending:'AI 待生成'})[episode.ai_cache_state] || 'AI 待缓存')}` : ''}</span>
           <span class="episode-badges"><em class="status-badge">${escapeHtml(episodeReviewStatusName(episode))}</em>${episode.quality_decision ? `<em class="decision-badge">${escapeHtml(decisionName(episode.quality_decision))}</em>` : ""}<em>${episode.camera_count} CAM</em><em>${episode.mocap_available ? "MOCAP" : "无 MOCAP"}</em><em>${episode.annotation_count} 有效标注</em>${previousBadge}</span>
         </span>
         <time>${formatDuration(episode.duration_sec || 0)}</time>

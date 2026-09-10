@@ -77,6 +77,7 @@ function installWebApi() {
       { method: "DELETE" },
     ),
     getPlatformJobs: () => request("/api/platform/jobs", { timeoutMs: 12000 }),
+    getPlatformStatus: () => request("/api/platform/status", { timeoutMs: 5000 }),
     getPlatformReviewers: (baseUrl) => request("/api/platform/reviewers", {
       method: "POST",
       body: { baseUrl },

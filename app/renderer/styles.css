@@ -256,6 +256,17 @@ body.episodes-collapsed .episode-sidebar, body.labels-collapsed .label-sidebar {
 .annotation-block { position: absolute; z-index: 1; top: 4px; left: var(--annotation-left); width: var(--annotation-width); min-width: 8px; height: 19px; display: flex; align-items: center; justify-content: flex-end; padding: 0 4px; border: 1px solid color-mix(in srgb, var(--annotation-color) 76%, #ffffff); border-radius: 4px; color: #f7fafb; background: color-mix(in srgb, var(--annotation-color) 58%, #172027); font-size: 7.5px; cursor: pointer; overflow: hidden; }
 .annotation-block:hover, .annotation-block:focus-visible { z-index: 3; filter: brightness(1.14); outline: 1px solid #f3f7f8; outline-offset: 1px; }
 .annotation-block.inherited { border-style: dashed; }
+.interval-track-tools { display:flex; align-items:center; flex-wrap:wrap; gap:6px; padding:6px 0; font-size:11px; }
+.interval-track-tools button { padding:4px 8px; }
+.interval-track-tools[hidden] { display:none; }
+.interval-track-tools span { flex:1; min-width:240px; }
+.annotation-block.interval-selected { outline:2px solid #fff; z-index:4; }
+.annotation-block[hidden], .interval-handle[hidden], .interval-playhead[hidden] { display:none; }
+.interval-handle { position:absolute; top:0; bottom:0; width:9px; background:#fff; cursor:ew-resize; touch-action:none; z-index:5; }
+.interval-handle[data-edge="start"] { left:0; }
+.interval-handle[data-edge="end"] { right:0; }
+.interval-playhead { position:absolute; top:0; bottom:0; width:1px; background:#f6da69; pointer-events:none; z-index:6; }
+.annotation-lane-surface { touch-action:none; }
 .annotation-block.modified { box-shadow: inset 0 -2px 0 var(--warning); }
 .annotation-block.added { box-shadow: inset 0 -2px 0 var(--success); }
 .annotation-block.annotation-point { width: 10px; min-width: 10px; padding: 0; border-radius: 5px; transform: translateX(-50%); overflow: visible; }

@@ -1,5 +1,6 @@
 import { installAISuggestions } from "./ai-suggestions.mjs";
-import { installCalibration, adjacentFrame } from "./annotation-calibration.mjs";
+import { adjacentFrame } from "./annotation-calibration.mjs";
+import { installIntervalTrack } from "./interval-track.mjs";
 import { G1Viewer } from "./g1-viewer.bundle.js";
 import { annotationDurationNs, annotationTimeError } from "./annotation-timing.mjs";
 import {
@@ -236,12 +237,13 @@ async function refreshWorkspace({ preserveEpisode = true } = {}) {
 let calibration, calibrationPreview = null;
 function bindEvents() {
   const pauseCalibration = () => { state.playing=false;calibrationPreview=null;updatePlaybackButton(); };
-  calibration=installCalibration({container:els.annotationTrack,
+  calibration=installIntervalTrack({container:els.annotationTrack,
     getState:()=>({episodeId:state.currentEpisodeId,annotations:state.detail?.annotations||[],time:state.playheadNs,duration:state.durationNs,limit:annotationDurationNs(state.detail?.episode),grid:selectionFrameGrid(),visualReady:!state.visualPending && state.visualReadyTime===Math.round(state.playheadNs)}),
     seek:seekTo,pause:pauseCalibration,
     preview:(start,end)=>{if(!state.cache||end<=start)return;seekTo(start);calibrationPreview={end};state.playing=true;state.lastTick=performance.now();updatePlaybackButton();},
     edit:openAnnotationEditor,notify:message=>toast(message,'error'),
     save:async(original,bounds)=>{
+      if(original.episode_id!==state.currentEpisodeId)throw new Error('Episode 已切换，取消修改');
       const current=state.detail?.annotations?.find(a=>a.annotation_id===original.annotation_id);
       if(!current||current.updated_at!==original.updated_at)throw new Error('标注已变化，请重新选中后校准');
       const episodeId=state.currentEpisodeId;
@@ -293,7 +295,7 @@ function bindEvents() {
   els.nextEpisode.addEventListener("click", () => moveEpisode(1));
   els.togglePlay.addEventListener("click", togglePlayback);
   els.playbackRate.addEventListener("change", () => { state.playbackRate = Number(els.playbackRate.value); });
-  els.timelineRange.addEventListener("input", () => seekTo((Number(els.timelineRange.value) / 1_000_000) * state.durationNs));
+  els.timelineRange.addEventListener("input", () => {state.playing=false;updatePlaybackButton();const ratio=Number(els.timelineRange.value)/1_000_000;seekTo(calibration?calibration.atRatio(ratio):ratio*state.durationNs);});
   els.markIn.addEventListener("click", markSelectionStart);
   els.markOut.addEventListener("click", markSelectionEnd);
   els.scopeTabs.addEventListener("click", (event) => {
@@ -350,21 +352,11 @@ function bindEvents() {
     });
     renderAnnotations();
   });
-  els.annotationTrack.addEventListener("click", (event) => {
-    const item = event.target.closest("[data-annotation-id]");
-    if (item) calibration.select(item.dataset.annotationId);
-  });
-  els.annotationTrack.addEventListener("pointerdown", beginTimelineSelection);
+  // Interval editing owns pointer gestures on the existing track. Empty
+  // space only seeks; creating annotations still uses explicit I/O controls.
   window.addEventListener("pointermove", updateTimelineSelection);
   window.addEventListener("pointerup", endTimelineSelection);
   window.addEventListener("pointercancel", cancelTimelineSelection);
-  els.annotationTrack.addEventListener("dblclick", (event) => {
-    if (event.target.closest("[data-annotation-id]")) return;
-    seekTo(timelineTimeFromPointer(event));
-    state.scope = "time_point";
-    els.scopeTabs.querySelectorAll("button").forEach((button) => button.classList.toggle("active", button.dataset.scope === state.scope));
-    renderLabels();
-  });
   els.undo.addEventListener("click", undo);
   els.redo.addEventListener("click", redo);
   els.confirmCurrentEpisode.addEventListener("click", confirmCurrentEpisode);
@@ -2092,6 +2084,7 @@ function renderAnnotationLanes(annotations, labels) {
     }).join("");
     return `<div class="effective-annotation-lane" data-label-lane="${escapeHtml(labelCode)}"><div class="annotation-lane-label" title="${escapeHtml(label.name)}"><i style="background:${escapeHtml(label.color || "#8c959f")}"></i><span>${escapeHtml(label.name)}</span></div><div class="annotation-lane-surface">${blocks}</div></div>`;
   }).join("");
+  calibration?.render();
 }
 
 function annotationTiming(annotation) {

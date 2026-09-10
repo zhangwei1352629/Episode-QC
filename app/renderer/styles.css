@@ -256,6 +256,7 @@ body.episodes-collapsed .episode-sidebar, body.labels-collapsed .label-sidebar {
 .annotation-block { position: absolute; z-index: 1; top: 4px; left: var(--annotation-left); width: var(--annotation-width); min-width: 8px; height: 19px; display: flex; align-items: center; justify-content: flex-end; padding: 0 4px; border: 1px solid color-mix(in srgb, var(--annotation-color) 76%, #ffffff); border-radius: 4px; color: #f7fafb; background: color-mix(in srgb, var(--annotation-color) 58%, #172027); font-size: 7.5px; cursor: pointer; overflow: hidden; }
 .annotation-block:hover, .annotation-block:focus-visible { z-index: 3; filter: brightness(1.14); outline: 1px solid #f3f7f8; outline-offset: 1px; }
 .annotation-block.inherited { border-style: dashed; }
+.annotation-block.draggable-time-point { cursor:ew-resize; touch-action:none; }
 .interval-track-tools { display:flex; align-items:center; flex-wrap:wrap; gap:6px; padding:6px 0; font-size:11px; }
 .interval-track-tools button { padding:4px 8px; }
 .interval-track-tools[hidden] { display:none; }

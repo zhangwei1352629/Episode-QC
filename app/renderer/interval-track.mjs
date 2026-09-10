@@ -7,6 +7,12 @@ export function zoomWindow(start,end,anchor,factor,duration){
   return [left,left+width];
 }
 
+export function draggedBounds(annotation,edge,value,limit){
+  if(annotation.scope==='time_point')return calibrationBounds('time_point',value,value,limit);
+  if(annotation.scope!=='time_range')throw new Error('整条标签不能拖动修改时间');
+  return calibrationBounds('time_range',edge==='start'?value:annotation.start_offset_ns,edge==='end'?value:annotation.end_offset_ns,limit);
+}
+
 export function installIntervalTrack({container,getState,seek,pause,save,notify}){
   const toolbar=document.createElement('div');toolbar.className='interval-track-tools';
   toolbar.innerHTML='<button type="button" data-view="in">放大 +</button><button type="button" data-view="out">缩小 −</button><button type="button" data-view="left">← 平移</button><button type="button" data-view="right">平移 →</button><button type="button" data-view="all">全段</button><span role="status"></span>';
@@ -32,6 +38,7 @@ export function installIntervalTrack({container,getState,seek,pause,save,notify}
       block.style.setProperty('--annotation-left',`${100*(Math.max(start,view[0])-view[0])/width}%`);
       block.style.setProperty('--annotation-width',`${100*Math.max(0,Math.min(end,view[1])-Math.max(start,view[0]))/width}%`);
       block.classList.toggle('interval-selected',a.annotation_id===selected);
+      block.classList.toggle('draggable-time-point',a.scope==='time_point');
       const editable=a.annotation_id===selected&&a.scope==='time_range';
       for(const edge of ['start','end']){
         let handle=block.querySelector(`[data-edge="${edge}"]`);
@@ -46,7 +53,8 @@ export function installIntervalTrack({container,getState,seek,pause,save,notify}
     const a=drag?.draft||annotations.get(selected);
     const offsets=s.grid?.exact?s.grid.frameOffsetsNs:null;
     const frame=t=>offsets?` F${offsets.indexOf(nearestFrame(offsets,t))+1}`:'';
-    status.textContent=saving?'正在保存边界…':`${(view[0]/1e9).toFixed(3)}–${(view[1]/1e9).toFixed(3)}s · 滚轮缩放，Shift+滚轮平移`+(a?` · ${(a.start_offset_ns/1e9).toFixed(6)}s${frame(a.start_offset_ns)} → ${(a.end_offset_ns/1e9).toFixed(6)}s${frame(a.end_offset_ns)} · 持续 ${((a.end_offset_ns-a.start_offset_ns)/1e9).toFixed(6)}s · ${s.grid?.displayName||'时间定位'} · 拖动两端修改，松开保存，Esc取消`:' · 点击区间选中');
+    const detail=a?.scope==='time_point'?` · 时间点 ${(a.start_offset_ns/1e9).toFixed(6)}s${frame(a.start_offset_ns)} · 拖动标记修改，松开保存，Esc取消`:a?` · ${(a.start_offset_ns/1e9).toFixed(6)}s${frame(a.start_offset_ns)} → ${(a.end_offset_ns/1e9).toFixed(6)}s${frame(a.end_offset_ns)} · 持续 ${((a.end_offset_ns-a.start_offset_ns)/1e9).toFixed(6)}s · 拖动两端修改，松开保存，Esc取消`:' · 点击标注选中';
+    status.textContent=saving?'正在保存标注时间…':`${(view[0]/1e9).toFixed(3)}–${(view[1]/1e9).toFixed(3)}s · 滚轮缩放，Shift+滚轮平移`+detail+` · ${s.grid?.displayName||'时间定位'} · I/O 设置区间`;
   }
   function changeView(action,anchor=getState().time){
     if(drag||!getState().duration)return;const s=getState(),width=view[1]-view[0];
@@ -59,22 +67,24 @@ export function installIntervalTrack({container,getState,seek,pause,save,notify}
   container.addEventListener('wheel',e=>{if(!getState().episodeId)return;e.preventDefault();const surface=e.target.closest('.annotation-lane-surface')||container.querySelector('.annotation-lane-surface');if(!surface)return;changeView(e.shiftKey?(e.deltaY<0?'left':'right'):(e.deltaY<0?'in':'out'),time(e,surface));},{passive:false});
   container.addEventListener('pointerdown',e=>{
     if(e.button!==0||saving)return;
-    const handle=e.target.closest('[data-edge]');if(!handle)return;
-    e.preventDefault();e.stopImmediatePropagation();pause();
-    const id=handle.closest('[data-annotation-id]').dataset.annotationId;
-    const a=getState().annotations.find(a=>a.annotation_id===id);if(!a||a.scope!=='time_range')return;
-    const rect=handle.closest('.annotation-lane-surface').getBoundingClientRect();
-    drag={id,original:structuredClone(a),draft:{...a},edge:handle.dataset.edge,episode:getState().episodeId,pointer:e.pointerId,surface:{getBoundingClientRect:()=>rect},changed:false};
+    const block=e.target.closest('[data-annotation-id]');if(!block)return;
+    const id=block.dataset.annotationId,a=getState().annotations.find(a=>a.annotation_id===id);
+    const handle=e.target.closest('[data-edge]');
+    if(!a||!(a.scope==='time_point'||(a.scope==='time_range'&&handle)))return;
+    e.preventDefault();e.stopImmediatePropagation();pause();selected=id;
+    const rect=block.closest('.annotation-lane-surface').getBoundingClientRect();
+    drag={id,original:structuredClone(a),draft:{...a},edge:a.scope==='time_point'?'point':handle.dataset.edge,anchorX:e.clientX,episode:getState().episodeId,pointer:e.pointerId,surface:{getBoundingClientRect:()=>rect},changed:false};
     container.setPointerCapture(e.pointerId);
+    render();
   },true);
   container.addEventListener('pointermove',e=>{
     if(!drag||e.pointerId!==drag.pointer)return;
     if(getState().episodeId!==drag.episode){cancel();return;}
+    if(drag.edge==='point'&&!drag.changed&&Math.abs(e.clientX-drag.anchorX)<4)return;
     const s=getState(),raw=time(e,drag.surface);
     const value=Math.round(nearestFrame(s.grid?.exact?s.grid.frameOffsetsNs:null,raw));
-    const candidate={...drag.draft,[drag.edge==='start'?'start_offset_ns':'end_offset_ns']:value};
-    try{calibrationBounds('time_range',candidate.start_offset_ns,candidate.end_offset_ns,s.limit);}catch{return;}
-    drag.draft=candidate;drag.changed=value!==drag.original[drag.edge==='start'?'start_offset_ns':'end_offset_ns'];seek(value);render();
+    let bounds;try{bounds=draggedBounds(drag.draft,drag.edge,value,s.limit);}catch{return;}
+    drag.draft={...drag.draft,...bounds};drag.changed=bounds.start_offset_ns!==drag.original.start_offset_ns||bounds.end_offset_ns!==drag.original.end_offset_ns;seek(value);render();
   });
   function cancel(){if(drag){const pointer=drag.pointer;drag=null;if(container.hasPointerCapture(pointer))container.releasePointerCapture(pointer);}render();}
   container.addEventListener('pointercancel',cancel);
@@ -84,9 +94,9 @@ export function installIntervalTrack({container,getState,seek,pause,save,notify}
     if(!drag||e.pointerId!==drag.pointer)return;
     const done=drag;drag=null;suppressClick=true;setTimeout(()=>suppressClick=false,0);
     if(container.hasPointerCapture(e.pointerId))container.releasePointerCapture(e.pointerId);
-    if(!done.changed||getState().episodeId!==done.episode){render();return;}
+    if(!done.changed||getState().episodeId!==done.episode){if(!done.changed&&done.edge==='point'&&getState().episodeId===done.episode)seek(done.original.start_offset_ns);render();return;}
     saving=true;render();
-    try{await save(done.original,calibrationBounds('time_range',done.draft.start_offset_ns,done.draft.end_offset_ns,getState().limit));}
+    try{await save(done.original,calibrationBounds(done.original.scope,done.draft.start_offset_ns,done.draft.end_offset_ns,getState().limit));}
     catch(error){notify(error.message||'保存失败，已恢复原区间');}finally{saving=false;render();}
   });
   container.addEventListener('click',e=>{

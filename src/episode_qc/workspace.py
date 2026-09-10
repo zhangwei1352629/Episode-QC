@@ -789,6 +789,13 @@ def scan_data_source(
         source = connection.execute("SELECT * FROM data_source WHERE root_path = ?", (str(root),)).fetchone()
         source_id = source["id"]
 
+    # Only rows present before discovery can be considered missing. Incremental
+    # caching may register more Episodes while a full scan is indexing files.
+    with connect_workspace(db_path) as connection:
+        missing_candidates = (connection.execute(
+            "SELECT id, relative_path, mcap_path FROM episode WHERE data_source_id = ?",
+            (source_id,),
+        ).fetchall() if episode_files is None else [])
     if episode_files is None:
         candidates = _discover_episode_mcaps(root, profile, task_kind=task_kind)
     indexed: list[dict[str, object]] = []
@@ -819,10 +826,8 @@ def scan_data_source(
             # SQLite writer lock. Each indexed Episode is a short transaction.
             connection.commit()
 
-        missing_rows = (connection.execute("SELECT id, relative_path FROM episode WHERE data_source_id = ?", (source_id,)).fetchall()
-                        if episode_files is None else [])
-        for row in missing_rows:
-            if row["relative_path"] not in seen_paths:
+        for row in missing_candidates:
+            if row["relative_path"] not in seen_paths and not Path(row["mcap_path"]).is_file():
                 connection.execute(
                     "UPDATE episode SET import_status = 'source_missing', import_error = ?, updated_at = ? WHERE id = ?",
                     ("源文件在本次重扫中未找到", _now(), row["id"]),

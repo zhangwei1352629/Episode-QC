@@ -19,6 +19,16 @@ def test_context_fetches_only_selected_episode_without_batch_sync(tmp_path):
     client.request.assert_called_once_with('GET','/api/v1/qc/jobs/QCJ-ONE?episode_id=REMOTE1')
 
 
+def test_uninherited_candidate_still_blocks_completion(tmp_path):
+    from episode_qc.workspace import update_episode_review
+    root=tmp_path/'source';_write_sample_episode(root/'episode_000001');db=tmp_path/'db'
+    scan=scan_data_source(db,root);eid=scan['episodes'][0]['id'];init(db)
+    with connect_workspace(db) as c:
+        c.execute('INSERT INTO ai_candidate(run_id,candidate_id,episode_id,payload) VALUES(?,?,?,?)',('other-run','c',eid,'{}'))
+    with pytest.raises(ValueError,match='AI候选'):
+        update_episode_review(db,eid,review_status='completed')
+
+
 def test_ai_round_seeds_timeline_without_human_pass_and_preserves_edits(tmp_path, monkeypatch):
     from types import SimpleNamespace
     from unittest.mock import Mock
@@ -53,6 +63,11 @@ def test_ai_round_seeds_timeline_without_human_pass_and_preserves_edits(tmp_path
     assert history['annotations'][0]['comment']=='AI original'
     delete_annotation(db,inherited['annotation_id']);ai.fetch(app,eid)
     assert not episode_detail(db,eid)['annotations']
+    from episode_qc.workspace import update_episode_review
+    update_episode_review(db,eid,review_status='completed')
+    with connect_workspace(db) as c:
+        assert c.execute('SELECT state FROM ai_candidate WHERE episode_id=?',(eid,)).fetchone()[0]=='inherited'
+        assert c.execute('SELECT COUNT(*) FROM ai_review_outbox').fetchone()[0]==0
     assert len(app._ai_verified_sources)==1
     with pytest.raises(ValueError,match='独立历史轮'):
         ai.review(app,eid,{'run_id':'r1','candidate_id':'c1','action':'accept'})

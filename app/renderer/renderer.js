@@ -558,10 +558,11 @@ async function refreshPlatformJobs({ quiet = false } = {}) {
     const stillCaching = payload.jobs?.some(
       (item) => item.local_caching || (!item.local_task_id && ["claimed", "caching", "cache_ready"].includes(item.status)),
     );
-    if (!stillCaching) stopFlowPolling();
+    if (payload.refreshing) startFlowPolling();
+    else if (!stillCaching) stopFlowPolling();
   } catch (error) {
     if (!quiet) toast(error.message || String(error), "error", 6500);
-    els.flowTaskStatus.textContent = "连接失败";
+    els.flowTaskStatus.textContent = "任务列表刷新失败，请重试（不代表已退出 Flow）";
   } finally {
     platformRefreshInFlight = false;
   }
@@ -580,6 +581,10 @@ function renderPlatformJobs() {
     ? "单机模式只保存本地索引、缓存和质检结果，不连接 Flow，也不会修改原始数据。"
     : "清空历史导入只删除本地索引和派生缓存，不删除原始数据，也不影响 Flow 任务。";
   if (standalone) return;
+  if (platform.connection_pending) {
+    els.flowTaskStatus.textContent = "正在更新任务列表，请稍候";
+    return;
+  }
   els.flowLoginForm.hidden = Boolean(platform.connected);
   els.flowLogout.hidden = !platform.connected;
   els.refreshFlowJobs.hidden = !platform.connected;
@@ -603,6 +608,7 @@ function renderPlatformJobs() {
     0,
   );
   els.flowTaskStatus.textContent = `${platform.reviewer || platform.username} · ${groups.length} 个任务 · 可领取 ${claimableBatchCount} · 可恢复 ${recoverableBatchCount} · 不可领取 ${blockedBatchCount}`;
+  if (platform.refreshing) els.flowTaskStatus.textContent += " · 更新中（显示上次结果）";
   if (!groups.length) {
     els.flowTaskList.innerHTML = '<div class="empty-panel">当前没有可领取或待排查的 Flow 质检批次</div>';
     return;

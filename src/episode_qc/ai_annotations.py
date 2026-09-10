@@ -1,7 +1,7 @@
 """Separate candidate storage; accepting one writes through normal annotation validation."""
 import hashlib,json,uuid
 from urllib.parse import urlencode
-from .workspace import connect_workspace,episode_detail,save_annotation,sync_flow_previous_reviews
+from .workspace import connect_workspace,episode_detail,save_annotation,sync_flow_previous_reviews,reconcile_inherited_ai_candidates
 
 def init(db):
     with connect_workspace(db) as c:
@@ -58,11 +58,12 @@ def fetch(app,eid,start=False):
     with connect_workspace(db) as c:
         for a in run['result']['annotations']:
             c.execute('INSERT OR IGNORE INTO ai_candidate(run_id,candidate_id,episode_id,payload) VALUES(?,?,?,?)',(run['id'],a['id'],eid,json.dumps(a,ensure_ascii=False)))
+        reconcile_inherited_ai_candidates(c,eid)
         rows=c.execute('SELECT * FROM ai_candidate WHERE run_id=? AND episode_id=?',(run['id'],eid)).fetchall()
         values=[]
         for row in rows:
             item=dict(row);a=json.loads(item.pop('payload'));item['annotation']=a
-            if item['annotation_id'] and not c.execute('SELECT 1 FROM annotation WHERE id=? AND deleted_at IS NULL',(item['annotation_id'],)).fetchone():item['state']='pending'
+            if item['state']!='inherited' and item['annotation_id'] and not c.execute('SELECT 1 FROM annotation WHERE id=? AND deleted_at IS NULL',(item['annotation_id'],)).fetchone():item['state']='pending'
             values.append(item)
     sync_outbox(db,client,job['code'],eid)
     return {'runs':[dict(id=r['id'],state=r['state'],error=r.get('error')) for r in runs],'candidates':values,'coverage':run['result']['coverage'],'inherited_rounds':len(ai_rounds),'episode_detail':episode_detail(db,eid) if ai_rounds else None}

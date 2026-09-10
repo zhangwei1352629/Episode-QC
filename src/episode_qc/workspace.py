@@ -1635,7 +1635,7 @@ def _episode_rows(connection: sqlite3.Connection, where: str = "", parameters: t
     query = f"""
         SELECT e.*, ds.root_path AS source_root, ds.task_id,
                t.task_code, t.task_name, t.origin AS task_origin,
-               t.source_type, t.task_kind, t.metadata_json AS timing_metadata_json,
+               t.source_type, t.task_kind,
                COALESCE(stream_counts.camera_count, 0) AS camera_count,
                COALESCE(stream_counts.mocap_available, 0) AS mocap_available,
                COALESCE(changes.incremental_added_count, 0) AS incremental_added_count,
@@ -1664,10 +1664,17 @@ def _episode_rows(connection: sqlite3.Connection, where: str = "", parameters: t
         ORDER BY e.data_group COLLATE NOCASE, e.relative_path COLLATE NOCASE
     """
     rows = []
+    # Request-local only: never reuse a previous label/timing snapshot after a
+    # task update. Do not join multi-MB task JSON onto every Episode row.
+    timing_by_task = {}
     query_parameters = parameters * 3 if single else parameters
     for row in connection.execute(query, query_parameters):
         value = dict(row)
-        metadata = _loads(value.pop("timing_metadata_json"), {})
+        task_id = value["task_id"]
+        if task_id not in timing_by_task:
+            task = connection.execute("SELECT metadata_json FROM qc_task WHERE id = ?", (task_id,)).fetchone()
+            timing_by_task[task_id] = _loads(task["metadata_json"], {}) if task else {}
+        metadata = timing_by_task[task_id]
         value.update(annotation_timing(
             value["duration_ns"], value["relative_path"], metadata.get("flow_job"),
             requires_flow=value["task_origin"] == "flow",
@@ -1700,7 +1707,15 @@ def _task_rows(
                tls.label_set_key AS local_label_set_key,
                tls.version AS local_label_schema_version,
                tls.source_hash AS local_label_schema_hash,
-               COUNT(e.id) AS episode_count,
+               SUM(e.episode_count) AS episode_count, SUM(e.ready_count) AS ready_count,
+               SUM(e.error_count) AS error_count, SUM(e.completed_count) AS completed_count,
+               SUM(e.active_count) AS active_count, SUM(e.playback_ready_count) AS playback_ready_count,
+               SUM(e.playback_preparing_count) AS playback_preparing_count,
+               SUM(e.source_size_bytes) AS source_size_bytes
+        FROM qc_task t
+        LEFT JOIN data_source ds ON ds.task_id = t.id
+        LEFT JOIN (
+          SELECT data_source_id, COUNT(id) AS episode_count,
                SUM(CASE WHEN e.import_status = 'ready' THEN 1 ELSE 0 END) AS ready_count,
                SUM(CASE WHEN e.import_status != 'ready' THEN 1 ELSE 0 END) AS error_count,
                SUM(CASE WHEN e.review_status IN ('completed', 'reviewed') THEN 1 ELSE 0 END) AS completed_count,
@@ -1708,9 +1723,8 @@ def _task_rows(
                SUM(CASE WHEN e.cache_status IN ('ready', 'partial') THEN 1 ELSE 0 END) AS playback_ready_count,
                SUM(CASE WHEN e.cache_status = 'preparing' THEN 1 ELSE 0 END) AS playback_preparing_count,
                COALESCE(SUM(e.file_size), 0) AS source_size_bytes
-        FROM qc_task t
-        LEFT JOIN data_source ds ON ds.task_id = t.id
-        LEFT JOIN episode e ON e.data_source_id = ds.id
+          FROM episode e GROUP BY data_source_id
+        ) e ON e.data_source_id = ds.id
         LEFT JOIN label_set tls ON tls.id = t.label_set_id
         {where}
         GROUP BY t.id
@@ -3793,6 +3807,33 @@ def _refresh_annotation_count(connection: sqlite3.Connection, episode_id: str) -
     connection.execute("UPDATE episode SET annotation_count = ?, updated_at = ? WHERE id = ?", (count, _now(), episode_id))
 
 
+def reconcile_inherited_ai_candidates(connection, episode_id: str) -> int:
+    """Retire legacy candidates only when an exact inherited copy exists.
+
+    Tombstones are evidence of an intentional edit in the human round too.
+    This is not candidate acceptance and must never emit an AI review event.
+    """
+    if not connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='ai_candidate'").fetchone():
+        return 0
+    inherited = {}
+    for row in connection.execute(
+        "SELECT id, attributes_json FROM annotation WHERE episode_id=? AND source='flow_incremental'",
+        (episode_id,),
+    ):
+        attrs = _loads(row['attributes_json'], {})
+        provenance = attrs.get('ai_provenance') or {}
+        run_id, candidate_id = provenance.get('run_id'), provenance.get('candidate_id')
+        if run_id and candidate_id and attrs.get('_incremental_lineage_id') == f'ai:{run_id}:{candidate_id}':
+            inherited[(str(run_id), str(candidate_id))] = row['id']
+    updated = 0
+    for (run_id, candidate_id), annotation_id in inherited.items():
+        updated += connection.execute(
+            "UPDATE ai_candidate SET state='inherited', annotation_id=? WHERE episode_id=? AND run_id=? AND candidate_id=? AND state IN ('pending','accepted')",
+            (annotation_id, episode_id, run_id, candidate_id),
+        ).rowcount
+    return updated
+
+
 def update_episode_review(
     db_path: str | Path,
     episode_id: str,
@@ -3819,6 +3860,7 @@ def update_episode_review(
         playhead = max(0, min(playhead, duration))
         review_write = review_status is not None or quality_decision is not None
         if review_write and status in {"completed", "reviewed"}:
+            reconcile_inherited_ai_candidates(connection, episode_id)
             if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='ai_candidate'").fetchone():
                 pending = connection.execute("SELECT 1 FROM ai_candidate c LEFT JOIN annotation a ON a.id=c.annotation_id AND a.deleted_at IS NULL WHERE c.episode_id=? AND c.state IN ('pending','accepted') AND a.id IS NULL LIMIT 1", (episode_id,)).fetchone()
                 if pending:

@@ -87,6 +87,10 @@ NAS_UNAVAILABLE_MESSAGE = (
 LOGGER = logging.getLogger(__name__)
 
 
+def _public_task_summary(task: dict[str, object]) -> dict[str, object]:
+    return {key: value for key, value in task.items() if key != "metadata"}
+
+
 def _task_label_snapshot_mismatch(
     job: dict[str, object], task: dict[str, object] | None
 ) -> bool:
@@ -496,6 +500,13 @@ class EpisodeQcWebApplication:
         self._platform_result_jobs: set[str] = set()
         self._platform_lock = threading.RLock()
         self._platform_refresh_lock = threading.Lock()
+        self._platform_poll_lock = threading.Lock()
+        self._platform_poll_future = None
+        self._platform_poll_client = None
+        self._platform_poll_snapshot = None
+        self._platform_poll_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="episode-qc-list-refresh"
+        )
         self._platform_claim_locks: dict[str, threading.Lock] = {}
         self._workspace_write_lock = threading.RLock()
         self._flow_client_factory = FlowClient
@@ -543,6 +554,7 @@ class EpisodeQcWebApplication:
             self._isolated_work.close()
         self._platform_executor.shutdown(wait=False, cancel_futures=True)
         self._platform_progress_executor.shutdown(wait=False, cancel_futures=True)
+        self._platform_poll_executor.shutdown(wait=False, cancel_futures=True)
 
     def nas_status(self) -> dict[str, object]:
         return self._nas_status_monitor.status()
@@ -567,6 +579,19 @@ class EpisodeQcWebApplication:
                 )
             )
             state = workspace_state(self.paths.db_path, task_id=task_id)
+        # The renderer obtains full annotation/history data from episode_detail
+        # when an Episode is opened. Task snapshots are server-side contracts,
+        # not list-view data; sending every historical snapshot can be huge.
+        state["tasks"] = [_public_task_summary(task) for task in state.get("tasks", [])]
+        if state.get("selected_task"):
+            state["selected_task"] = _public_task_summary(state["selected_task"])
+        for episode in state.get("episodes", []):
+            previous = episode.get("previous_review")
+            if isinstance(previous, dict):
+                episode["previous_review"] = {
+                    key: value for key, value in previous.items()
+                    if key not in {"annotations", "deleted_annotation_lineages"}
+                }
         return state
 
     def update_settings(self, request: dict[str, object]) -> dict[str, object]:
@@ -581,7 +606,7 @@ class EpisodeQcWebApplication:
         )
 
     def get_tasks(self) -> dict[str, object]:
-        return {"tasks": list_qc_tasks(self.paths.db_path)}
+        return {"tasks": [_public_task_summary(task) for task in list_qc_tasks(self.paths.db_path)]}
 
     def clear_local_task_history(self, keep_task_id: str | None) -> dict[str, object]:
         result = self._write_workspace(
@@ -676,6 +701,47 @@ class EpisodeQcWebApplication:
             self._platform_history_synced_jobs.clear()
             self._platform_ownership_errors.clear()
         return {"connected": False, "jobs": []}
+
+    def poll_platform_jobs(self) -> dict[str, object]:
+        """Bound HTTP waiting while a single refresh performs local disk work.
+
+        Snapshots are scoped to the client identity, never shared across logins.
+        Mutating operations continue to use authoritative state, not snapshots.
+        """
+        from concurrent.futures import TimeoutError as FutureTimeout
+
+        if not self.flow_enabled:
+            return {"enabled": False, "connected": False, "jobs": []}
+        client = self._flow_client
+        with self._platform_poll_lock:
+            if self._platform_poll_client is not client:
+                self._platform_poll_client = client
+                self._platform_poll_snapshot = None
+            future = self._platform_poll_future
+            if future is None:
+                future = self._platform_poll_executor.submit(self.get_platform_jobs)
+                self._platform_poll_future = (client, future)
+            owner, future = self._platform_poll_future
+        try:
+            payload = future.result(timeout=0.2)
+        except FutureTimeout:
+            with self._platform_poll_lock:
+                snapshot = self._platform_poll_snapshot if self._platform_poll_client is client else None
+            return {**(snapshot or {"enabled": self.flow_enabled, "connected": False, "jobs": []}),
+                    "refreshing": True, "connection_pending": snapshot is None}
+        except Exception:
+            with self._platform_poll_lock:
+                if self._platform_poll_future == (owner, future):
+                    self._platform_poll_future = None
+            raise
+        with self._platform_poll_lock:
+            if self._platform_poll_future == (owner, future):
+                self._platform_poll_future = None
+            if owner is not self._flow_client or client is not self._flow_client:
+                return {"enabled": self.flow_enabled, "connected": False, "jobs": [],
+                        "refreshing": True, "connection_pending": True}
+            self._platform_poll_snapshot = payload
+        return {**payload, "refreshing": False}
 
     def get_platform_jobs(self) -> dict[str, object]:
         # A timed-out browser request may still be running here. Do not start
@@ -2278,7 +2344,7 @@ class EpisodeQcRequestHandler(BaseHTTPRequestHandler):
             self._send_json(app.disconnect_platform())
             return
         if method == "GET" and path == "/api/platform/jobs":
-            self._send_json(app.get_platform_jobs())
+            self._send_json(app.poll_platform_jobs())
             return
         platform_claim_match = re.fullmatch(
             r"/api/platform/jobs/([A-Za-z0-9._-]+)/claim", path

@@ -1,5 +1,5 @@
 // Frozen AI rounds seed editable human copies; original AI output stays immutable.
-export function installAISuggestions({ container, api, episodeId, seek, reload, notify }) {
+export function installAISuggestions({ container, api, episodeId, seek, reload, applyDetail, notify }) {
   const panel=document.createElement('details');panel.className='ai-suggestions';container.before(panel);
   let generation=0;
   async function render(start=false) {
@@ -14,7 +14,8 @@ export function installAISuggestions({ container, api, episodeId, seek, reload, 
       const data=await api.aiSuggestions(eid,start?'start':'suggestions',{});
       if(g!==generation||eid!==episodeId())return;
       if(data.inherited_rounds){
-        await reload();
+        if(data.episode_detail && applyDetail) applyDetail(eid,data.episode_detail);
+        else await reload();
         if(g!==generation||eid!==episodeId())return;
         info.textContent=`AI 独立历史轮已载入时间轴 · 当前为人工复检，可修改、删除或补标；AI 原始记录保留。`;
         return;

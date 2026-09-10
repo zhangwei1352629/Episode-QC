@@ -1,4 +1,5 @@
 import { installAISuggestions } from "./ai-suggestions.mjs";
+import { installCalibration, adjacentFrame } from "./annotation-calibration.mjs";
 import { G1Viewer } from "./g1-viewer.bundle.js";
 import { annotationDurationNs, annotationTimeError } from "./annotation-timing.mjs";
 import {
@@ -232,7 +233,22 @@ async function refreshWorkspace({ preserveEpisode = true } = {}) {
   }
 }
 
+let calibration, calibrationPreview = null;
 function bindEvents() {
+  const pauseCalibration = () => { state.playing=false;calibrationPreview=null;updatePlaybackButton(); };
+  calibration=installCalibration({container:els.annotationTrack,
+    getState:()=>({episodeId:state.currentEpisodeId,annotations:state.detail?.annotations||[],time:state.playheadNs,duration:state.durationNs,limit:annotationDurationNs(state.detail?.episode),grid:selectionFrameGrid(),visualReady:!state.visualPending && state.visualReadyTime===Math.round(state.playheadNs)}),
+    seek:seekTo,pause:pauseCalibration,
+    preview:(start,end)=>{if(!state.cache||end<=start)return;seekTo(start);calibrationPreview={end};state.playing=true;state.lastTick=performance.now();updatePlaybackButton();},
+    edit:openAnnotationEditor,notify:message=>toast(message,'error'),
+    save:async(original,bounds)=>{
+      const current=state.detail?.annotations?.find(a=>a.annotation_id===original.annotation_id);
+      if(!current||current.updated_at!==original.updated_at)throw new Error('标注已变化，请重新选中后校准');
+      const episodeId=state.currentEpisodeId;
+      const saved=await window.episodeQc.saveAnnotation({annotationId:current.annotation_id,payload:{...current,...bounds,episode_id:episodeId}});
+      if(state.currentEpisodeId===episodeId){state.detail.annotations=state.detail.annotations.map(a=>a.annotation_id===saved.annotation_id?saved:a);renderAnnotations();}
+      return saved;
+    }});
   window.episodeQc.onEpisodeCacheReady(handleWorkerEvent);
   els.toggleEpisodes.addEventListener("click", () => toggleWorkspacePanel("episodes"));
   els.toggleLabels.addEventListener("click", () => toggleWorkspacePanel("labels"));
@@ -336,7 +352,7 @@ function bindEvents() {
   });
   els.annotationTrack.addEventListener("click", (event) => {
     const item = event.target.closest("[data-annotation-id]");
-    if (item) openAnnotationEditor(item.dataset.annotationId);
+    if (item) calibration.select(item.dataset.annotationId);
   });
   els.annotationTrack.addEventListener("pointerdown", beginTimelineSelection);
   window.addEventListener("pointermove", updateTimelineSelection);
@@ -1058,7 +1074,7 @@ function renderEpisodeList() {
 
 let renderAI;
 function refreshAI() {
-  if (!renderAI) renderAI=installAISuggestions({container:els.annotationList,api:window.episodeQc,episodeId:()=>state.currentEpisodeId,seek:seekTo,reload:reloadCurrentEpisode,notify:(s)=>toast(s,"error")});
+  if (!renderAI) renderAI=installAISuggestions({container:els.annotationList,api:window.episodeQc,episodeId:()=>state.currentEpisodeId,seek:seekTo,reload:reloadCurrentEpisode,applyDetail:(eid,detail)=>{if(eid===state.currentEpisodeId){state.detail=detail;renderEpisodeDetail();}},notify:(s)=>toast(s,"error")});
   renderAI();
 }
 async function openEpisode(episodeId) {
@@ -1074,6 +1090,9 @@ async function openEpisode(episodeId) {
   state.detail = null;
   state.playbackEpisodeId = null;
   state.currentEpisodeId = episodeId;
+  state.visualReadyTime=null;
+  calibrationPreview=null;
+  calibration?.render();
   state.previousEgoDetail = null;
   state.previousEgoDetailEpisodeId = null;
   state.previousEgoDetailTaskId = null;
@@ -1360,12 +1379,19 @@ async function requestVisualFrames(force = false) {
       : Promise.resolve();
     await Promise.all([...cameraRequests, motionRequest, actionRequest]);
     if (episodeId === state.currentEpisodeId && generation === (state.visualGeneration || 0)) {
+      state.visualReadyTime=timeNs;
       setCacheStatus("ready", state.cache.reused ? "播放缓存已复用" : "播放缓存已就绪");
     }
   } catch (error) {
     if (episodeId === state.currentEpisodeId && generation === (state.visualGeneration || 0)) setCacheStatus("error", `帧读取失败：${error.message || error}`);
   } finally {
     if (generation === (state.visualGeneration || 0)) state.visualPending = false;
+    if (episodeId === state.currentEpisodeId && generation === (state.visualGeneration || 0)) {
+      calibration?.render();
+      // A paused drag may have moved again while this request was in flight.
+      // Always fetch the final position; otherwise the playhead and image differ.
+      if(!state.playing && Math.round(state.playheadNs)!==timeNs) void requestVisualFrames(true);
+    }
   }
 }
 
@@ -1377,9 +1403,10 @@ function playbackLoop(now) {
   state.lastTick = now;
   if (state.playing && state.durationNs > 0) {
     state.playheadNs += elapsedMs * 1e6 * state.playbackRate;
+    if(calibrationPreview && state.playheadNs>=calibrationPreview.end){state.playheadNs=calibrationPreview.end;state.playing=false;calibrationPreview=null;updatePlaybackButton();renderClock();requestVisualFrames(true);requestAnimationFrame(playbackLoop);return;}
     const start = state.selectionStartNs;
     const end = state.selectionEndNs;
-    if (els.loopSelection.checked && start !== null && end !== null && end > start && state.playheadNs >= end) {
+    if (!calibrationPreview && els.loopSelection.checked && start !== null && end !== null && end > start && state.playheadNs >= end) {
       state.playheadNs = start;
     } else if (state.playheadNs >= state.durationNs) {
       state.playheadNs = state.durationNs;
@@ -1427,6 +1454,7 @@ function renderClock() {
     els.framePosition.title = "播放缓存就绪后显示帧号";
   }
   els.timelineRange.value = state.durationNs ? String(Math.round((state.playheadNs / state.durationNs) * 1_000_000)) : "0";
+  calibration?.render();
 }
 
 function markSelectionStart() {
@@ -2649,6 +2677,7 @@ function handleKeyboard(event) {
     if (!els.timelineRange.disabled) {
       event.preventDefault();
       const grid = selectionFrameGrid();
+      if(!event.shiftKey && grid.exact){state.playing=false;calibrationPreview=null;updatePlaybackButton();seekTo(adjacentFrame(grid.frameOffsetsNs,state.playheadNs,event.key==='ArrowRight'?1:-1));return;}
       const stepNs = event.shiftKey ? 1e9 : grid.stepNs;
       seekTo(snapTimeToFrame(
         state.playheadNs + (event.key === "ArrowRight" ? 1 : -1) * stepNs,

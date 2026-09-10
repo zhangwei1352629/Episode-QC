@@ -44,7 +44,7 @@ test('completion of an old frame request cannot unlock the current generation',a
   const state={cache:{cameras:[{stream_id:'s'}]},currentEpisodeId:'e',playbackEpisodeId:'e',visualPending:false,visualGeneration:1,durationNs:100,playheadNs:0};
   const context=vm.createContext({state,performance:{now:()=>1000},URL:{revokeObjectURL(){}},
     window:{episodeQc:{getCameraFrame:()=>new Promise(resolve=>pending.push(resolve))}},
-    els:{cameraGrid:{querySelector:()=>null}},setCacheStatus(){}});
+    els:{cameraGrid:{querySelector:()=>null}},calibration:null,setCacheStatus(){}});
   vm.runInContext(fn,context);
   const first=context.requestVisualFrames(true);
   state.visualGeneration=2;state.visualPending=false;
@@ -53,4 +53,20 @@ test('completion of an old frame request cannot unlock the current generation',a
   assert.equal(state.visualPending,true);
   pending[1]({dataUrl:'blob:new'});await second;
   assert.equal(state.visualPending,false);
+});
+
+test('paused drag requests its final frame after an in-flight request',async()=>{
+  const source=fs.readFileSync(path.join(__dirname,'../renderer/renderer.js'),'utf8');
+  const fn=source.slice(source.indexOf('async function requestVisualFrames('),source.indexOf('\nfunction playbackLoop('));
+  const pending=[], times=[];
+  const state={cache:{cameras:[{stream_id:'s'}]},currentEpisodeId:'e',playbackEpisodeId:'e',visualPending:false,visualGeneration:1,durationNs:100,playheadNs:0,playing:false};
+  const context=vm.createContext({state,performance:{now:()=>1000},URL:{revokeObjectURL(){}},calibration:null,
+    window:{episodeQc:{getCameraFrame:({timeNs})=>{times.push(timeNs);return new Promise(resolve=>pending.push(resolve));}}},els:{cameraGrid:{querySelector:()=>null}},setCacheStatus(){}});
+  vm.runInContext(fn,context);
+  const first=context.requestVisualFrames(true);state.playheadNs=80;
+  await context.requestVisualFrames(true);
+  pending[0]({});await first;
+  assert.deepEqual(times,[0,80]);assert.equal(state.visualPending,true);
+  pending[1]({});await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(state.visualReadyTime,80);assert.equal(state.visualPending,false);
 });

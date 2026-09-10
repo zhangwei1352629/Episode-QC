@@ -5,6 +5,20 @@ from episode_qc.workspace import canonical_json_sha256,scan_data_source,install_
 from episode_qc.ai_annotations import init
 
 
+def test_context_fetches_only_selected_episode_without_batch_sync(tmp_path):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from episode_qc.ai_annotations import context
+    root=tmp_path/'source';_write_sample_episode(root/'episode_000001');db=tmp_path/'db'
+    scan=scan_data_source(db,root,origin='flow',flow_job_code='QCJ-ONE')
+    eid=scan['episodes'][0]['id']
+    client=Mock();client.request.return_value={'code':'QCJ-ONE','status':'in_progress'}
+    manager=Mock();manager.local_episode_mappings.return_value=[{'episode_id':'REMOTE1','local_episode_id':eid}]
+    app=SimpleNamespace(paths=SimpleNamespace(db_path=db),_require_flow_client=lambda:client,_quality_cache_manager=lambda:manager)
+    assert context(app,eid)[3]=='REMOTE1'
+    client.request.assert_called_once_with('GET','/api/v1/qc/jobs/QCJ-ONE?episode_id=REMOTE1')
+
+
 def test_ai_round_seeds_timeline_without_human_pass_and_preserves_edits(tmp_path, monkeypatch):
     from types import SimpleNamespace
     from unittest.mock import Mock
@@ -26,6 +40,7 @@ def test_ai_round_seeds_timeline_without_human_pass_and_preserves_edits(tmp_path
     app=SimpleNamespace(paths=SimpleNamespace(db_path=db),_write_workspace=lambda op:op())
     monkeypatch.setattr(ai,'context',lambda *_:(episode_detail(db,eid),client,job,'REMOTE1'))
     assert ai.fetch(app,eid)['inherited_rounds']==1
+    assert 'episode_id=REMOTE1' in client.request.call_args.args[1]
     detail=episode_detail(db,eid);assert detail['episode']['review_status']=='unreviewed'
     assert not detail['episode']['quality_decision'];assert detail['episode']['review_history_count']==1
     inherited=detail['annotations'][0];assert inherited['attributes']['_incremental_source']['round_kind']=='ai'

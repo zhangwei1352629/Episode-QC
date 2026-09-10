@@ -1,5 +1,6 @@
 """Separate candidate storage; accepting one writes through normal annotation validation."""
 import hashlib,json,uuid
+from urllib.parse import urlencode
 from .workspace import connect_workspace,episode_detail,save_annotation,sync_flow_previous_reviews
 
 def init(db):
@@ -13,16 +14,19 @@ def context(app,eid):
     with connect_workspace(db) as c:
         r=c.execute('SELECT t.flow_job_code FROM episode e JOIN data_source d ON d.id=e.data_source_id JOIN qc_task t ON t.id=d.task_id WHERE e.id=?',(eid,)).fetchone()
     if not r or not r[0]:raise ValueError('AI预标注需要已领取的Flow任务')
-    job=r[0];client=app._require_flow_client();remote=app._platform_job(client,job)
-    if remote.get('status')=='completed':raise ValueError('已提交任务不能改变AI候选')
+    job=r[0];client=app._require_flow_client()
     mappings=app._quality_cache_manager().local_episode_mappings(job)
     ids=[m['episode_id'] for m in mappings if m.get('local_episode_id')==eid]
     if len(ids)!=1:raise ValueError('Episode映射不唯一')
+    remote=client.request('GET',f'/api/v1/qc/jobs/{job}?'+urlencode({'episode_id':ids[0]}))
+    if remote.get('status')=='completed':raise ValueError('已提交任务不能改变AI候选')
+    # Never persist this partial job as the whole task snapshot, nor sync the
+    # other episodes merely because the reviewer navigated to this one.
     return detail,client,remote,ids[0]
 
 def fetch(app,eid,start=False):
     detail,client,job,remote_id=context(app,eid);db=app.paths.db_path;init(db)
-    response=client.request('POST' if start else 'GET',f"/api/v1/qc/jobs/{job['code']}/ai-runs",{'retry':True} if start else None)
+    response=client.request('POST' if start else 'GET',f"/api/v1/qc/jobs/{job['code']}/ai-runs"+('' if start else '?'+urlencode({'episode_id':remote_id})),{'retry':True} if start else None)
     runs=[r for r in response['runs'] if r['episode_id']==remote_id];run=next((r for r in runs if r['state']=='succeeded'),None)
     with connect_workspace(db) as c:
         for old in runs:
@@ -61,7 +65,7 @@ def fetch(app,eid,start=False):
             if item['annotation_id'] and not c.execute('SELECT 1 FROM annotation WHERE id=? AND deleted_at IS NULL',(item['annotation_id'],)).fetchone():item['state']='pending'
             values.append(item)
     sync_outbox(db,client,job['code'],eid)
-    return {'runs':[dict(id=r['id'],state=r['state'],error=r.get('error')) for r in runs],'candidates':values,'coverage':run['result']['coverage'],'inherited_rounds':len(ai_rounds)}
+    return {'runs':[dict(id=r['id'],state=r['state'],error=r.get('error')) for r in runs],'candidates':values,'coverage':run['result']['coverage'],'inherited_rounds':len(ai_rounds),'episode_detail':episode_detail(db,eid) if ai_rounds else None}
 
 def review(app,eid,body):
     # Recheck current Flow ownership/version before every acceptance.

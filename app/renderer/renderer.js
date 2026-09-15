@@ -1,6 +1,6 @@
 import { installAISuggestions } from "./ai-suggestions.mjs";
 import { adjacentFrame } from "./annotation-calibration.mjs";
-import { contiguousAiSegments, installIntervalTrack, isPrimaryAiSegment } from "./interval-track.mjs";
+import { contiguousAiSegmentGroup, installIntervalTrack } from "./interval-track.mjs";
 import { G1Viewer } from "./g1-viewer.bundle.js";
 import { annotationDurationNs, annotationTimeError } from "./annotation-timing.mjs";
 import {
@@ -2159,11 +2159,8 @@ function renderAnnotationLanes(annotations, labels) {
     if (state.timelineView === "history") return round.inherited;
     return true;
   });
-  const primaryAiCandidates = visible.filter((annotation) => (
-    isPrimaryAiSegment(annotation, labels.get(annotation.label_code) || {})
-  ));
   const aiSegments = state.timelineView === "effective"
-    ? contiguousAiSegments(primaryAiCandidates, annotationDurationNs(state.detail?.episode))
+    ? contiguousAiSegmentGroup(visible, labels, annotationDurationNs(state.detail?.episode))
     : [];
   const aiIds = new Set(aiSegments.map((annotation) => annotation.annotation_id));
   const grouped = new Map();
@@ -2209,16 +2206,16 @@ function renderAiSegmentTrack(segments, labels) {
     const width = state.durationNs ? ((endNs - startNs) / state.durationNs) * 100 : 0;
     const grid = frameGridForCameras(state.cache?.cameras || [], annotation.target_type === "camera" ? annotation.target_key : state.selectedCameraId);
     const frameText = formatFrameRange(frameRangeForInterval(startNs, endNs, grid));
-    return `<button type="button" class="annotation-block ai-segment-block" data-annotation-id="${escapeHtml(annotation.annotation_id)}" aria-label="${escapeHtml(label.name)}，${escapeHtml(annotationTiming(annotation))}" title="${escapeHtml(label.name)} · ${escapeHtml(annotationTiming(annotation))}" style="--annotation-left:${left}%;--annotation-width:${width}%;--annotation-color:${escapeHtml(label.color || "#8c959f")}"><span class="ai-segment-name"><b>${escapeHtml(label.name)}</b><small>${escapeHtml(frameText || `${formatClock(startNs)}–${formatClock(endNs)}`)}</small></span></button>`;
+    return `<button type="button" class="annotation-block ai-segment-block" data-annotation-id="${escapeHtml(annotation.annotation_id)}" data-display-start-ns="${startNs}" data-display-end-ns="${endNs}" aria-label="${escapeHtml(label.name)}，${escapeHtml(annotationTiming(annotation))}" title="${escapeHtml(label.name)} · ${escapeHtml(annotationTiming(annotation))}" style="--annotation-left:${left}%;--annotation-width:${width}%;--annotation-color:${escapeHtml(label.color || "#8c959f")}"><span class="ai-segment-name"><b>${escapeHtml(label.name)}</b><small>${escapeHtml(frameText || `${formatClock(startNs)}–${formatClock(endNs)}`)}</small></span></button>`;
   }).join("");
   const handles = segments.slice(1).map((right, index) => {
     const left = segments[index];
     const position = state.durationNs ? (Number(right.start_offset_ns) / state.durationNs) * 100 : 0;
     const leftName = labels.get(left.label_code)?.name || left.label_name || left.label_code;
     const rightName = labels.get(right.label_code)?.name || right.label_name || right.label_code;
-    return `<button type="button" class="ai-segment-boundary" data-boundary-left-id="${escapeHtml(left.annotation_id)}" data-boundary-right-id="${escapeHtml(right.annotation_id)}" aria-label="拖动 ${escapeHtml(leftName)} 与 ${escapeHtml(rightName)} 的分界点" title="拖动分界点：${escapeHtml(leftName)} ↔ ${escapeHtml(rightName)}" style="--boundary-left:${position}%"></button>`;
+    return `<button type="button" class="ai-segment-boundary" data-boundary-left-id="${escapeHtml(left.annotation_id)}" data-boundary-right-id="${escapeHtml(right.annotation_id)}" data-boundary-offset-ns="${Number(right.start_offset_ns)}" aria-label="拖动 ${escapeHtml(leftName)} 与 ${escapeHtml(rightName)} 的分界点" title="拖动分界点：${escapeHtml(leftName)} ↔ ${escapeHtml(rightName)}" style="--boundary-left:${position}%"></button>`;
   }).join("");
-  return `<div class="effective-annotation-lane ai-segment-track" data-ai-segment-track><div class="annotation-lane-label" title="AI 整段互斥动作分段"><i></i><span>动作分段</span></div><div class="annotation-lane-surface">${blocks}${handles}</div></div>`;
+  return `<div class="effective-annotation-lane ai-segment-track" data-ai-segment-track><div class="annotation-lane-label" title="AI 整段互斥动作标签"><i></i><span>动作标签</span></div><div class="annotation-lane-surface">${blocks}${handles}</div></div>`;
 }
 
 function annotationTiming(annotation) {

@@ -176,7 +176,7 @@ def test_move_ai_segment_boundary_is_atomic_and_one_undo_restores_both_sides(tmp
     assert redone[0]['end_offset_ns']==redone[1]['start_offset_ns']==1_200_000_000
 
 
-def test_move_ai_segment_boundary_rejects_gap_and_stale_edit_without_partial_write(tmp_path):
+def test_move_ai_segment_boundary_closes_frame_gap_and_rejects_stale_edit(tmp_path):
     root=tmp_path/'data';_write_sample_episode(root/'episode_000001');db=tmp_path/'db.sqlite3'
     schema=copy.deepcopy(FLOW_SCHEMA);schema['labels'][0]['annotation_scopes']=['time_range']
     label=install_flow_label_schema(db,{'label_set_id':'task-quality','label_schema_version':'1.0.0','label_schema':schema,'label_schema_hash':canonical_json_sha256(schema)})
@@ -186,8 +186,7 @@ def test_move_ai_segment_boundary_rejects_gap_and_stale_edit_without_partial_wri
     right=save_annotation(db,{'episode_id':eid,'label_code':'body_sway','scope':'time_range','target_type':'global','start_offset_ns':1_000_000_000,'end_offset_ns':duration,'attributes':attrs})
     with pytest.raises(WorkspaceConflictError,match='另一个页面'):
         move_ai_segment_boundary(db,episode_id=eid,left_annotation_id=left['annotation_id'],right_annotation_id=right['annotation_id'],boundary_offset_ns=1_100_000_000,left_updated_at='stale',right_updated_at=right['updated_at'])
-    with pytest.raises(ValueError,match='不连续'):
-        move_ai_segment_boundary(db,episode_id=eid,left_annotation_id=left['annotation_id'],right_annotation_id=right['annotation_id'],boundary_offset_ns=1_100_000_000,left_updated_at=left['updated_at'],right_updated_at=right['updated_at'])
+    moved=move_ai_segment_boundary(db,episode_id=eid,left_annotation_id=left['annotation_id'],right_annotation_id=right['annotation_id'],boundary_offset_ns=1_100_000_000,left_updated_at=left['updated_at'],right_updated_at=right['updated_at'])
     after=episode_detail(db,eid)['annotations']
-    assert after[0]['end_offset_ns']==900_000_000
-    assert after[1]['start_offset_ns']==1_000_000_000
+    assert moved['annotations'][0]['end_offset_ns']==moved['annotations'][1]['start_offset_ns']==1_100_000_000
+    assert after[0]['end_offset_ns']==after[1]['start_offset_ns']==1_100_000_000

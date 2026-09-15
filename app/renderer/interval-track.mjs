@@ -34,9 +34,43 @@ export function isPrimaryAiSegment(annotation,label={}){
     &&(role==='phase'||role==='segmentation'||/(^|_)(phase|action|step)($|_)/.test(group));
 }
 
+export function contiguousAiSegmentGroup(annotations,labels,duration){
+  const limit=Number(duration)||0;
+  const groups=new Map();
+  for(const annotation of annotations||[]){
+    const attributes=annotation?.attributes||{};
+    if(annotation?.scope!=='time_range'||!(attributes.ai_provenance||attributes._incremental_source?.round_kind==='ai'))continue;
+    const label=labels?.get?.(annotation.label_code)||{};
+    const group=String(label.group||label.group_code||attributes.ai_provenance?.segment_role||'').trim();
+    const run=String(attributes.ai_provenance?.run_id||attributes._incremental_source?.review_attempt_id||'').trim();
+    const key=`${group||'ungrouped'}\u0000${run||'unknown-run'}`;
+    if(!groups.has(key))groups.set(key,[]);
+    groups.get(key).push(annotation);
+  }
+  return [...groups.values()]
+    .map(values=>{
+      const ordered=values.slice().sort((a,b)=>Number(a.start_offset_ns)-Number(b.start_offset_ns)||Number(a.end_offset_ns)-Number(b.end_offset_ns));
+      if(!limit||ordered.length<2)return [];
+      let uncovered=Math.max(0,Number(ordered[0].start_offset_ns))+Math.max(0,limit-Number(ordered.at(-1).end_offset_ns));
+      for(let i=1;i<ordered.length;i++){
+        const gap=Number(ordered[i].start_offset_ns)-Number(ordered[i-1].end_offset_ns);
+        if(gap<0||gap>limit*.02)return [];
+        uncovered+=gap;
+      }
+      if(uncovered>limit*.03)return [];
+      return ordered.map((annotation,index)=>({
+        ...annotation,
+        start_offset_ns:index===0?0:Number(annotation.start_offset_ns),
+        end_offset_ns:index===ordered.length-1?limit:Number(ordered[index+1].start_offset_ns),
+      }));
+    })
+    .filter(values=>values.length)
+    .sort((left,right)=>right.length-left.length)[0]||[];
+}
+
 export function sharedBoundaryBounds(left,right,value,limit){
   if(left?.scope!=='time_range'||right?.scope!=='time_range')throw new Error('共享分界点仅支持区间标注');
-  if(left.episode_id!==right.episode_id||Number(left.end_offset_ns)!==Number(right.start_offset_ns))throw new Error('相邻 AI 分段不连续');
+  if(left.episode_id!==right.episode_id||Number(left.end_offset_ns)>Number(right.start_offset_ns))throw new Error('相邻 AI 分段重叠或顺序无效');
   const boundary=Math.round(Number(value));
   if(!Number.isFinite(boundary)||boundary<=Number(left.start_offset_ns)||boundary>=Number(right.end_offset_ns)||boundary<0||boundary>Number(limit))throw new Error('分界点必须位于相邻两段内部');
   return {
@@ -87,8 +121,14 @@ export function installIntervalTrack({container,getState,seek,pause,save,saveBou
   function activeBoundary(annotations){
     const ids=drag?.kind==='boundary'?{leftId:drag.leftId,rightId:drag.rightId}:selectedBoundary;
     if(!ids)return null;
-    const left=drag?.kind==='boundary'?drag.leftDraft:annotations.get(ids.leftId),right=drag?.kind==='boundary'?drag.rightDraft:annotations.get(ids.rightId);
-    return left&&right?{...ids,left,right}:null;
+    let left=drag?.kind==='boundary'?drag.leftDraft:annotations.get(ids.leftId),right=drag?.kind==='boundary'?drag.rightDraft:annotations.get(ids.rightId);
+    if(!left||!right)return null;
+    if(drag?.kind!=='boundary'){
+      const handle=container.querySelector(`[data-boundary-left-id="${ids.leftId}"][data-boundary-right-id="${ids.rightId}"]`);
+      const boundary=Number(handle?.dataset.boundaryOffsetNs);
+      if(Number.isFinite(boundary)){left={...left,end_offset_ns:boundary};right={...right,start_offset_ns:boundary};}
+    }
+    return {...ids,left,right};
   }
   function labelName(annotation){return annotation?.label_name||annotation?.label_code||'未命名分段';}
   function renderInspector(annotations,s){
@@ -124,7 +164,13 @@ export function installIntervalTrack({container,getState,seek,pause,save,saveBou
     for(const block of container.querySelectorAll('[data-annotation-id]')){
       const a=annotations.get(block.dataset.annotationId);if(!a)continue;
       const value=drag?.kind==='boundary'?(drag.leftId===a.annotation_id?drag.leftDraft:drag.rightId===a.annotation_id?drag.rightDraft:a):(drag?.id===a.annotation_id?drag.draft:a);
-      const start=value.start_offset_ns,end=value.end_offset_ns,width=view[1]-view[0];
+      const aiBlock=block.closest('[data-ai-segment-track]');
+      const displayStart=Number(block.dataset.displayStartNs),displayEnd=Number(block.dataset.displayEndNs);
+      let start=aiBlock&&Number.isFinite(displayStart)?displayStart:value.start_offset_ns;
+      let end=aiBlock&&Number.isFinite(displayEnd)?displayEnd:value.end_offset_ns;
+      if(drag?.kind==='boundary'&&drag.leftId===a.annotation_id)end=drag.leftDraft.end_offset_ns;
+      if(drag?.kind==='boundary'&&drag.rightId===a.annotation_id)start=drag.rightDraft.start_offset_ns;
+      const width=view[1]-view[0];
       block.hidden=end<view[0]||start>view[1];
       block.style.setProperty('--annotation-left',`${100*(Math.max(start,view[0])-view[0])/width}%`);
       block.style.setProperty('--annotation-width',`${100*Math.max(0,Math.min(end,view[1])-Math.max(start,view[0]))/width}%`);
@@ -143,7 +189,8 @@ export function installIntervalTrack({container,getState,seek,pause,save,saveBou
     for(const handle of container.querySelectorAll('[data-boundary-left-id]')){
       const left=drag?.kind==='boundary'&&drag.leftId===handle.dataset.boundaryLeftId?drag.leftDraft:annotations.get(handle.dataset.boundaryLeftId);
       if(!left)continue;
-      const boundary=Number(left.end_offset_ns);
+      const visualBoundary=Number(handle.dataset.boundaryOffsetNs);
+      const boundary=drag?.kind==='boundary'&&drag.leftId===handle.dataset.boundaryLeftId?Number(left.end_offset_ns):(Number.isFinite(visualBoundary)?visualBoundary:Number(left.end_offset_ns));
       handle.hidden=saving||boundary<view[0]||boundary>view[1];
       handle.style.setProperty('--boundary-left',`${100*(boundary-view[0])/(view[1]-view[0])}%`);
       handle.classList.toggle('active',Boolean(selectedBoundary&&handle.dataset.boundaryLeftId===selectedBoundary.leftId&&handle.dataset.boundaryRightId===selectedBoundary.rightId));
@@ -202,7 +249,8 @@ export function installIntervalTrack({container,getState,seek,pause,save,saveBou
       if(!left||!right||!saveBoundary)return;
       e.preventDefault();e.stopImmediatePropagation();pause();selected=null;selectedBoundary={leftId:left.annotation_id,rightId:right.annotation_id};
       const rect=boundaryHandle.closest('.annotation-lane-surface').getBoundingClientRect();
-      drag={kind:'boundary',leftId:left.annotation_id,rightId:right.annotation_id,leftOriginal:structuredClone(left),rightOriginal:structuredClone(right),leftDraft:{...left},rightDraft:{...right},episode:s.episodeId,pointer:e.pointerId,surface:{getBoundingClientRect:()=>rect},grabOffsetX:boundaryGrabOffset(view,left.end_offset_ns,e.clientX,rect),changed:false};
+      const visualBoundary=Number(boundaryHandle.dataset.boundaryOffsetNs)||Number(right.start_offset_ns);
+      drag={kind:'boundary',leftId:left.annotation_id,rightId:right.annotation_id,leftOriginal:structuredClone(left),rightOriginal:structuredClone(right),leftDraft:{...left,end_offset_ns:visualBoundary},rightDraft:{...right,start_offset_ns:visualBoundary},episode:s.episodeId,pointer:e.pointerId,surface:{getBoundingClientRect:()=>rect},grabOffsetX:boundaryGrabOffset(view,visualBoundary,e.clientX,rect),changed:false};
       container.setPointerCapture(e.pointerId);render();return;
     }
     const block=e.target.closest('[data-annotation-id]');if(!block)return;

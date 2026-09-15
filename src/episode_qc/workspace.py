@@ -3669,8 +3669,8 @@ def move_ai_segment_boundary(
 
         if not is_ai_segment(left_attrs) or not is_ai_segment(right_attrs):
             raise ValueError("只能联动修改 AI 预标注分段")
-        if int(left["end_offset_ns"]) != int(right["start_offset_ns"]):
-            raise ValueError("相邻 AI 分段不连续，已阻止修改")
+        if int(left["end_offset_ns"]) > int(right["start_offset_ns"]):
+            raise ValueError("相邻 AI 分段重叠或顺序无效，已阻止修改")
         boundary = int(boundary_offset_ns)
         if boundary <= int(left["start_offset_ns"]) or boundary >= int(right["end_offset_ns"]):
             raise ValueError("分界点必须位于相邻两段内部")

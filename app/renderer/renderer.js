@@ -1,6 +1,6 @@
 import { installAISuggestions } from "./ai-suggestions.mjs";
 import { adjacentFrame } from "./annotation-calibration.mjs";
-import { installIntervalTrack } from "./interval-track.mjs";
+import { contiguousAiSegments, installIntervalTrack, isPrimaryAiSegment } from "./interval-track.mjs";
 import { G1Viewer } from "./g1-viewer.bundle.js";
 import { annotationDurationNs, annotationTimeError } from "./annotation-timing.mjs";
 import {
@@ -252,6 +252,27 @@ function bindEvents() {
       const saved=await window.episodeQc.saveAnnotation({annotationId:current.annotation_id,payload:{...current,...bounds,episode_id:episodeId}});
       if(state.currentEpisodeId===episodeId){state.detail.annotations=state.detail.annotations.map(a=>a.annotation_id===saved.annotation_id?saved:a);renderAnnotations();}
       return saved;
+    },
+    saveBoundary:async(left,right,boundaryOffsetNs)=>{
+      if(left.episode_id!==state.currentEpisodeId||right.episode_id!==state.currentEpisodeId)throw new Error('Episode 已切换，取消修改');
+      const currentLeft=state.detail?.annotations?.find(a=>a.annotation_id===left.annotation_id);
+      const currentRight=state.detail?.annotations?.find(a=>a.annotation_id===right.annotation_id);
+      if(!currentLeft||!currentRight||currentLeft.updated_at!==left.updated_at||currentRight.updated_at!==right.updated_at)throw new Error('相邻分段已变化，请刷新后重试');
+      const episodeId=state.currentEpisodeId;
+      const result=await window.episodeQc.moveAiBoundary({
+        episodeId,
+        leftAnnotationId:left.annotation_id,
+        rightAnnotationId:right.annotation_id,
+        boundaryOffsetNs,
+        leftUpdatedAt:left.updated_at,
+        rightUpdatedAt:right.updated_at,
+      });
+      if(state.currentEpisodeId===episodeId){
+        const saved=new Map(result.annotations.map(a=>[a.annotation_id,a]));
+        state.detail.annotations=state.detail.annotations.map(a=>saved.get(a.annotation_id)||a);
+        renderAnnotations();
+      }
+      return result;
     }});
   window.episodeQc.onEpisodeCacheReady(handleWorkerEvent);
   els.toggleEpisodes.addEventListener("click", () => toggleWorkspacePanel("episodes"));
@@ -354,11 +375,24 @@ function bindEvents() {
     });
     renderAnnotations();
   });
-  // Interval editing owns pointer gestures on the existing track. Empty
-  // space only seeks; creating annotations still uses explicit I/O controls.
+  // Preserve the original manual-annotation gestures. The interval editor
+  // intercepts only an existing annotation handle or an AI shared boundary;
+  // dragging empty track space still creates a manual I/O range.
+  els.annotationTrack.addEventListener("click", (event) => {
+    const item = event.target.closest("[data-annotation-id]");
+    if (item) calibration.select(item.dataset.annotationId);
+  });
+  els.annotationTrack.addEventListener("pointerdown", beginTimelineSelection);
   window.addEventListener("pointermove", updateTimelineSelection);
   window.addEventListener("pointerup", endTimelineSelection);
   window.addEventListener("pointercancel", cancelTimelineSelection);
+  els.annotationTrack.addEventListener("dblclick", (event) => {
+    if (event.target.closest("[data-annotation-id]")) return;
+    seekTo(timelineTimeFromPointer(event));
+    state.scope = "time_point";
+    els.scopeTabs.querySelectorAll("button").forEach((button) => button.classList.toggle("active", button.dataset.scope === state.scope));
+    renderLabels();
+  });
   els.undo.addEventListener("click", undo);
   els.redo.addEventListener("click", redo);
   els.confirmCurrentEpisode.addEventListener("click", confirmCurrentEpisode);
@@ -472,7 +506,7 @@ function renderTaskContext() {
   els.currentTaskPath.textContent = compactSourcePath(taskPath);
   els.currentTaskPath.title = taskPath;
   els.currentTaskStatus.textContent = task
-    ? `${taskStatusName(task.status)} · ${task.completed_count}/${task.episode_count}`
+    ? `${taskStatusName(task.status)} · ${task.completed_count}/${task.expected_episode_count ?? task.episode_count}${task.missing_episode_count ? ` · 待缓存/导入 ${task.missing_episode_count} 条` : ""}`
     : "未加载";
   els.currentTaskStatus.dataset.status = task?.status || "empty";
   els.rescanTask.disabled = !task;
@@ -515,7 +549,7 @@ function renderTaskContext() {
           <small>${escapeHtml(taskKindName(item.task_kind))} · ${escapeHtml(item.task_code)} · ${escapeHtml(taskStatusName(item.status))}${escapeHtml(issue)}</small>
           <span title="${escapeHtml(path)}">${escapeHtml(compactSourcePath(path))}</span>
         </span>
-        <span class="task-list-progress"><strong>${item.completed_count}/${item.episode_count}</strong><span>${formatBytes(item.source_size_bytes)} · 异常 ${item.error_count}</span></span>
+        <span class="task-list-progress"><strong>${item.completed_count}/${item.expected_episode_count ?? item.episode_count}</strong><span>${formatBytes(item.source_size_bytes)} · 异常 ${item.error_count}${item.missing_episode_count ? ` · 待缓存/导入 ${item.missing_episode_count} 条` : ""}</span></span>
       </button>`;
   }).join("");
 }
@@ -693,6 +727,7 @@ function flowJobProgressLabel(job) {
 }
 
 function flowJobAction(job) {
+  if (job.superseded) return { name: "none", label: "旧版本已替代", disabled: true };
   if (flowJobNeedsCacheRecovery(job)) {
     if (job.local_caching) return { name: "none", label: flowJobProgressLabel(job), disabled: true };
     return { name: "claim", label: "恢复缓存", disabled: false };
@@ -1506,10 +1541,10 @@ function renderClock() {
   const grid = selectionFrameGrid();
   const frame = framePositionForTime(state.playheadNs, state.durationNs, grid);
   if (frame) {
-    els.framePosition.textContent = `${frame.exact ? "" : "约"}第 ${frame.number} / ${frame.total} 帧`;
+    els.framePosition.textContent = `${frame.exact ? "" : "≈"}F${frame.number} / F${frame.total}`;
     els.framePosition.title = `${grid.displayName || "参考相机"} · ${frame.exact ? "按真实帧时间戳定位" : "按平均帧间隔估算"}`;
   } else {
-    els.framePosition.textContent = "帧 -- / --";
+    els.framePosition.textContent = "F-- / F--";
     els.framePosition.title = "播放缓存就绪后显示帧号";
   }
   els.timelineRange.value = state.durationNs ? String(Math.round((state.playheadNs / state.durationNs) * 1_000_000)) : "0";
@@ -1570,11 +1605,11 @@ function renderSelection() {
     els.selectionLabel.textContent = "未选择区间";
   } else if (state.selectionEndNs === null) {
     const frame = framePositionForTime(state.selectionStartNs, state.durationNs, grid);
-    els.selectionLabel.textContent = `${formatClock(state.selectionStartNs)}${frame ? ` · ${frame.exact ? "" : "≈"}F${frame.number}` : ""} → 等待终点`;
+    els.selectionLabel.textContent = `${frame ? `${frame.exact ? "" : "≈"}F${frame.number} · ` : ""}${formatClock(state.selectionStartNs)} → 等待终点`;
   } else {
     const durationText = formatSeconds(state.selectionEndNs - state.selectionStartNs);
     const frameText = formatFrameRange(frameRangeForInterval(state.selectionStartNs, state.selectionEndNs, grid));
-    els.selectionLabel.textContent = `${formatClock(state.selectionStartNs)} → ${formatClock(state.selectionEndNs)} · ${durationText}${frameText ? ` · ${frameText}` : ""}`;
+    els.selectionLabel.textContent = `${frameText ? `${frameText} · ` : ""}${formatClock(state.selectionStartNs)} → ${formatClock(state.selectionEndNs)} · ${durationText}`;
   }
 }
 
@@ -2124,17 +2159,28 @@ function renderAnnotationLanes(annotations, labels) {
     if (state.timelineView === "history") return round.inherited;
     return true;
   });
+  const primaryAiCandidates = visible.filter((annotation) => (
+    isPrimaryAiSegment(annotation, labels.get(annotation.label_code) || {})
+  ));
+  const aiSegments = state.timelineView === "effective"
+    ? contiguousAiSegments(primaryAiCandidates, annotationDurationNs(state.detail?.episode))
+    : [];
+  const aiIds = new Set(aiSegments.map((annotation) => annotation.annotation_id));
   const grouped = new Map();
-  visible.forEach((annotation) => {
+  visible.filter((annotation) => !aiIds.has(annotation.annotation_id)).forEach((annotation) => {
     if (!grouped.has(annotation.label_code)) grouped.set(annotation.label_code, []);
     grouped.get(annotation.label_code).push(annotation);
   });
-  if (!grouped.size) {
+  if (!grouped.size && !aiSegments.length) {
     const emptyText = state.timelineView === "changes" ? "本条暂时没有新增或修改" : "暂无有效标注";
     els.annotationTrack.innerHTML = `<div class="timeline-empty annotation-lane-surface">${emptyText} · 可在此拖拽选择区间</div>`;
     return;
   }
-  els.annotationTrack.innerHTML = [...grouped.entries()].map(([labelCode, items]) => {
+  const aiTrack = aiSegments.length ? renderAiSegmentTrack(aiSegments, labels) : "";
+  const overlayHeading = aiSegments.length && grouped.size
+    ? '<div class="annotation-layer-divider"><span>附加标注</span><small>可重叠</small></div>'
+    : "";
+  els.annotationTrack.innerHTML = aiTrack + overlayHeading + [...grouped.entries()].map(([labelCode, items]) => {
     const first = items[0] || {};
     const label = labels.get(labelCode) || {
       name: first.label_name || labelCode,
@@ -2154,6 +2200,27 @@ function renderAnnotationLanes(annotations, labels) {
   calibration?.render();
 }
 
+function renderAiSegmentTrack(segments, labels) {
+  const blocks = segments.map((annotation) => {
+    const label = labels.get(annotation.label_code) || { name: annotation.label_name || annotation.label_code, color: "#8c959f" };
+    const startNs = Number(annotation.start_offset_ns) || 0;
+    const endNs = Number(annotation.end_offset_ns) || startNs;
+    const left = state.durationNs ? (startNs / state.durationNs) * 100 : 0;
+    const width = state.durationNs ? ((endNs - startNs) / state.durationNs) * 100 : 0;
+    const grid = frameGridForCameras(state.cache?.cameras || [], annotation.target_type === "camera" ? annotation.target_key : state.selectedCameraId);
+    const frameText = formatFrameRange(frameRangeForInterval(startNs, endNs, grid));
+    return `<button type="button" class="annotation-block ai-segment-block" data-annotation-id="${escapeHtml(annotation.annotation_id)}" aria-label="${escapeHtml(label.name)}，${escapeHtml(annotationTiming(annotation))}" title="${escapeHtml(label.name)} · ${escapeHtml(annotationTiming(annotation))}" style="--annotation-left:${left}%;--annotation-width:${width}%;--annotation-color:${escapeHtml(label.color || "#8c959f")}"><span class="ai-segment-name"><b>${escapeHtml(label.name)}</b><small>${escapeHtml(frameText || `${formatClock(startNs)}–${formatClock(endNs)}`)}</small></span></button>`;
+  }).join("");
+  const handles = segments.slice(1).map((right, index) => {
+    const left = segments[index];
+    const position = state.durationNs ? (Number(right.start_offset_ns) / state.durationNs) * 100 : 0;
+    const leftName = labels.get(left.label_code)?.name || left.label_name || left.label_code;
+    const rightName = labels.get(right.label_code)?.name || right.label_name || right.label_code;
+    return `<button type="button" class="ai-segment-boundary" data-boundary-left-id="${escapeHtml(left.annotation_id)}" data-boundary-right-id="${escapeHtml(right.annotation_id)}" aria-label="拖动 ${escapeHtml(leftName)} 与 ${escapeHtml(rightName)} 的分界点" title="拖动分界点：${escapeHtml(leftName)} ↔ ${escapeHtml(rightName)}" style="--boundary-left:${position}%"></button>`;
+  }).join("");
+  return `<div class="effective-annotation-lane ai-segment-track" data-ai-segment-track><div class="annotation-lane-label" title="AI 整段互斥动作分段"><i></i><span>动作分段</span></div><div class="annotation-lane-surface">${blocks}${handles}</div></div>`;
+}
+
 function annotationTiming(annotation) {
   const grid = frameGridForCameras(
     state.cache?.cameras || [],
@@ -2162,14 +2229,14 @@ function annotationTiming(annotation) {
   if (annotation.scope === "episode") {
     const end = Number(annotation.end_offset_ns || 0);
     const frameText = formatFrameRange(frameRangeForInterval(0, end, grid));
-    return `整条 · ${formatSeconds(end)}${frameText ? ` · ${frameText}` : ""}`;
+    return `整条${frameText ? ` · ${frameText}` : ""} · ${formatSeconds(end)}`;
   }
   if (annotation.scope === "time_point") {
     const frame = framePositionForTime(annotation.start_offset_ns, state.durationNs, grid);
-    return `${formatClock(annotation.start_offset_ns)}${frame ? ` · ${frame.exact ? "" : "≈"}F${frame.number}` : ""}`;
+    return `${frame ? `${frame.exact ? "" : "≈"}F${frame.number} · ` : ""}${formatClock(annotation.start_offset_ns)}`;
   }
   const frameText = formatFrameRange(frameRangeForInterval(annotation.start_offset_ns, annotation.end_offset_ns, grid));
-  return `${formatClock(annotation.start_offset_ns)}–${formatClock(annotation.end_offset_ns)} · ${formatSeconds(Number(annotation.end_offset_ns) - Number(annotation.start_offset_ns))}${frameText ? ` · ${frameText}` : ""}`;
+  return `${frameText ? `${frameText} · ` : ""}${formatClock(annotation.start_offset_ns)}–${formatClock(annotation.end_offset_ns)} · ${formatSeconds(Number(annotation.end_offset_ns) - Number(annotation.start_offset_ns))}`;
 }
 
 function currentReviewRound(episode = state.detail?.episode) {

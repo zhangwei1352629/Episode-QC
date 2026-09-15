@@ -1,7 +1,8 @@
+import copy
 import json
 import pytest
 from test_workspace_v1 import _write_sample_episode,FLOW_SCHEMA
-from episode_qc.workspace import canonical_json_sha256,scan_data_source,install_flow_label_schema,save_annotation,episode_detail,connect_workspace,undo_annotation_change
+from episode_qc.workspace import WorkspaceConflictError,canonical_json_sha256,scan_data_source,install_flow_label_schema,save_annotation,episode_detail,connect_workspace,move_ai_segment_boundary,undo_annotation_change,redo_annotation_change
 from episode_qc.ai_annotations import init
 
 
@@ -25,6 +26,42 @@ def test_uninherited_candidate_still_blocks_completion(tmp_path):
     scan=scan_data_source(db,root);eid=scan['episodes'][0]['id'];init(db)
     with connect_workspace(db) as c:
         c.execute('INSERT INTO ai_candidate(run_id,candidate_id,episode_id,payload) VALUES(?,?,?,?)',('other-run','c',eid,'{}'))
+    with pytest.raises(ValueError,match='AI候选'):
+        update_episode_review(db,eid,review_status='completed')
+
+
+def test_unique_manual_timeline_edit_reconciles_pending_ai_candidate(tmp_path):
+    from episode_qc.workspace import update_episode_review
+    root=tmp_path/'source';_write_sample_episode(root/'episode_000001');db=tmp_path/'db'
+    label=install_flow_label_schema(db,{'label_set_id':'task-quality','label_schema_version':'1.0.0','label_schema':FLOW_SCHEMA,'label_schema_hash':canonical_json_sha256(FLOW_SCHEMA)})
+    scan=scan_data_source(db,root,label_set_id=label['id']);eid=scan['episodes'][0]['id'];init(db)
+    with connect_workspace(db) as c:
+        c.execute('INSERT INTO ai_candidate(run_id,candidate_id,episode_id,payload) VALUES(?,?,?,?)',(
+            'r1','c1',eid,json.dumps({'label_code':'body_sway','start_offset_ns':100,'end_offset_ns':200}),
+        ))
+    saved=save_annotation(db,{'episode_id':eid,'label_code':'body_sway','scope':'episode','target_type':'global','start_offset_ns':300,'end_offset_ns':400})
+    update_episode_review(db,eid,review_status='completed',quality_decision='pass_with_labels')
+    with connect_workspace(db) as c:
+        candidate=c.execute('SELECT state,annotation_id FROM ai_candidate WHERE episode_id=?',(eid,)).fetchone()
+        annotation=c.execute('SELECT attributes_json FROM annotation WHERE id=?',(saved['annotation_id'],)).fetchone()
+        outbox=c.execute('SELECT body FROM ai_review_outbox WHERE episode_id=?',(eid,)).fetchone()
+    assert tuple(candidate)==('accepted',saved['annotation_id'])
+    attributes=json.loads(annotation['attributes_json'])
+    assert attributes['_incremental_lineage_id']=='ai:r1:c1'
+    assert attributes['ai_provenance']['review_action']=='edited_on_timeline'
+    assert json.loads(outbox['body'])['details']['start_offset_ns']==saved['start_offset_ns']
+
+
+def test_ambiguous_manual_timeline_edits_still_block_completion(tmp_path):
+    from episode_qc.workspace import update_episode_review
+    root=tmp_path/'source';_write_sample_episode(root/'episode_000001');db=tmp_path/'db'
+    label=install_flow_label_schema(db,{'label_set_id':'task-quality','label_schema_version':'1.0.0','label_schema':FLOW_SCHEMA,'label_schema_hash':canonical_json_sha256(FLOW_SCHEMA)})
+    scan=scan_data_source(db,root,label_set_id=label['id']);eid=scan['episodes'][0]['id'];init(db)
+    with connect_workspace(db) as c:
+        for candidate in ('c1','c2'):
+            c.execute('INSERT INTO ai_candidate(run_id,candidate_id,episode_id,payload) VALUES(?,?,?,?)',('r1',candidate,eid,json.dumps({'label_code':'body_sway'})))
+    for start in (100,300):
+        save_annotation(db,{'episode_id':eid,'label_code':'body_sway','scope':'episode','target_type':'global','start_offset_ns':start,'end_offset_ns':start+50})
     with pytest.raises(ValueError,match='AI候选'):
         update_episode_review(db,eid,review_status='completed')
 
@@ -116,3 +153,41 @@ def test_accept_atomic_idempotent_and_undo(tmp_path):
     with pytest.raises(ValueError):save_annotation(db,dict(payload,label_code='invalid'),ai_candidate=('r','c'))
     assert not episode_detail(db,eid)['annotations']
     save_annotation(db,payload,ai_candidate=('r','c'));assert len(episode_detail(db,eid)['annotations'])==1
+
+
+def test_move_ai_segment_boundary_is_atomic_and_one_undo_restores_both_sides(tmp_path):
+    root=tmp_path/'data';_write_sample_episode(root/'episode_000001');db=tmp_path/'db.sqlite3'
+    schema=copy.deepcopy(FLOW_SCHEMA)
+    schema['labels'][0]['annotation_scopes']=['time_range']
+    label=install_flow_label_schema(db,{'label_set_id':'task-quality','label_schema_version':'1.0.0','label_schema':schema,'label_schema_hash':canonical_json_sha256(schema)})
+    scanned=scan_data_source(db,root,label_set_id=label['id']);eid=scanned['episodes'][0]['id']
+    duration=episode_detail(db,eid)['episode']['annotation_duration_ns']
+    provenance=lambda candidate:{'ai_provenance':{'run_id':'run','candidate_id':candidate},'_incremental_source':{'round_kind':'ai','round_number':1}}
+    left=save_annotation(db,{'episode_id':eid,'label_code':'body_sway','scope':'time_range','target_type':'global','start_offset_ns':0,'end_offset_ns':1_000_000_000,'attributes':provenance('left')})
+    right=save_annotation(db,{'episode_id':eid,'label_code':'body_sway','scope':'time_range','target_type':'global','start_offset_ns':1_000_000_000,'end_offset_ns':duration,'attributes':provenance('right')})
+    moved=move_ai_segment_boundary(db,episode_id=eid,left_annotation_id=left['annotation_id'],right_annotation_id=right['annotation_id'],boundary_offset_ns=1_200_000_000,left_updated_at=left['updated_at'],right_updated_at=right['updated_at'],session_id='boundary-test')
+    assert moved['annotations'][0]['end_offset_ns']==moved['annotations'][1]['start_offset_ns']==1_200_000_000
+    assert all(item['attributes']['ai_provenance']['review_action']=='edited_on_timeline' for item in moved['annotations'])
+    undo_annotation_change(db,session_id='boundary-test')
+    restored=episode_detail(db,eid)['annotations']
+    assert restored[0]['end_offset_ns']==restored[1]['start_offset_ns']==1_000_000_000
+    redo_annotation_change(db,session_id='boundary-test')
+    redone=episode_detail(db,eid)['annotations']
+    assert redone[0]['end_offset_ns']==redone[1]['start_offset_ns']==1_200_000_000
+
+
+def test_move_ai_segment_boundary_rejects_gap_and_stale_edit_without_partial_write(tmp_path):
+    root=tmp_path/'data';_write_sample_episode(root/'episode_000001');db=tmp_path/'db.sqlite3'
+    schema=copy.deepcopy(FLOW_SCHEMA);schema['labels'][0]['annotation_scopes']=['time_range']
+    label=install_flow_label_schema(db,{'label_set_id':'task-quality','label_schema_version':'1.0.0','label_schema':schema,'label_schema_hash':canonical_json_sha256(schema)})
+    scanned=scan_data_source(db,root,label_set_id=label['id']);eid=scanned['episodes'][0]['id'];duration=episode_detail(db,eid)['episode']['annotation_duration_ns']
+    attrs={'ai_provenance':{'run_id':'run','candidate_id':'candidate'}}
+    left=save_annotation(db,{'episode_id':eid,'label_code':'body_sway','scope':'time_range','target_type':'global','start_offset_ns':0,'end_offset_ns':900_000_000,'attributes':attrs})
+    right=save_annotation(db,{'episode_id':eid,'label_code':'body_sway','scope':'time_range','target_type':'global','start_offset_ns':1_000_000_000,'end_offset_ns':duration,'attributes':attrs})
+    with pytest.raises(WorkspaceConflictError,match='另一个页面'):
+        move_ai_segment_boundary(db,episode_id=eid,left_annotation_id=left['annotation_id'],right_annotation_id=right['annotation_id'],boundary_offset_ns=1_100_000_000,left_updated_at='stale',right_updated_at=right['updated_at'])
+    with pytest.raises(ValueError,match='不连续'):
+        move_ai_segment_boundary(db,episode_id=eid,left_annotation_id=left['annotation_id'],right_annotation_id=right['annotation_id'],boundary_offset_ns=1_100_000_000,left_updated_at=left['updated_at'],right_updated_at=right['updated_at'])
+    after=episode_detail(db,eid)['annotations']
+    assert after[0]['end_offset_ns']==900_000_000
+    assert after[1]['start_offset_ns']==1_000_000_000

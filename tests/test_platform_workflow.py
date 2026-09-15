@@ -223,6 +223,20 @@ def test_atomic_json_writer_uses_platform_independent_lf(tmp_path: Path):
     assert target.read_bytes() == b'{\n  "name": "\xe6\xb5\x8b\xe8\xaf\x95"\n}\n'
 
 
+def test_atomic_json_syncs_contents_before_replace(tmp_path: Path, monkeypatch):
+    events = []
+    replace = platform_workflow.os.replace
+    monkeypatch.setattr(platform_workflow.os, "fsync", lambda fd: events.append("sync"))
+    def checked_replace(source, target):
+        assert events == ["sync"]
+        assert json.loads(Path(source).read_bytes()) == {"ok": True}
+        events.append("replace")
+        replace(source, target)
+    monkeypatch.setattr(platform_workflow.os, "replace", checked_replace)
+    QualityCacheManager._write_json_atomic(tmp_path / "state.json", {"ok": True})
+    assert events == ["sync", "replace"]
+
+
 def test_atomic_json_writer_retries_transient_windows_permission_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -1457,7 +1471,8 @@ def test_copy_resumable_uses_download_budget_without_extra_state_writes(tmp_path
     assert target.read_bytes() == source.read_bytes()
 
 
-def test_cache_job_recovers_an_episode_moved_before_its_state_was_saved(tmp_path: Path):
+@pytest.mark.parametrize("missing_state", [False, True])
+def test_cache_job_recovers_an_episode_moved_before_its_state_was_saved(tmp_path: Path, missing_state):
     asset_root = tmp_path / "nas" / "AST-MOVED"
     episode_root = asset_root / "episodes" / "episode_000001"
     episode_root.mkdir(parents=True)
@@ -1486,12 +1501,15 @@ def test_cache_job_recovers_an_episode_moved_before_its_state_was_saved(tmp_path
     interrupted["episodes"][0]["status"] = "caching"
     interrupted["episodes"][0]["primary_files"] = []
     QualityCacheManager._write_json_atomic(state_path, interrupted)
+    if missing_state:
+        state_path.unlink()
 
     resumed = QualityCacheManager(tmp_path / "qc-cache", reserve_bytes=0).cache_job(
         FakeFlowClient(job), job
     )
 
     assert resumed["cache_complete"] is True
+    assert (Path(resumed["cache_dir"]) / "episodes/episode_000001/motion.bvh").read_bytes() == primary.read_bytes()
 
 
 def test_cache_job_keeps_processing_later_episodes_after_one_episode_fails(

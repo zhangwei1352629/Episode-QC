@@ -224,6 +224,7 @@ test("播放位置和标注区间同时显示时间、秒数与真实帧号", ()
   assert.match(html, /id="current-time"/);
   assert.match(html, /id="duration-time"/);
   assert.match(html, /id="frame-position"/);
+  assert.ok(html.indexOf('id="frame-position"') < html.indexOf('id="current-time"'));
   assert.match(renderer, /framePositionForTime/);
   assert.match(renderer, /frameRangeForInterval/);
   assert.match(renderer, /formatSeconds\(state\.selectionEndNs - state\.selectionStartNs\)/);

@@ -163,6 +163,32 @@ def test_workspace_connection_waits_for_long_running_transient_writer(tmp_path: 
     assert busy_timeout_ms == 30_000
 
 
+def test_partial_flow_cache_cannot_complete_whole_task(tmp_path: Path):
+    root = tmp_path / "dataset"
+    _write_sample_episode(root / "episode_000001")
+    db = tmp_path / "workspace.db"
+    scanned = scan_data_source(db, root, origin="flow", flow_job_code="QCJ-PARTIAL",
+        task_metadata={"flow_job": {"required_episode_count": 2,
+            "episodes": [{"episode_id": f"EP{i}", "relative_path": f"episode_{i:06d}",
+                          "duration_seconds": 10} for i in (1, 2)]}})
+    update_episode_review(db, scanned["episodes"][0]["id"],
+        review_status="completed", quality_decision="pass")
+    task = workspace_state(db)["tasks"][0]
+    assert task["status"] == "in_progress"
+    assert task["expected_episode_count"] == 2
+    assert task["missing_episode_count"] == 1
+    assert task["completed_count"] == 1
+    # Already persisted legacy 'completed' must also be corrected on read.
+    with connect_workspace(db) as c:
+        c.execute("UPDATE qc_task SET status='completed'")
+    assert workspace_state(db)["tasks"][0]["status"] == "in_progress"
+    _write_sample_episode(root / "episode_000002")
+    rescanned = scan_data_source(db, root)
+    for episode in rescanned["episodes"]:
+        update_episode_review(db, episode["id"], review_status="completed", quality_decision="pass")
+    assert workspace_state(db)["tasks"][0]["status"] == "completed"
+
+
 def test_workspace_backup_preserves_completed_qc_results(tmp_path: Path):
     source_root = tmp_path / "dataset"
     _write_sample_episode(source_root / "episode_000001")
@@ -716,6 +742,14 @@ def test_flow_incremental_history_is_editable_and_deleted_labels_do_not_return(
         label_set_id=str(installed["id"]),
     )
     local_episode_id = str(scanned["episodes"][0]["id"])
+    local_duration_ns = int(
+        episode_detail(db_path, local_episode_id)["episode"]["duration_ns"]
+    )
+    flow_duration_ns = local_duration_ns - 50_000_000
+    flow_duration_seconds = (
+        f"{flow_duration_ns // 1_000_000_000}."
+        f"{flow_duration_ns % 1_000_000_000:09d}"
+    )
     first_lineage = "QCJ-V1:ann-1"
     histories = [
         {
@@ -759,7 +793,7 @@ def test_flow_incremental_history_is_editable_and_deleted_labels_do_not_return(
             {
                 "episode_id": "AST-INCREMENTAL-EP0001",
                 "relative_path": "episodes/episode_000001",
-                "duration_seconds": "2.03",
+                "duration_seconds": flow_duration_seconds,
                 "review_history": histories,
                 "previous_review": histories[-1],
             }
@@ -782,6 +816,8 @@ def test_flow_incremental_history_is_editable_and_deleted_labels_do_not_return(
         "camera_shake",
     ]
     inherited_body, inherited_camera = detail["annotations"]
+    assert inherited_body["end_offset_ns"] == flow_duration_ns
+    assert inherited_camera["end_offset_ns"] == flow_duration_ns
     assert inherited_body["attributes"]["_incremental_lineage_id"] == first_lineage
     assert inherited_body["attributes"]["_incremental_source"]["round_number"] == 1
     assert inherited_body["attributes"]["_incremental_source"]["origin_round_number"] == 1
@@ -793,6 +829,29 @@ def test_flow_incremental_history_is_editable_and_deleted_labels_do_not_return(
     assert episode_summary["incremental_modified_count"] == 0
     assert episode_summary["incremental_removed_count"] == 0
     assert episode_summary["incremental_preserved_count"] == 2
+
+    # Older clients seeded whole-Episode inherited facts with the longer local
+    # MCAP duration. Confirming the Episode must repair that representation to
+    # the authoritative Flow duration instead of blocking the next-Episode action.
+    with connect_workspace(db_path) as connection:
+        connection.execute(
+            "UPDATE annotation SET end_offset_ns=? WHERE id=?",
+            (local_duration_ns, inherited_camera["annotation_id"]),
+        )
+    completed = update_episode_review(
+        db_path,
+        local_episode_id,
+        review_status="completed",
+        quality_decision="pass_with_labels",
+        reviewer_name="复检员",
+    )
+    assert completed["review_status"] == "completed"
+    repaired = episode_detail(db_path, local_episode_id)
+    repaired_camera = next(
+        item for item in repaired["annotations"] if item["label_code"] == "camera_shake"
+    )
+    assert repaired_camera["start_offset_ns"] == 0
+    assert repaired_camera["end_offset_ns"] == flow_duration_ns
 
     delete_annotation(db_path, inherited_body["annotation_id"])
     saved_camera = save_annotation(

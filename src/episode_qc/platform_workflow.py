@@ -2441,6 +2441,11 @@ class QualityCacheManager:
         state_path = ready_job_root / ".qc-cache.json"
         try:
             state = json.loads(state_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            # The explicit claim/recovery path already validates the Flow/NAS
+            # manifest. Let progressive caching verify and adopt each existing
+            # Episode; missing state is not evidence that cached files are bad.
+            return None
         except (OSError, json.JSONDecodeError):
             raise QualityCacheError(f"已有本地缓存状态损坏，请人工检查：{ready_job_root}")
         if state.get("schema_version") == 3 and not state.get("cache_complete"):
@@ -2668,7 +2673,12 @@ class QualityCacheManager:
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.partial")
         try:
-            temporary.write_bytes(payload)
+            # Atomic rename alone does not ensure the replacement's contents
+            # reached disk before a power loss. Sync before publishing it.
+            with temporary.open("wb") as output:
+                output.write(payload)
+                output.flush()
+                os.fsync(output.fileno())
             for attempt in range(_ATOMIC_JSON_REPLACE_ATTEMPTS):
                 try:
                     os.replace(temporary, path)

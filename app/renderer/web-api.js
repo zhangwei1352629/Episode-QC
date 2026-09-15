@@ -190,6 +190,7 @@ function installWebApi() {
     },
     confirmLabelSchema: () => request("/api/label-schema/import", { method: "POST" }),
     saveAnnotation: (value) => request("/api/annotations", { method: "POST", body: value }),
+    moveAiBoundary: (value) => request("/api/annotations/ai-boundary", { method: "POST", body: value }),
     deleteAnnotation: (annotationId) => request(`/api/annotations/${encodeURIComponent(annotationId)}`, { method: "DELETE" }),
     undo: () => request("/api/undo", { method: "POST" }),
     redo: () => request("/api/redo", { method: "POST" }),

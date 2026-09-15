@@ -1,68 +1,90 @@
-# Episode QC 增量质检页面设计验收
+# Design QA — AI 分界点精调
 
-## 对比基准
-
-- source visual truth: `/home/zw/.codex/generated_images/019ff3c8-e4c2-7d61-9670-44b4dcc6c451/exec-6ea3a982-13e5-415d-a8e2-e14ba979ae7d.png`
-- implementation URL: `http://127.0.0.1:8770/`
-- implementation screenshot: `/tmp/episode-qc-ui-final.png`
-- combined comparison: `/tmp/episode-qc-ui-final-comparison.png`
-- source pixels: `1586 × 992`
-- implementation runtime CSS viewport: `1600 × 960`
-- implementation raw browser capture: `3200 × 1920`
-- density normalization: IAB 对固定全屏/WebGL 页面返回 4 倍密度平铺截图；取首个 `800 × 480` 完整渲染单元并归一到 `1600 × 960`。源图同步归一到 `1600 × 960` 后并排比较。
-- state: 深色主题；Flow 任务 `QCJ-20260825-00006`；标签 `V3.0.0`；当前 `R3`；8 条 Episode；选中第一条；6 路相机、G1 29DOF、Mocap、历史 R1/R2 与本轮 R3 数据齐备。
+- Source visual truth: `/home/zw/.codex/generated_images/01a01508-5a80-78b3-a60d-92d4b300e1e1/exec-dfafcac5-97dc-4079-af3a-22623c10e79e.png`
+- Implementation capture: `in-app-browser://tab/6`（本轮 Codex 内置浏览器全页及时间轴局部截图）
+- Preview URL: `http://127.0.0.1:8876/`
+- Real-data verification URL: `http://127.0.0.1:8877/`
+- Real-data source: `/home/zw/Desktop/AST-20260906-00012/episodes/episode_000001/episode.mcap`（独立测试库，只读引用源文件）
+- Source pixels: 2171 × 724
+- Browser verification viewport: 1440 × 900 CSS px，随后已恢复默认视口
+- Browser capture: 1190 × 744 JPEG；时间轴局部捕获 646 × 253 JPEG
+- Density normalization: 源图和实现均按 CSS 布局比例判断；实现局部图用于细节核对，不以浏览器截图缩放差异作为问题
+- State: 本地 AI 整段预标注演示，第二个分界点选中并显示精调面板
 
 ## Full-view comparison evidence
 
-- 页面保持设计稿的三栏信息架构：左侧任务/Episode，中间 G1 + 六路相机 + 时间轴，右侧标签/有效标注/Episode 结论。
-- 顶栏持续展示任务编号、任务名称、标签版本和当前轮次；右侧工具入口保持原产品能力。
-- 六路相机采用 `3 × 2`，G1 29DOF 独立显示；相机和 Mocap 覆盖信息合并为单条“数据源同步”。
-- 底部保持“本轮变更”、Episode 级“确认本条并继续”和任务级唯一“提交本轮质检到 Flow”。
-- 颜色继续使用项目既有深色底、青灰分隔与黄绿色主操作色；状态标签使用蓝、橙、绿、红、紫语义色。
+- 信息结构与选定方向一致：结果视图、紧凑视图控制、单行 AI 分段、选中分界点、分界时间、帧号、吸附状态和左右段时长均在同一工作区内。
+- 实现保留了现有 QC 的全局时间轴标题、I/O 选区和数据源同步信息，避免破坏已有高频流程。
+- 未增加第二条标注进度轴；实现仍以现有播放滑杆作为唯一全局定位控件。
 
-## Focused region comparison evidence
+## Focused-region comparison evidence
 
-- right sidebar: 历史标签直接出现在当前标签区和“本条有效标注”列表，显示 `R1`、`R2`、`R1→R3 已修改`、`本轮新增 · R3`；没有另设拥挤的只读历史面板。
-- timeline + footer: 仅一条数据源同步轨道；标注按标签合并成有效结果轨道；当前有效、本轮变更、历史来源三种视图可切换；底部汇总新增、修改、移除、原样保留。
-- typography: 使用项目既有 `Inter / Noto Sans SC / Microsoft YaHei` 字体栈；任务、Episode、标签、状态、辅助文字层级与设计稿一致，未出现遮挡或不可读换行。
-- image quality: G1 使用现有 URDF/WebGL 资产；本机验收相机画面是临时合成测试帧，用于验证六路布局和帧读取，不代表生产视频内容。
-- copy: “本条有效标注”“历史标注已合并到当前结果”“确认本条并继续”“提交本轮质检到 Flow”等文案区分 Episode 级与整任务级操作。
+- 分界点可点击宽度为 31 CSS px，视觉握柄为 9 CSS px；命中面积明显大于旧版，同时保持时间点视觉精度。
+- 选中或拖动时，相邻两段同时提亮，并以强调色标识共享边界。
+- 精调区显示左右标签、六位小数秒值、真实帧号、逐帧前移/后移、吸附到帧状态及左右段时长。
+- 时间轴自身宽度为约 592 CSS px 时，容器查询将精调区切换为两列（`226.591px 339.886px`），没有按浏览器总宽度误排为四列。
 
-## Interaction evidence
+## Findings and comparison history
 
-- 6 个相机卡片均加载，G1 29DOF 单独可见。
-- “数据源同步”DOM 行数为 1；上一轮独立面板 DOM 行数为 0；Flow 提交按钮 DOM 行数为 1。
-- 历史 R1 标注可打开编辑器，编辑器明确提示“保存后记为 R3 变更”；保存后变为 `R1→R3 已修改`。
-- 当前有效 / 本轮变更 / 历史来源分别显示 5 / 3 / 4 个标注块；筛选按钮正确更新 `aria-pressed`。
-- “确认本条并继续”从 `episode_000001` 正常切换到 `episode_000002`。
-- 任务未全部完成时 Flow 提交按钮保持禁用且显示“完成全部 Episode 后提交”。
-- 浏览器控制台错误数：0。
+### Iteration 1
 
-## Findings
+- [P1] 中等宽度工作区的四列精调面板过于拥挤。
+  - Evidence: QC 左右侧栏开启时，时间轴内容宽度约 592–711 CSS px；按浏览器宽度判断仍会使用四列。
+  - Fix: 改为基于 `.timeline-panel` 自身宽度的容器查询；820 px 以下两列，590 px 以下单列。
+  - Post-fix evidence: 592.287 px 宽度下实际列宽为 226.591 px 和 339.886 px，字段未截断。
 
-- 无未解决的 P0 / P1 / P2 问题。
-- P3: 设计稿使用真实冰箱任务画面，本机验收使用合成帧；这是测试数据差异，生产数据加载后自动显示真实六路画面，不需要修改 UI。
-- P3: 品牌标记继续沿用项目既有 `DQ` 资产，而非设计图中的六边形图形；保持了当前产品资产一致性。
+### Iteration 2
 
-## Comparison history
+- [P1] 拖动过程中逐帧吸附并同步加载画面，真实数据帧数较多时产生卡顿，而且拖完后不容易再次调整同一分界点。
+  - Evidence: 真实 Episode 的优先相机缓存包含 1,330 帧；原交互在每次 `pointermove` 时吸附帧并触发 `seek`。
+  - Fix: 拖动中使用连续时间预览并只重绘时间轴；松手时一次性吸附最近有效帧、定位画面并原子保存左右分段。
+  - Post-fix evidence: 同一个真实分界点连续从 4.617 秒拖到 8.235 秒，再拖到 6.265 秒；最终保存为 6,264,983,236 ns，左右记录边界完全相等，画面定位到 F103。
 
-1. first comparison
-   - P2: 顶栏没有持续显示任务编号、标签版本和当前轮次，用户切换 Episode 后缺少轮次上下文。
-   - fix: 增加动态任务摘要、`标签 Vx.y.z`、`当前 Rn`，并在任务/Episode 切换时刷新。
-2. second comparison
-   - P2: 时间轴结果筛选只有视觉 active 状态，辅助技术无法获知当前选择。
-   - fix: 为三种筛选补充初始 `aria-pressed`，点击时同步更新。
-3. post-fix comparison
-   - 顶栏、三栏布局、六路相机、单数据源轨道、增量标注、结论与底部双层操作结构均与目标信息架构一致；未发现新的 P0 / P1 / P2。
+### Iteration 3
 
-## Implementation checklist
+- [P1] 31 px 宽命中区内偏离中心按下时，切分线会在首次移动时跳到指针中心，造成可见偏移。
+  - Fix: 记录按下位置相对切分线中心的抓取偏移，并在整个拖动手势中保持该偏移。
+  - Post-fix evidence: 从命中区左缘按住并向右拖 30 px，目标时间按轨道比例从 11.845 秒移动到 14.369 秒，不再先向左跳到指针位置。
+- [P2] 隔离测试标签仅由英文编码临时生成展示名。
+  - Fix: 测试标签、时间轴分段和有效标注列表统一改用中文展示名；编码保持不变。
 
-- [x] 六路相机 + 独立 G1 29DOF
-- [x] 相机/Mocap 合并成一条数据源同步轨道
-- [x] 多轮历史标注合并进当前有效结果并可修改/删除
-- [x] 标签和时间轴显示来源轮次及本轮变更
-- [x] Episode 级确认与任务级唯一 Flow 提交区分
-- [x] 顶栏显示任务、标签版本与当前轮次
-- [x] 页面交互、无控制台错误、自动化回归通过
+### Iteration 4
+
+- [P1] 鼠标左键刚按下、尚未移动时，切分条立即向右偏移约半个命中区宽度。
+  - Root cause: 全局 `button:active` 样式覆盖了切分条的 `translateX(-50%)`，使 31 px 命中区失去中心定位。
+  - Fix: 为切分条按下状态显式保留 `translateX(-50%)`；按下前后中心位置不变。
+
+### Iteration 5
+
+- [P2] 时间轴虽然已有真实帧信息，但秒数仍占据主视觉层级，不符合逐帧复检的操作习惯。
+  - Fix: 播放读数、时间轴刻度、AI 分段、选区和分界精调统一改为帧号优先；秒数降为辅助信息，底层仍以纳秒保存。
+
+### Iteration 6
+
+- [P1] 单行 AI 分段缺少明确的多层语义，附加质量标签容易被误认为不再支持，且同属 AI 来源时可能破坏主分段识别。
+  - Fix: 仅将连续互斥的动作/步骤标签归入“动作分段”；其余 AI、人工、质量和时间点标签按原标签轨道显示，并增加“附加标注 · 可重叠”层级提示。
+
+### Final pass
+
+- No actionable P0/P1/P2 visual or interaction findings remain.
+- P3: 真实长标签在极短分段中仍可能省略显示；完整名称保留在辅助文本和悬停提示中，属于可接受约束。
+
+## Required fidelity surfaces
+
+- Fonts and typography: 复用 Inter、Noto Sans SC、Microsoft YaHei；分段名称、时间和精调数据采用清晰层级与等宽数字表现。
+- Spacing and layout rhythm: 复用现有 8–11 px 紧凑节奏；精调区使用轻分隔而非嵌套卡片，并完成两列/单列响应式检查。
+- Colors and visual tokens: 复用现有近黑背景、石墨边线和 `#cff45a` 强调色；相邻分段保持标签原色并仅在编辑时提亮。
+- Image quality and asset fidelity: 此组件没有需要生成或替换的位图、品牌图或装饰资产；未使用占位图。
+- Copy and content: 使用“AI 分段”“分界时间”“吸附到帧”“相邻段时长”等与当前质检语义一致的中文文案。
+
+## Primary interactions tested
+
+- 点击共享分界点可打开精调面板。
+- 31 px 命中区域可直接拖动，左右分段原子联动且松手保存。
+- 真实数据同一分界点可连续拖动两次；拖动中不读取视频，松手后只读取最终真实帧。
+- 逐帧按钮将分界点从 1.353333 秒移动到真实 F3（2.000000 秒），左右段同步更新且无空帧/重叠。
+- 不可继续移动的方向会禁用，避免越过相邻段边界。
+- 页面控制台错误：0。
+- Frontend automated tests: 78 passed.
 
 final result: passed

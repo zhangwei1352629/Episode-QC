@@ -55,6 +55,7 @@ from episode_qc.workspace import (
     playback_window,
     list_label_sets,
     mark_qc_task_submitted,
+    move_ai_segment_boundary,
     preview_label_schema,
     redo_annotation_change,
     rescan_qc_task,
@@ -85,6 +86,23 @@ NAS_UNAVAILABLE_MESSAGE = (
     "NAS 当前不可用；可继续查看本机已有任务，依赖 NAS 的领取、缓存、导入和提交操作将在恢复后可用。"
 )
 LOGGER = logging.getLogger(__name__)
+
+
+class DownloadPaused(ValueError):
+    """Cooperative queue interruption, not a failed cache or failed review."""
+
+
+class SupersededPlatformJob(ValueError):
+    """The Flow job was retired in favor of a replacement review job."""
+
+
+def _platform_job_is_superseded(job: dict[str, object]) -> bool:
+    if str(job.get("status") or "") != "failed":
+        return False
+    error = str(job.get("cache_error") or "").strip().lower()
+    return error.startswith("superseded:") or (
+        "标签已切换到" in error and "旧" in error and "任务停止" in error
+    )
 
 
 def _public_task_summary(task: dict[str, object]) -> dict[str, object]:
@@ -493,6 +511,13 @@ class EpisodeQcWebApplication:
         )
         self._jobs_lock = threading.Lock()
         self._platform_jobs: set[str] = set()
+        self._download_policy_path = self.paths.root / "download-priority.json"
+        try:
+            self._download_priority = json.loads(self._download_policy_path.read_text(encoding="utf-8")).get("job_code")
+        except FileNotFoundError:
+            self._download_priority = None
+        except (OSError, ValueError, AttributeError):
+            self._download_priority = "invalid-policy-stop"
         self._platform_owned_jobs: set[str] = set()
         self._platform_history_synced_jobs: set[str] = set()
         self._platform_ownership_errors: dict[str, str] = {}
@@ -1126,6 +1151,26 @@ class EpisodeQcWebApplication:
 
         self._platform_progress_executor.submit(sync)
 
+    def _check_download_priority(self, job_code: str) -> None:
+        if self._download_priority and self._download_priority != job_code:
+            raise DownloadPaused("已暂停下载，保留缓存断点及标注")
+
+    def set_download_priority(self, job_code: str | None) -> dict:
+        if job_code is not None and (not isinstance(job_code, str) or not re.fullmatch(r"[A-Za-z0-9._-]+", job_code)):
+            raise ValueError("质检任务编号无效")
+        if job_code and not self._local_task_for_job(job_code):
+            raise ValueError("只能优先下载已领取的本地任务")
+        with self._platform_lock:
+            QualityCacheManager._write_json_atomic(self._download_policy_path, {"job_code": job_code})
+            self._download_priority = job_code
+        if job_code:
+            result = self.claim_platform_job(job_code)
+        else:
+            client = self._require_flow_client()
+            self._resume_incomplete_platform_caches(client, client.jobs_response())
+            result = {}
+        return {"priority_job": job_code, "other_downloads_paused": bool(job_code), **result}
+
     def _resume_incomplete_platform_caches(self, client, response: dict[str, object]) -> None:
         """Continue durable Episode queues once a reviewer reconnects to Flow."""
         manager = self._quality_cache_manager()
@@ -1134,6 +1179,10 @@ class EpisodeQcWebApplication:
                 continue
             job_code = str(item.get("code") or "")
             if not job_code:
+                continue
+            if _platform_job_is_superseded(item):
+                continue
+            if self._download_priority and self._download_priority != job_code:
                 continue
             try:
                 manager.flush_pending_cache_report(client, job_code)
@@ -1146,7 +1195,11 @@ class EpisodeQcWebApplication:
                 # A schema/pre-cache failure has no local Episode queue to
                 # resume. Its durable Flow report is retried above only.
                 continue
-            if summary is None or summary.get("cache_complete"):
+            if summary is None:
+                if job_code == self._download_priority and self._local_task_for_job(job_code):
+                    self.claim_platform_job(job_code)
+                continue
+            if summary.get("cache_complete"):
                 continue
             with self._platform_lock:
                 if job_code in self._platform_jobs:
@@ -1155,6 +1208,7 @@ class EpisodeQcWebApplication:
             self._platform_executor.submit(self._cache_platform_job, client, job_code)
 
     def claim_platform_job(self, job_code: str) -> dict[str, object]:
+        self._check_download_priority(job_code)
         with self._platform_claim_lock(job_code):
             return self._claim_platform_job_once(job_code)
 
@@ -1166,6 +1220,8 @@ class EpisodeQcWebApplication:
             raise ValueError("质检批次的数据尚未完成 NAS 传输和校验")
         if job.get("status") == "completed":
             raise ValueError("质检任务已经完成")
+        if _platform_job_is_superseded(job):
+            raise SupersededPlatformJob("旧标签任务已被新版本复检任务替代，请领取新的质检任务")
         local_task = self._local_task_for_job(job_code)
         manager = self._quality_cache_manager()
         with self._platform_lock:
@@ -1225,6 +1281,8 @@ class EpisodeQcWebApplication:
         self._assert_flow_enabled()
         client = self._require_flow_client()
         job = self._platform_job(client, job_code)
+        if _platform_job_is_superseded(job):
+            raise SupersededPlatformJob("旧标签任务已被新版本复检任务替代，请领取新的质检任务")
         task = self._local_task_for_job(job_code)
         if task is None:
             raise ValueError("质检任务尚未完整缓存到本地")
@@ -1371,6 +1429,13 @@ class EpisodeQcWebApplication:
         elif str(task.get("id") or "").strip() and isinstance(
             job.get("episodes"), list
         ) and job.get("episodes"):
+            partial_mappings = self._workspace_episode_mappings(job, task, require_complete=False)
+            if partial_mappings and len(partial_mappings) < len(job["episodes"]):
+                missing = len(job["episodes"]) - len(partial_mappings)
+                raise ValueError(
+                    f"本批次应检 {len(job['episodes'])} 条，本地已缓存/导入 {len(partial_mappings)} 条，"
+                    f"尚缺 {missing} 条。请恢复缓存并完成剩余质检后提交；已有标注和缓存不会删除"
+                )
             raise ValueError(
                 "质检结果无法按实际 Episode 目录建立完整映射，已阻止按列表顺序提交"
             )
@@ -1580,7 +1645,9 @@ class EpisodeQcWebApplication:
                         else None
                     ),
                     "label_snapshot_mismatch": label_snapshot_mismatch,
+                    "superseded": _platform_job_is_superseded(item),
                     "local_caching": code in caching,
+                    "download_paused": bool(self._download_priority and code != self._download_priority and local_task and not cache_summary.get("cache_complete") and item.get("status") != "completed"),
                     "cache_state_missing": cache_state_missing,
                     "cache_recovery_available": cache_recovery_available,
                     **(
@@ -1784,6 +1851,7 @@ class EpisodeQcWebApplication:
         bound_label_set_id: str | None = None
 
         def publish_progress(values: dict[str, object]) -> None:
+            self._check_download_priority(job_code)
             with self._platform_lock:
                 self._platform_progress[job_code] = dict(values)
             self.events.publish(
@@ -1950,7 +2018,12 @@ class EpisodeQcWebApplication:
             )
 
         try:
+            self._check_download_priority(job_code)
             job = self._platform_job(client, job_code)
+            if _platform_job_is_superseded(job):
+                raise SupersededPlatformJob(
+                    "旧标签任务已被新版本复检任务替代，请领取新的质检任务"
+                )
             if job.get("label_set_id") or job.get("status") not in {
                 "claimed",
                 "caching",
@@ -1985,6 +2058,17 @@ class EpisodeQcWebApplication:
                     "taskId": indexed_task_id,
                     "cached_episode_count": cached.get("total_episode_count", 0),
                     "total_episode_count": cached.get("total_episode_count", 0),
+                }
+            )
+        except DownloadPaused:
+            self.events.publish({"type": "platform_job", "jobCode": job_code, "status": "paused"})
+        except SupersededPlatformJob as exc:
+            self.events.publish(
+                {
+                    "type": "platform_job",
+                    "jobCode": job_code,
+                    "status": "superseded",
+                    "error": str(exc),
                 }
             )
         except Exception as exc:
@@ -2114,6 +2198,27 @@ class EpisodeQcWebApplication:
                 ),
             )
         )
+
+    def move_ai_boundary(self, request: dict[str, object]) -> dict[str, object]:
+        required_strings = (
+            "episodeId", "leftAnnotationId", "rightAnnotationId",
+            "leftUpdatedAt", "rightUpdatedAt",
+        )
+        if any(not isinstance(request.get(key), str) or not request[key] for key in required_strings):
+            raise ValueError("AI 分界点请求缺少必填字段")
+        boundary = request.get("boundaryOffsetNs")
+        if not isinstance(boundary, int) or isinstance(boundary, bool):
+            raise ValueError("AI 分界点必须是整数纳秒")
+        return self._write_workspace(lambda: move_ai_segment_boundary(
+            self.paths.db_path,
+            episode_id=request["episodeId"],
+            left_annotation_id=request["leftAnnotationId"],
+            right_annotation_id=request["rightAnnotationId"],
+            boundary_offset_ns=boundary,
+            left_updated_at=request["leftUpdatedAt"],
+            right_updated_at=request["rightUpdatedAt"],
+            session_id=self.session_id,
+        ))
 
     def undo_annotation(self) -> dict[str, object]:
         return self._write_workspace(
@@ -2406,6 +2511,12 @@ class EpisodeQcRequestHandler(BaseHTTPRequestHandler):
         if method == "GET" and path == "/api/platform/jobs":
             self._send_json(app.poll_platform_jobs())
             return
+        if method == "POST" and path == "/api/platform/download-priority":
+            payload = self._json_body()
+            if "job_code" not in payload:
+                raise ValueError("缺少 job_code；传 null 可恢复其他下载")
+            self._send_json(app.set_download_priority(payload["job_code"]))
+            return
         platform_claim_match = re.fullmatch(
             r"/api/platform/jobs/([A-Za-z0-9._-]+)/claim", path
         )
@@ -2482,6 +2593,9 @@ class EpisodeQcRequestHandler(BaseHTTPRequestHandler):
             return
         if method == "POST" and path == "/api/annotations":
             self._send_json(app.save_annotation(self._json_body()))
+            return
+        if method == "POST" and path == "/api/annotations/ai-boundary":
+            self._send_json(app.move_ai_boundary(self._json_body()))
             return
         if method == "POST" and path == "/api/undo":
             self._discard_body()

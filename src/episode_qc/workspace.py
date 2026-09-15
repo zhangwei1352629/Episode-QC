@@ -17,7 +17,11 @@ import yaml
 from mcap.reader import make_reader
 
 from episode_qc.bvh import read_bvh_header
-from episode_qc.annotation_timing import annotation_timing, annotation_time_error
+from episode_qc.annotation_timing import (
+    annotation_timing,
+    annotation_time_error,
+    positive_duration_ns,
+)
 from episode_qc.dohc_recording import (
     discover_dohc_episode_files,
     inspect_dohc_recording,
@@ -1628,7 +1632,7 @@ def _camera_name(topic: str) -> str:
 def _episode_rows(connection: sqlite3.Connection, where: str = "", parameters: tuple[object, ...] = ()) -> list[dict[str, object]]:
     # Do not aggregate every historical Episode for a single detail request.
     single = where.strip() == "WHERE e.id = ?" and len(parameters) == 1
-    aggregate_filter = "WHERE episode_id = ?" if single else ""
+    aggregate_filter = " WHERE episode_id = ?" if single else ""
     # Aggregate narrow stream rows first. Grouping the joined episode rows
     # duplicates large Flow history snapshots once per stream in SQLite's
     # temporary sort, which can stall history sync for minutes on Windows.
@@ -1649,7 +1653,7 @@ def _episode_rows(connection: sqlite3.Connection, where: str = "", parameters: t
             SELECT episode_id,
                    SUM(CASE WHEN stream_type = 'camera' AND available = 1 THEN 1 ELSE 0 END) AS camera_count,
                    MAX(CASE WHEN stream_type = 'mocap' AND available = 1 THEN 1 ELSE 0 END) AS mocap_available
-            FROM stream {aggregate_filter} GROUP BY episode_id
+            FROM stream{aggregate_filter} GROUP BY episode_id
         ) stream_counts ON stream_counts.episode_id = e.id
         LEFT JOIN (
             SELECT episode_id,
@@ -1657,7 +1661,7 @@ def _episode_rows(connection: sqlite3.Connection, where: str = "", parameters: t
                    SUM(CASE WHEN deleted_at IS NULL AND source = 'flow_incremental' AND updated_at != created_at THEN 1 ELSE 0 END) AS incremental_modified_count,
                    SUM(CASE WHEN deleted_at IS NOT NULL AND source = 'flow_incremental' THEN 1 ELSE 0 END) AS incremental_removed_count,
                    SUM(CASE WHEN deleted_at IS NULL AND source = 'flow_incremental' AND updated_at = created_at THEN 1 ELSE 0 END) AS incremental_preserved_count
-            FROM annotation {aggregate_filter}
+            FROM annotation{aggregate_filter}
             GROUP BY episode_id
         ) changes ON changes.episode_id = e.id
         {where}
@@ -1694,6 +1698,19 @@ def _episode_rows(connection: sqlite3.Connection, where: str = "", parameters: t
         )
         rows.append(value)
     return rows
+
+
+def _expected_task_episode_count(origin: object, metadata: dict, local_count: int) -> int:
+    """Use the job's scoped episode count, never the entire asset count."""
+    job = metadata.get("flow_job") if origin == "flow" else None
+    if not isinstance(job, dict):
+        return local_count
+    episodes = job.get("episodes")
+    try:
+        required = max(0, int(job.get("required_episode_count") or 0))
+    except (TypeError, ValueError):
+        required = 0
+    return max(local_count, required, len(episodes) if isinstance(episodes, list) else 0)
 
 
 def _task_rows(
@@ -1744,6 +1761,12 @@ def _task_rows(
             "playback_preparing_count",
         ):
             value[key] = int(value[key] or 0)
+        value["expected_episode_count"] = _expected_task_episode_count(
+            value.get("origin"), value["metadata"], value["episode_count"]
+        )
+        value["missing_episode_count"] = value["expected_episode_count"] - value["episode_count"]
+        if value["status"] == "completed" and value["missing_episode_count"]:
+            value["status"] = "in_progress"
         rows.append(value)
     return rows
 
@@ -1796,7 +1819,7 @@ def _refresh_task_status(
     *,
     now: str | None = None,
 ) -> None:
-    task = connection.execute("SELECT status FROM qc_task WHERE id = ?", (task_id,)).fetchone()
+    task = connection.execute("SELECT status, origin, metadata_json FROM qc_task WHERE id = ?", (task_id,)).fetchone()
     if task is None or task["status"] in {"submitted", "archived"}:
         return
     counts = connection.execute(
@@ -1817,9 +1840,10 @@ def _refresh_task_status(
     completed = int(counts["completed"] or 0)
     decided = int(counts["decided"] or 0)
     active = int(counts["active"] or 0)
+    expected = _expected_task_episode_count(task["origin"], _loads(task["metadata_json"], {}), total)
     if total == 0:
         status = "failed"
-    elif completed == total and decided == total:
+    elif completed == total and decided == total and total == expected:
         status = "completed"
     elif ready == 0:
         status = "failed"
@@ -2237,6 +2261,7 @@ def _seed_incremental_annotations(
     local_episode_id: str,
     review_history: list[dict[str, object]],
     inherit_ai: bool = False,
+    annotation_duration_ns: int | None = None,
 ) -> int:
     """Materialize all compatible historical facts as copy-on-write annotations."""
 
@@ -2259,6 +2284,18 @@ def _seed_incremental_annotations(
     ).fetchone()
     if label_set is None:
         return 0
+    timed_episode = dict(episode)
+    if annotation_duration_ns is not None:
+        timed_episode["annotation_duration_ns"] = min(
+            int(episode["duration_ns"] or 0), annotation_duration_ns
+        )
+    else:
+        try:
+            timed_episode = _episode_with_annotation_timing(connection, episode)
+        except ValueError:
+            # History-only snapshots may omit Flow timing. Preserve the old
+            # local-duration behavior until a complete server snapshot arrives.
+            pass
     definitions = {
         str(row["code"]): row
         for row in connection.execute(
@@ -2339,7 +2376,7 @@ def _seed_incremental_annotations(
             "attributes": attributes,
         }
         try:
-            normalized = _validate_annotation_payload(payload, episode, label)
+            normalized = _validate_annotation_payload(payload, timed_episode, label)
         except (TypeError, ValueError):
             continue
         annotation_id = _stable_id(
@@ -2462,6 +2499,9 @@ def sync_flow_previous_reviews(
                 local_episode_id=local_episode_id,
                 review_history=review_history,
                 inherit_ai=inherit_ai,
+                annotation_duration_ns=positive_duration_ns(
+                    platform_episode.get("duration_seconds")
+                ),
             )
             updated += 1
     return updated
@@ -3588,6 +3628,90 @@ def save_annotation(
         return saved
 
 
+def move_ai_segment_boundary(
+    db_path: str | Path,
+    *,
+    episode_id: str,
+    left_annotation_id: str,
+    right_annotation_id: str,
+    boundary_offset_ns: int,
+    left_updated_at: str,
+    right_updated_at: str,
+    session_id: str = "default",
+) -> dict[str, object]:
+    """Atomically move one shared boundary between two inherited AI ranges."""
+    initialize_workspace(db_path)
+    with connect_workspace(db_path) as connection:
+        rows = []
+        for annotation_id in (left_annotation_id, right_annotation_id):
+            row = connection.execute(
+                "SELECT * FROM annotation WHERE id=? AND deleted_at IS NULL",
+                (annotation_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"标注不存在: {annotation_id}")
+            rows.append(row)
+        left, right = rows
+        if left["episode_id"] != episode_id or right["episode_id"] != episode_id:
+            raise ValueError("相邻分段不属于当前 Episode")
+        if left["updated_at"] != left_updated_at or right["updated_at"] != right_updated_at:
+            raise WorkspaceConflictError("相邻分段已在另一个页面中更新，请刷新后重试")
+        if left["scope"] != "time_range" or right["scope"] != "time_range":
+            raise ValueError("共享分界点仅支持区间标注")
+        left_attrs = _loads(left["attributes_json"], {})
+        right_attrs = _loads(right["attributes_json"], {})
+
+        def is_ai_segment(attributes: dict[str, object]) -> bool:
+            source = attributes.get("_incremental_source")
+            return bool(attributes.get("ai_provenance")) or (
+                isinstance(source, dict) and source.get("round_kind") == "ai"
+            )
+
+        if not is_ai_segment(left_attrs) or not is_ai_segment(right_attrs):
+            raise ValueError("只能联动修改 AI 预标注分段")
+        if int(left["end_offset_ns"]) != int(right["start_offset_ns"]):
+            raise ValueError("相邻 AI 分段不连续，已阻止修改")
+        boundary = int(boundary_offset_ns)
+        if boundary <= int(left["start_offset_ns"]) or boundary >= int(right["end_offset_ns"]):
+            raise ValueError("分界点必须位于相邻两段内部")
+        episode = connection.execute("SELECT * FROM episode WHERE id=?", (episode_id,)).fetchone()
+        if episode is None:
+            raise KeyError(f"Episode 不存在: {episode_id}")
+        duration = _annotation_duration(_episode_with_annotation_timing(connection, episode))
+        if boundary < 0 or boundary > duration:
+            raise ValueError("分界点超出 Episode 可标注时长")
+        before = {"left": _annotation_row(left), "right": _annotation_row(right)}
+        for attributes in (left_attrs, right_attrs):
+            provenance = attributes.get("ai_provenance")
+            if isinstance(provenance, dict):
+                provenance["review_action"] = "edited_on_timeline"
+        now = _now()
+        connection.execute(
+            "UPDATE annotation SET end_offset_ns=?, attributes_json=?, updated_at=? WHERE id=?",
+            (boundary, _json(left_attrs), now, left_annotation_id),
+        )
+        connection.execute(
+            "UPDATE annotation SET start_offset_ns=?, attributes_json=?, updated_at=? WHERE id=?",
+            (boundary, _json(right_attrs), now, right_annotation_id),
+        )
+        saved_left = _annotation_row(connection.execute("SELECT * FROM annotation WHERE id=?", (left_annotation_id,)).fetchone())
+        saved_right = _annotation_row(connection.execute("SELECT * FROM annotation WHERE id=?", (right_annotation_id,)).fetchone())
+        after = {"left": saved_left, "right": saved_right}
+        _record_change(
+            connection,
+            f"{left_annotation_id}|{right_annotation_id}",
+            "move_ai_boundary",
+            before,
+            after,
+            session_id,
+        )
+        _mark_task_review_write(connection, episode_id, now=now)
+        task_id = _task_id_for_episode(connection, episode_id)
+        if task_id:
+            _refresh_task_status(connection, task_id, now=now)
+        return {"boundary_offset_ns": boundary, "annotations": [saved_left, saved_right]}
+
+
 def _episode_with_annotation_timing(connection: sqlite3.Connection, episode) -> dict:
     value = dict(episode)
     task = connection.execute(
@@ -3607,6 +3731,23 @@ def _episode_with_annotation_timing(connection: sqlite3.Connection, episode) -> 
 def _annotation_duration(episode) -> int:
     key = "annotation_duration_ns" if "annotation_duration_ns" in episode.keys() else "duration_ns"
     return int(episode[key] or 0)
+
+
+def _normalize_episode_scope_annotation_bounds(
+    connection: sqlite3.Connection, episode_id: str, duration_ns: int
+) -> int:
+    """Keep whole-Episode facts aligned with the authoritative annotation duration."""
+
+    cursor = connection.execute(
+        """
+        UPDATE annotation
+        SET start_offset_ns = 0, end_offset_ns = ?
+        WHERE episode_id = ? AND deleted_at IS NULL AND scope = 'episode'
+          AND (start_offset_ns != 0 OR end_offset_ns != ?)
+        """,
+        (duration_ns, episode_id, duration_ns),
+    )
+    return int(cursor.rowcount or 0)
 
 
 def sync_flow_task_timing(db_path: str | Path, job: dict) -> None:
@@ -3748,7 +3889,14 @@ def undo_annotation_change(db_path: str | Path, *, session_id: str = "default") 
         ).fetchone()
         if not change:
             return None
-        _restore_annotation_snapshot(connection, change["entity_id"], _loads(change["before_json"], None))
+        if change["operation"] == "move_ai_boundary":
+            snapshots = _loads(change["before_json"], {})
+            for key in ("left", "right"):
+                snapshot = snapshots.get(key)
+                if snapshot:
+                    _restore_annotation_snapshot(connection, snapshot["annotation_id"], snapshot)
+        else:
+            _restore_annotation_snapshot(connection, change["entity_id"], _loads(change["before_json"], None))
         connection.execute("UPDATE change_log SET undone = 1 WHERE id = ?", (change["id"],))
         return {"operation": "undo", "entity_id": change["entity_id"]}
 
@@ -3760,7 +3908,14 @@ def redo_annotation_change(db_path: str | Path, *, session_id: str = "default") 
         ).fetchone()
         if not change:
             return None
-        _restore_annotation_snapshot(connection, change["entity_id"], _loads(change["after_json"], None))
+        if change["operation"] == "move_ai_boundary":
+            snapshots = _loads(change["after_json"], {})
+            for key in ("left", "right"):
+                snapshot = snapshots.get(key)
+                if snapshot:
+                    _restore_annotation_snapshot(connection, snapshot["annotation_id"], snapshot)
+        else:
+            _restore_annotation_snapshot(connection, change["entity_id"], _loads(change["after_json"], None))
         connection.execute("UPDATE change_log SET undone = 0 WHERE id = ?", (change["id"],))
         return {"operation": "redo", "entity_id": change["entity_id"]}
 
@@ -3834,6 +3989,82 @@ def reconcile_inherited_ai_candidates(connection, episode_id: str) -> int:
     return updated
 
 
+def reconcile_timeline_ai_candidates(connection, episode_id: str) -> int:
+    """Attach conservatively matched timeline edits to pending AI candidates.
+
+    A reviewer may redraw an AI interval with the ordinary timeline editor.  Older
+    clients saved that edit as a plain manual annotation, so the candidate stayed
+    pending and later blocked the quality decision.  Only a one-to-one label match
+    is repaired automatically; ambiguous or missing candidates remain pending.
+    """
+    if not connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='ai_candidate'").fetchone():
+        return 0
+    candidates: dict[str, list[tuple[sqlite3.Row, dict[str, object]]]] = {}
+    for row in connection.execute(
+        "SELECT * FROM ai_candidate WHERE episode_id=? AND state='pending' AND annotation_id IS NULL",
+        (episode_id,),
+    ):
+        payload = _loads(row["payload"], {})
+        label_code = str(payload.get("label_code") or "").strip()
+        if label_code:
+            candidates.setdefault(label_code, []).append((row, payload))
+    annotations: dict[str, list[tuple[sqlite3.Row, dict[str, object]]]] = {}
+    for row in connection.execute(
+        "SELECT * FROM annotation WHERE episode_id=? AND deleted_at IS NULL AND source='manual'",
+        (episode_id,),
+    ):
+        attrs = _loads(row["attributes_json"], {})
+        provenance = attrs.get("ai_provenance")
+        if isinstance(provenance, dict) and provenance.get("run_id") and provenance.get("candidate_id"):
+            continue
+        annotations.setdefault(str(row["label_code"]), []).append((row, attrs))
+    updated = 0
+    for label_code, pending in candidates.items():
+        matches = annotations.get(label_code, [])
+        if len(pending) != 1 or len(matches) != 1:
+            continue
+        candidate, payload = pending[0]
+        annotation, attrs = matches[0]
+        run_id = str(candidate["run_id"])
+        candidate_id = str(candidate["candidate_id"])
+        attrs = dict(attrs)
+        attrs["_incremental_lineage_id"] = f"ai:{run_id}:{candidate_id}"
+        attrs["ai_provenance"] = {
+            "run_id": run_id,
+            "candidate_id": candidate_id,
+            "original_start_offset_ns": payload.get("start_offset_ns"),
+            "original_end_offset_ns": payload.get("end_offset_ns"),
+            "review_action": "edited_on_timeline",
+        }
+        connection.execute(
+            "UPDATE annotation SET attributes_json=? WHERE id=?",
+            (_json(attrs), annotation["id"]),
+        )
+        connection.execute(
+            "UPDATE ai_candidate SET state='accepted', annotation_id=? WHERE run_id=? AND candidate_id=? AND episode_id=? AND state='pending' AND annotation_id IS NULL",
+            (annotation["id"], run_id, candidate_id, episode_id),
+        )
+        event_id = hashlib.sha256(_new_id("aireview").encode()).hexdigest()
+        event = {
+            "event_id": event_id,
+            "run_id": run_id,
+            "candidate_id": candidate_id,
+            "action": "accepted",
+            "annotation_id": annotation["id"],
+            "details": {
+                "start_offset_ns": annotation["start_offset_ns"],
+                "end_offset_ns": annotation["end_offset_ns"],
+                "review_action": "edited_on_timeline",
+            },
+        }
+        connection.execute(
+            "INSERT INTO ai_review_outbox(event_id,episode_id,body) VALUES(?,?,?)",
+            (event_id, episode_id, _json(event)),
+        )
+        updated += 1
+    return updated
+
+
 def update_episode_review(
     db_path: str | Path,
     episode_id: str,
@@ -3861,11 +4092,17 @@ def update_episode_review(
         review_write = review_status is not None or quality_decision is not None
         if review_write and status in {"completed", "reviewed"}:
             reconcile_inherited_ai_candidates(connection, episode_id)
+            reconcile_timeline_ai_candidates(connection, episode_id)
             if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='ai_candidate'").fetchone():
                 pending = connection.execute("SELECT 1 FROM ai_candidate c LEFT JOIN annotation a ON a.id=c.annotation_id AND a.deleted_at IS NULL WHERE c.episode_id=? AND c.state IN ('pending','accepted') AND a.id IS NULL LIMIT 1", (episode_id,)).fetchone()
                 if pending:
                     raise ValueError("请先确认或排除本条已载入的AI候选，再完成整条人工检查")
             timed = _episode_with_annotation_timing(connection, row)
+            _normalize_episode_scope_annotation_bounds(
+                connection,
+                episode_id,
+                timed["annotation_duration_ns"],
+            )
             errors = [
                 annotation_time_error(a, timed["annotation_duration_ns"])
                 for a in _list_annotations(connection, episode_id)

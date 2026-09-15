@@ -1653,6 +1653,86 @@ def test_web_flow_label_schema_submit_uses_direct_annotations(tmp_path: Path, mo
     }
 
 
+def test_download_priority_persists_and_skips_other_queued_jobs(tmp_path, monkeypatch):
+    with running_server(tmp_path) as (server, _):
+        app = server.application
+        monkeypatch.setattr(app, "_local_task_for_job", lambda code: {"id": "local"})
+        monkeypatch.setattr(app, "claim_platform_job", lambda code: {"caching": True})
+        app.set_download_priority("QCJ-TOY")
+        assert json.loads(app._download_policy_path.read_text())["job_code"] == "QCJ-TOY"
+        with pytest.raises(web_server.DownloadPaused):
+            app._check_download_priority("QCJ-OTHER")
+        app._check_download_priority("QCJ-TOY")
+        class Client:
+            def job(self, code):
+                raise AssertionError("Paused job reached Flow")
+            def report_cache(self, *args, **kwargs):
+                raise AssertionError("Pause was reported as failure")
+        app._platform_jobs.add("QCJ-OTHER")
+        app._cache_platform_job(Client(), "QCJ-OTHER")
+        assert "QCJ-OTHER" not in app._platform_jobs
+    with running_server(tmp_path) as (server, _):
+        assert server.application._download_priority == "QCJ-TOY"
+
+
+def test_priority_resume_only_enqueues_selected_missing_cache(tmp_path, monkeypatch):
+    with running_server(tmp_path) as (server, _):
+        app = server.application
+        app._download_priority = "QCJ-TOY"
+        calls = []
+        monkeypatch.setattr(app, "_local_task_for_job", lambda code: {"id": "local"})
+        monkeypatch.setattr(app, "claim_platform_job", calls.append)
+        class Manager:
+            def flush_pending_cache_report(self, *args): pass
+            def cache_summary(self, code): return None
+        monkeypatch.setattr(app, "_quality_cache_manager", Manager)
+        app._resume_incomplete_platform_caches(object(), {"jobs": [
+            {"code": "QCJ-OTHER", "status": "in_progress"},
+            {"code": "QCJ-TOY", "status": "in_progress"}]})
+        assert calls == ["QCJ-TOY"]
+
+
+def test_superseded_platform_job_cannot_resume_or_start(tmp_path, monkeypatch):
+    job = {
+        "code": "QCJ-OLD-VERSION",
+        "status": "failed",
+        "cache_error": (
+            "superseded: 标签已切换到 V1.0.4；旧 V1.0.3 任务停止，"
+            "请使用 QCJ-NEW-VERSION。"
+        ),
+    }
+
+    with running_server(tmp_path) as (server, _):
+        app = server.application
+        app._flow_client = object()
+        monkeypatch.setattr(app, "_platform_job", lambda _client, _code: job)
+
+        with pytest.raises(web_server.SupersededPlatformJob, match="新版本复检任务"):
+            app.claim_platform_job(job["code"])
+        with pytest.raises(web_server.SupersededPlatformJob, match="新版本复检任务"):
+            app.start_platform_job(job["code"])
+
+
+def test_web_submit_partial_cache_reports_missing_count(tmp_path, monkeypatch):
+    job = {"code": "QCJ-PARTIAL", "status": "in_progress", "episodes": [
+        {"episode_id": "EP1", "relative_path": "episodes/episode_000001"},
+        {"episode_id": "EP2", "relative_path": "episodes/episode_000002"},
+    ]}
+    class Client:
+        def job(self, code):
+            return job
+    monkeypatch.setattr(web_server, "workspace_state", lambda *a, **k: {
+        "episodes": [{"id": "local1", "relative_path": "episodes/episode_000001"}]})
+    with running_server(tmp_path) as (server, _):
+        app = server.application
+        app._flow_client = Client()
+        app._quality_cache_manager = lambda: object()
+        monkeypatch.setattr(app, "_local_task_for_job", lambda code: {"id": "task1"})
+        monkeypatch.setattr(app, "_sync_platform_task_label_schema", lambda j, t, **k: (t, {}))
+        with pytest.raises(ValueError, match="应检 2 条.*本地已缓存/导入 1 条.*尚缺 1 条"):
+            app.submit_platform_job(job["code"], delete_cache=True)
+
+
 def test_web_submit_repairs_order_based_mapping_with_actual_gapped_paths(
     tmp_path: Path,
     monkeypatch,

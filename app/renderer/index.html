@@ -166,7 +166,7 @@
       </main>
 
       <aside class="label-sidebar">
-        <section class="panel-section label-section">
+        <section class="panel-section label-section expanded" id="label-section">
           <div class="section-heading">
             <div class="section-title-copy">
               <span class="eyebrow">人工标注</span>
@@ -174,57 +174,67 @@
               <span class="section-meta" id="label-set-meta">正在读取标签库…</span>
               <span class="label-help" id="label-help">简易模板只要求填写标签名称，其余字段均可省略</span>
             </div>
-            <div class="undo-actions"><button id="undo" title="撤销 Ctrl+Z">↶</button><button id="redo" title="恢复 Ctrl+Shift+Z">↷</button></div>
+            <div class="section-heading-actions">
+              <div class="undo-actions"><button id="undo" title="撤销 Ctrl+Z">↶</button><button id="redo" title="恢复 Ctrl+Shift+Z">↷</button></div>
+              <button class="section-collapse-button" id="toggle-label-section" type="button" aria-expanded="true" aria-controls="label-section-body">收起</button>
+            </div>
           </div>
-          <div class="scope-tabs" id="scope-tabs">
-            <button class="active" data-scope="time_range" type="button">区间</button>
-            <button data-scope="time_point" type="button">时间点</button>
-            <button data-scope="episode" type="button">整条</button>
-          </div>
-          <div class="open-label-editor" id="open-label-editor" hidden>
-            <select id="open-annotation-type" aria-label="开放标注类型">
-              <option value="action">动作</option>
-              <option value="pose_quality">Pose 质量</option>
-              <option value="camera_quality">相机质量</option>
-              <option value="exception">意外与恢复</option>
-              <option value="object_state">物品状态</option>
-              <option value="other">其他</option>
-            </select>
-            <input id="open-label-name" maxlength="120" placeholder="输入自定义标签，如：双手拿起红色咖啡杯" aria-label="自定义标签名称" />
-            <button id="save-open-label" class="button primary" type="button">添加</button>
-          </div>
-          <div class="label-filter-row">
-            <input id="label-search" type="search" placeholder="搜索标签…" aria-label="搜索标签" />
-            <select id="label-group-filter" aria-label="筛选标签分组"><option value="all">全部分组</option></select>
-          </div>
-          <div class="target-context" id="target-context">目标：全局</div>
-          <label class="annotation-note" for="annotation-comment">
-            <span class="annotation-note-heading"><strong>备注</strong><small>随下一个标签保存 · 可选</small></span>
-            <textarea id="annotation-comment" rows="1" placeholder="补充这次标注的说明…"></textarea>
-          </label>
-          <section class="ego-annotation-fields" id="ego-annotation-fields" hidden>
-            <div class="ego-fields-heading"><strong>Ego 语义标注</strong><span>固定步骤＋人工描述＋结构化属性</span></div>
-            <div class="ego-step-draft" id="ego-step-draft" hidden>
-              <div class="ego-selected-step"><span>当前固定步骤</span><strong id="ego-selected-step">请从下方选择步骤</strong></div>
-              <div class="ego-draft-actions">
-                <button id="ego-new-object" class="button secondary" type="button" disabled>上一条数据：新物品</button>
-                <button id="ego-reuse-object" class="button secondary" type="button" disabled>上一条数据：同一物品</button>
-                <button id="save-ego-annotation" class="button primary" type="button" disabled>保存本段标注</button>
+          <div class="label-section-body" id="label-section-body">
+            <div class="scope-tabs" id="scope-tabs">
+              <button class="active" data-scope="time_range" type="button">区间</button>
+              <button data-scope="time_point" type="button">时间点</button>
+              <button data-scope="episode" type="button">整条</button>
+            </div>
+            <div class="open-label-editor" id="open-label-editor" hidden>
+              <select id="open-annotation-type" aria-label="开放标注类型">
+                <option value="action">动作</option>
+                <option value="pose_quality">Pose 质量</option>
+                <option value="camera_quality">相机质量</option>
+                <option value="exception">意外与恢复</option>
+                <option value="object_state">物品状态</option>
+                <option value="other">其他</option>
+              </select>
+              <input id="open-label-name" maxlength="120" placeholder="输入自定义标签，如：双手拿起红色咖啡杯" aria-label="自定义标签名称" />
+              <button id="save-open-label" class="button primary" type="button">添加</button>
+            </div>
+            <div class="label-filter-row">
+              <input id="label-search" type="search" placeholder="搜索标签…" aria-label="搜索标签" />
+              <select id="label-group-filter" aria-label="筛选标签分组"><option value="all">全部分组</option></select>
+            </div>
+            <div class="target-context" id="target-context">目标：全局</div>
+            <label class="annotation-note" for="annotation-comment">
+              <span class="annotation-note-heading"><strong>备注</strong><small>随下一个标签保存 · 可选</small></span>
+              <textarea id="annotation-comment" rows="1" placeholder="补充这次标注的说明…"></textarea>
+            </label>
+            <section class="ego-annotation-fields" id="ego-annotation-fields" hidden>
+              <div class="ego-fields-heading"><strong>Ego 语义标注</strong><span>固定步骤＋人工描述＋结构化属性</span></div>
+              <div class="ego-step-draft" id="ego-step-draft" hidden>
+                <div class="ego-selected-step"><span>当前固定步骤</span><strong id="ego-selected-step">请从下方选择步骤</strong></div>
+                <div class="ego-draft-actions">
+                  <button id="ego-new-object" class="button secondary" type="button" disabled>上一条数据：新物品</button>
+                  <button id="ego-reuse-object" class="button secondary" type="button" disabled>上一条数据：同一物品</button>
+                  <button id="save-ego-annotation" class="button primary" type="button" disabled>保存本段标注</button>
+                </div>
               </div>
+              <div class="ego-fields-grid">
+                <label class="wide" id="ego-semantic-field"><span>人工语义描述</span><textarea id="ego-semantic-description" rows="2" maxlength="500" placeholder="如：使用左手从椅子上拿起黑色衣服，目标位置为洗衣机滚筒"></textarea></label>
+                <label><span>执行部位</span><select id="ego-body-part"><option value="">请选择</option><option value="left_hand">左手</option><option value="right_hand">右手</option><option value="both_hands">双手</option><option value="whole_body">全身</option><option value="unknown">无法判断</option></select></label>
+                <label><span>物品名称</span><input id="ego-object-name" placeholder="如：咖啡杯" /></label>
+                <label><span>物品颜色</span><input id="ego-object-color" placeholder="如：红色" /></label>
+                <label><span>起始位置</span><input id="ego-source-name" placeholder="如：纸箱内" /></label>
+                <label class="wide"><span>目标位置</span><input id="ego-target-name" placeholder="如：第二层货架左侧" /></label>
+                <label><span>意外类型</span><select id="ego-exception-type"><option value="">无</option><option value="object_dropped">物品掉落</option><option value="object_fell_over">物品倒下</option><option value="retry">重复或重试</option><option value="failed_grasp">抓取失败</option><option value="collision">碰撞</option><option value="person_interruption">人员干扰</option><option value="other">其他</option></select></label>
+                <label class="wide"><span>恢复动作</span><input id="ego-recovery-action" placeholder="如：重新拾起后继续放置" /></label>
+              </div>
+            </section>
+            <div class="label-list" id="label-list">
+              <div class="empty-panel">请先导入标签库</div>
             </div>
-            <div class="ego-fields-grid">
-              <label class="wide" id="ego-semantic-field"><span>人工语义描述</span><textarea id="ego-semantic-description" rows="2" maxlength="500" placeholder="如：使用左手从椅子上拿起黑色衣服，目标位置为洗衣机滚筒"></textarea></label>
-              <label><span>执行部位</span><select id="ego-body-part"><option value="">请选择</option><option value="left_hand">左手</option><option value="right_hand">右手</option><option value="both_hands">双手</option><option value="whole_body">全身</option><option value="unknown">无法判断</option></select></label>
-              <label><span>物品名称</span><input id="ego-object-name" placeholder="如：咖啡杯" /></label>
-              <label><span>物品颜色</span><input id="ego-object-color" placeholder="如：红色" /></label>
-              <label><span>起始位置</span><input id="ego-source-name" placeholder="如：纸箱内" /></label>
-              <label class="wide"><span>目标位置</span><input id="ego-target-name" placeholder="如：第二层货架左侧" /></label>
-              <label><span>意外类型</span><select id="ego-exception-type"><option value="">无</option><option value="object_dropped">物品掉落</option><option value="object_fell_over">物品倒下</option><option value="retry">重复或重试</option><option value="failed_grasp">抓取失败</option><option value="collision">碰撞</option><option value="person_interruption">人员干扰</option><option value="other">其他</option></select></label>
-              <label class="wide"><span>恢复动作</span><input id="ego-recovery-action" placeholder="如：重新拾起后继续放置" /></label>
-            </div>
-          </section>
-          <div class="label-list" id="label-list">
-            <div class="empty-panel">请先导入标签库</div>
+            <nav class="label-pagination" id="label-pagination" aria-label="标签分页" hidden>
+              <button id="label-page-previous" type="button">上一页</button>
+              <span id="label-page-status" aria-live="polite">第 1 / 1 页</span>
+              <button id="label-page-next" type="button">下一页</button>
+            </nav>
           </div>
         </section>
 
@@ -240,20 +250,25 @@
           <div class="annotation-list" id="annotation-list"><div class="empty-panel">暂无标注</div></div>
         </section>
 
-        <section class="panel-section decision-section">
+        <section class="panel-section decision-section expanded" id="decision-section">
           <div class="decision-heading">
             <div><span class="eyebrow">Episode 结论</span><strong>选择处理结果</strong></div>
-            <span class="decision-current" id="decision-current">未选择</span>
+            <div class="decision-heading-actions">
+              <span class="decision-current" id="decision-current">未选择</span>
+              <button class="section-collapse-button" id="toggle-decision-section" type="button" aria-expanded="true" aria-controls="decision-section-body">收起</button>
+            </div>
           </div>
-          <div class="decision-grid" id="decision-grid">
-            <button data-decision="pass" data-tone="positive" type="button" title="通过（Alt 1）"><span class="decision-icon">✓</span><span class="decision-copy"><strong>通过</strong><small>直接交付</small></span><kbd>1</kbd></button>
-            <button data-decision="pass_with_labels" data-tone="positive" type="button" title="有条件通过（Alt 2）"><span class="decision-icon">◐</span><span class="decision-copy"><strong>有条件</strong><small>带标注交付</small></span><kbd>2</kbd></button>
-            <button data-decision="trim" data-tone="warning" type="button" title="需裁剪（Alt 3）"><span class="decision-icon">✂</span><span class="decision-copy"><strong>裁剪</strong><small>调整区间</small></span><kbd>3</kbd></button>
-            <button data-decision="repair" data-tone="warning" type="button" title="需修复（Alt 4）"><span class="decision-icon">◇</span><span class="decision-copy"><strong>修复</strong><small>修复后交付</small></span><kbd>4</kbd></button>
-            <button data-decision="recollect" data-tone="danger" type="button" title="需重采（Alt 5）"><span class="decision-icon">↻</span><span class="decision-copy"><strong>重采</strong><small>重新采集</small></span><kbd>5</kbd></button>
-            <button data-decision="reject" data-tone="danger" type="button" title="废弃（Alt 6）"><span class="decision-icon">×</span><span class="decision-copy"><strong>废弃</strong><small>不可使用</small></span><kbd>6</kbd></button>
+          <div class="decision-section-body" id="decision-section-body">
+            <div class="decision-grid" id="decision-grid">
+              <button data-decision="pass" data-tone="positive" type="button" title="通过（Alt 1）"><span class="decision-icon">✓</span><span class="decision-copy"><strong>通过</strong><small>直接交付</small></span><kbd>1</kbd></button>
+              <button data-decision="pass_with_labels" data-tone="positive" type="button" title="有条件通过（Alt 2）"><span class="decision-icon">◐</span><span class="decision-copy"><strong>有条件</strong><small>带标注交付</small></span><kbd>2</kbd></button>
+              <button data-decision="trim" data-tone="warning" type="button" title="需裁剪（Alt 3）"><span class="decision-icon">✂</span><span class="decision-copy"><strong>裁剪</strong><small>调整区间</small></span><kbd>3</kbd></button>
+              <button data-decision="repair" data-tone="warning" type="button" title="需修复（Alt 4）"><span class="decision-icon">◇</span><span class="decision-copy"><strong>修复</strong><small>修复后交付</small></span><kbd>4</kbd></button>
+              <button data-decision="recollect" data-tone="danger" type="button" title="需重采（Alt 5）"><span class="decision-icon">↻</span><span class="decision-copy"><strong>重采</strong><small>重新采集</small></span><kbd>5</kbd></button>
+              <button data-decision="reject" data-tone="danger" type="button" title="废弃（Alt 6）"><span class="decision-icon">×</span><span class="decision-copy"><strong>废弃</strong><small>不可使用</small></span><kbd>6</kbd></button>
+            </div>
+            <button class="needs-recheck" id="needs-recheck" type="button"><strong>标记为待复核</strong><small>暂不设置最终结论</small></button>
           </div>
-          <button class="needs-recheck" id="needs-recheck" type="button"><strong>标记为待复核</strong><small>暂不设置最终结论</small></button>
         </section>
       </aside>
 
@@ -318,10 +333,14 @@
       <form method="dialog" id="annotation-edit-form">
         <div class="dialog-heading"><h3>编辑标注</h3><button value="cancel" type="submit">×</button></div>
         <input id="edit-id" type="hidden" />
+        <section class="edit-annotation-summary" aria-live="polite">
+          <div><span id="edit-label-name">未命名标注</span><strong id="edit-frame-range">F--</strong></div>
+          <p id="edit-timing-help">帧号优先；秒数用于精确核对。</p>
+        </section>
         <p class="edit-provenance" id="edit-provenance" hidden></p>
         <div class="edit-times">
-          <label>起点（秒）<input id="edit-start" type="number" min="0" step="0.001" /></label>
-          <label>终点（秒）<input id="edit-end" type="number" min="0" step="0.001" /></label>
+          <label><span id="edit-start-label">起点（秒）</span><input id="edit-start" type="number" min="0" step="0.001" /></label>
+          <label><span id="edit-end-label">终点（秒）</span><input id="edit-end" type="number" min="0" step="0.001" /></label>
         </div>
         <section class="edit-ego-fields" id="edit-ego-fields" hidden>
           <label class="wide" id="edit-ego-step-field">固定步骤<select id="edit-ego-step"></select></label>

@@ -4,34 +4,39 @@ export function installAISuggestions({ container, api, episodeId, seek, reload, 
   let generation=0;
   async function render(start=false) {
     const eid=episodeId(), g=++generation;panel.replaceChildren();if(!eid)return;
-    const title=document.createElement('summary');title.textContent='AI 预标注 · 待人工复核';panel.append(title);
-    for(const [label,action] of [['刷新本地 AI 结果',false]]) {
-      const b=document.createElement('button');b.textContent=label;b.onclick=()=>render(action);panel.append(b);
-    }
-    const info=document.createElement('p');info.textContent='候选仅作提示；请检查完整视频并补标。';panel.append(info);
-    if(!api.aiSuggestions){info.textContent='AI候选目前支持Web工作台。';return;}
+    const title=document.createElement('summary');title.textContent='AI 标注';panel.append(title);
+    const info=document.createElement('p');info.textContent='请在时间轴上复核并调整。';panel.append(info);
+    if(!api.aiSuggestions){info.textContent='当前工作台不支持 AI 标注。';return;}
     try {
       const data=await api.aiSuggestions(eid,start?'start':'suggestions',{});
       if(g!==generation||eid!==episodeId())return;
       if(data.local_cache_state && data.local_cache_state!=='ready') {
-        panel.open=true;
-        info.textContent=data.message||'AI 结果尚未缓存到本地，不代表没有标注。';
+        panel.open=false;
+        panel.dataset.state='waiting';
+        title.textContent='AI 标注未缓存';
+        title.title=data.message||'登录 Flow 后自动补齐';
+        info.textContent='登录 Flow 后自动补齐。';
         return;
       }
       if(data.inherited_rounds){
         if(data.episode_detail && applyDetail) applyDetail(eid,data.episode_detail);
         else await reload();
         if(g!==generation||eid!==episodeId())return;
-        info.textContent=`本地 AI 独立历史轮已载入时间轴 · 可离线修改、删除或补标；AI 原始记录保留。`;
+        panel.open=false;
+        panel.dataset.state='ready';
+        title.textContent='AI 标注已载入';
+        info.textContent='已载入时间轴，可直接修改或补标。';
         return;
       }
       const counts={};for(const c of data.coverage||[])counts[c.state]=(counts[c.state]||0)+1;
-      info.textContent=(data.runs||[]).map(r=>({queued:'排队',running:'分析中',succeeded:'已就绪',failed:'失败',stale:'已过期'}[r.state]||r.state)).join(' / ')||'尚未生成，请在 Flow 质检工作台启动';
-      info.textContent+=' · 无法判断 '+(counts.unknown||0)+' 项；未检出不等于合格。';
-      if((data.candidates||[]).some(c=>c.state==='pending'))panel.open=true;
+      const runStatus=(data.runs||[]).map(r=>({queued:'排队',running:'分析中',succeeded:'已就绪',failed:'失败',stale:'已过期'}[r.state]||r.state)).join(' / ');
+      title.textContent=runStatus?`AI 标注 · ${runStatus}`:'AI 标注尚未生成';
+      info.textContent=runStatus||'请在 Flow 质检工作台启动';
+      if(counts.unknown) info.textContent+=` · ${counts.unknown} 项待确认`;
+      if((data.candidates||[]).some(c=>c.state==='pending')){panel.open=true;title.textContent='AI 标注待确认';}
       for(const c of data.candidates||[]) {
         const a=c.annotation,row=document.createElement('div');row.className='ai-candidate';
-        const title=document.createElement('button');title.textContent=`${a.label_code} ${(a.start_offset_ns/1e9).toFixed(3)}–${(a.end_offset_ns/1e9).toFixed(3)} 秒`;title.onclick=()=>seek(a.start_offset_ns);row.append(title);
+        const title=document.createElement('button');title.textContent=`${a.label_name||a.label_code} ${(a.start_offset_ns/1e9).toFixed(3)}–${(a.end_offset_ns/1e9).toFixed(3)} 秒`;title.onclick=()=>seek(a.start_offset_ns);row.append(title);
         const evidence=document.createElement('p');evidence.textContent=a.comment||'';row.append(evidence);
         if(c.state==='accepted'||c.state==='rejected'){const s=document.createElement('small');s.textContent=c.state==='accepted'?'已确认（可在正式标注中继续修改）':'已排除';row.append(s);}
         else {

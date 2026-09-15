@@ -61,6 +61,9 @@ const els = {
   timelineViewControls: $("timeline-view-controls"), timelineRange: $("timeline-range"), timelineEnd: $("timeline-end"), scopeTabs: $("scope-tabs"),
   labelSearch: $("label-search"), labelGroupFilter: $("label-group-filter"), labelCount: $("label-count"),
   labelSetMeta: $("label-set-meta"), labelHelp: $("label-help"), targetContext: $("target-context"), labelList: $("label-list"),
+  labelSection: $("label-section"), toggleLabelSection: $("toggle-label-section"),
+  labelPagination: $("label-pagination"), labelPagePrevious: $("label-page-previous"),
+  labelPageNext: $("label-page-next"), labelPageStatus: $("label-page-status"),
   openLabelEditor: $("open-label-editor"), openAnnotationType: $("open-annotation-type"),
   openLabelName: $("open-label-name"), saveOpenLabel: $("save-open-label"),
   annotationComment: $("annotation-comment"), undo: $("undo"), redo: $("redo"),
@@ -73,8 +76,11 @@ const els = {
   annotationCount: $("annotation-count"), annotationList: $("annotation-list"), decisionGrid: $("decision-grid"), decisionCurrent: $("decision-current"),
   annotationsSection: $("current-annotations-section"),
   toggleCurrentAnnotations: $("toggle-current-annotations"),
+  decisionSection: $("decision-section"), toggleDecisionSection: $("toggle-decision-section"),
   needsRecheck: $("needs-recheck"), toastStack: $("toast-stack"), taskCenterToastStack: $("task-center-toast-stack"), annotationEditor: $("annotation-editor"),
   editId: $("edit-id"), editStart: $("edit-start"), editEnd: $("edit-end"), editSeverity: $("edit-severity"),
+  editLabelName: $("edit-label-name"), editFrameRange: $("edit-frame-range"), editTimingHelp: $("edit-timing-help"),
+  editStartLabel: $("edit-start-label"), editEndLabel: $("edit-end-label"),
   editAction: $("edit-action"), editComment: $("edit-comment"), editProvenance: $("edit-provenance"), deleteAnnotation: $("delete-annotation"),
   editEgoFields: $("edit-ego-fields"), editEgoStepField: $("edit-ego-step-field"), editEgoStep: $("edit-ego-step"),
   editEgoSemanticField: $("edit-ego-semantic-field"),
@@ -150,6 +156,7 @@ const state = {
   previousEgoDetail: null,
   previousEgoDetailEpisodeId: null,
   previousEgoDetailTaskId: null,
+  labelPage: 1,
 };
 
 const g1Viewer = new G1Viewer(els.motionCanvas, (status, error) => {
@@ -165,6 +172,7 @@ const g1Viewer = new G1Viewer(els.motionCanvas, (status, error) => {
 });
 
 const WHOLE_BODY_JOINT = "whole_body";
+const LABEL_PAGE_SIZE = 12;
 
 async function initialize() {
   refreshFlowSessionNotice();
@@ -222,7 +230,10 @@ async function refreshWorkspace({ preserveEpisode = true } = {}) {
   state.currentTaskId = state.currentTask?.id || null;
   state.episodes = payload.episodes || [];
   state.labelSchema = payload.label_schema;
-  if (state.currentTaskId !== previousTaskId) clearEgoDraft();
+  if (state.currentTaskId !== previousTaskId) {
+    clearEgoDraft();
+    state.labelPage = 1;
+  }
   if (state.currentTaskId) window.localStorage.setItem("episodeQcActiveTaskId", state.currentTaskId);
   else window.localStorage.removeItem("episodeQcActiveTaskId");
   els.workspaceName.textContent = payload.workspace.name;
@@ -324,12 +335,12 @@ function bindEvents() {
   els.scopeTabs.addEventListener("click", (event) => {
     const button = event.target.closest("[data-scope]");
     if (!button) return;
-    state.scope = button.dataset.scope;
-    els.scopeTabs.querySelectorAll("button").forEach((item) => item.classList.toggle("active", item === button));
-    renderLabels();
+    selectAnnotationScope(button.dataset.scope);
   });
-  els.labelSearch.addEventListener("input", renderLabels);
-  els.labelGroupFilter.addEventListener("change", renderLabels);
+  els.labelSearch.addEventListener("input", () => { state.labelPage = 1; renderLabels(); });
+  els.labelGroupFilter.addEventListener("change", () => { state.labelPage = 1; renderLabels(); });
+  els.labelPagePrevious.addEventListener("click", () => { state.labelPage -= 1; renderLabels(); });
+  els.labelPageNext.addEventListener("click", () => { state.labelPage += 1; renderLabels(); });
   els.saveOpenLabel.addEventListener("click", () => createOpenAnnotation());
   els.saveEgoAnnotation.addEventListener("click", saveSelectedEgoAnnotation);
   els.egoNewObject.addEventListener("click", () => applyEgoDraftShortcut("new_object"));
@@ -364,6 +375,12 @@ function bindEvents() {
   });
   els.toggleCurrentAnnotations.addEventListener("click", () => {
     setCurrentAnnotationsExpanded(!els.annotationsSection.classList.contains("expanded"));
+  });
+  els.toggleLabelSection.addEventListener("click", () => {
+    setSidebarSectionExpanded("labels", !els.labelSection.classList.contains("expanded"));
+  });
+  els.toggleDecisionSection.addEventListener("click", () => {
+    setSidebarSectionExpanded("decision", !els.decisionSection.classList.contains("expanded"));
   });
   els.timelineViewControls.addEventListener("click", (event) => {
     const button = event.target.closest("[data-timeline-view]");
@@ -437,7 +454,9 @@ function bindEvents() {
 function restoreWorkspaceLayout() {
   setWorkspacePanel("episodes", window.localStorage.getItem("episodeQcEpisodesVisible") !== "false", false);
   setWorkspacePanel("labels", window.localStorage.getItem("episodeQcLabelsVisible") !== "false", false);
+  setSidebarSectionExpanded("labels", window.localStorage.getItem("episodeQcLabelSectionExpanded") !== "false", false);
   setCurrentAnnotationsExpanded(window.localStorage.getItem("episodeQcCurrentAnnotationsExpanded") !== "false", false);
+  setSidebarSectionExpanded("decision", window.localStorage.getItem("episodeQcDecisionSectionExpanded") !== "false", false);
 }
 
 function toggleWorkspacePanel(panel) {
@@ -461,6 +480,21 @@ function setCurrentAnnotationsExpanded(expanded, persist = true) {
   els.toggleCurrentAnnotations.setAttribute("aria-expanded", String(expanded));
   els.toggleCurrentAnnotations.textContent = expanded ? "收起" : "展开";
   if (persist) window.localStorage.setItem("episodeQcCurrentAnnotationsExpanded", String(expanded));
+}
+
+function setSidebarSectionExpanded(section, expanded, persist = true) {
+  const isLabels = section === "labels";
+  const container = isLabels ? els.labelSection : els.decisionSection;
+  const button = isLabels ? els.toggleLabelSection : els.toggleDecisionSection;
+  container.classList.toggle("expanded", expanded);
+  button.setAttribute("aria-expanded", String(expanded));
+  button.textContent = expanded ? "收起" : "展开";
+  if (persist) {
+    window.localStorage.setItem(
+      isLabels ? "episodeQcLabelSectionExpanded" : "episodeQcDecisionSectionExpanded",
+      String(expanded),
+    );
+  }
 }
 
 function handleWorkerEvent(payload) {
@@ -1619,6 +1653,23 @@ function warnAnnotationTail() {
   }
 }
 
+function labelPageItems(labels) {
+  const total = labels.length;
+  const pages = Math.max(1, Math.ceil(total / LABEL_PAGE_SIZE));
+  state.labelPage = Math.max(1, Math.min(pages, state.labelPage));
+  const start = (state.labelPage - 1) * LABEL_PAGE_SIZE;
+  els.labelPagination.hidden = total <= LABEL_PAGE_SIZE;
+  els.labelPagePrevious.disabled = state.labelPage <= 1;
+  els.labelPageNext.disabled = state.labelPage >= pages;
+  els.labelPageStatus.textContent = `第 ${state.labelPage} / ${pages} 页 · ${start + 1}–${Math.min(start + LABEL_PAGE_SIZE, total)} / ${total}`;
+  return labels.slice(start, start + LABEL_PAGE_SIZE);
+}
+
+function hideLabelPagination() {
+  els.labelPagination.hidden = true;
+  state.labelPage = 1;
+}
+
 function renderLabels() {
   const labels = state.labelSchema?.labels || [];
   const openMode = state.currentTask?.annotation_mode === "open"
@@ -1659,10 +1710,11 @@ function renderLabels() {
   els.labelSetMeta.title = els.labelSetMeta.textContent;
   els.labelCount.textContent = `${usable.length} 可用 / ${visible.length}`;
   if (!visible.length) {
+    hideLabelPagination();
     els.labelList.innerHTML = `<div class="empty-panel">${labels.length ? "当前范围没有可用标签" : "请先导入标签库"}</div>`;
     return;
   }
-  els.labelList.innerHTML = visible.map((label) => {
+  els.labelList.innerHTML = labelPageItems(visible).map((label) => {
     const supported = labelSupportsTarget(label, currentTarget);
     const scopeSupported = label.annotation_scopes?.includes(state.scope);
     const enabledForEpisode = supported && scopeSupported && Boolean(state.detail);
@@ -1691,10 +1743,11 @@ function renderOpenLabels(labels) {
   els.labelSetMeta.title = "无需绑定标签库；保留结构版本和原始标签快照";
   els.labelCount.textContent = `${visible.length} 个建议`;
   if (!visible.length) {
+    hideLabelPagination();
     els.labelList.innerHTML = '<div class="empty-panel">直接在上方输入第一个自定义标签</div>';
     return;
   }
-  els.labelList.innerHTML = visible.map((label) => {
+  els.labelList.innerHTML = labelPageItems(visible).map((label) => {
     const related = annotations.filter((annotation) => annotation.label_slug === label.code || annotation.label_code === label.code);
     const status = labelAnnotationStatus(related);
     return `<button class="label-button" data-label-code="${escapeHtml(label.code)}" style="--label-color:${escapeHtml(label.color || "#cfef5a")}" title="以建议项创建标注；可先修改上方输入框" type="button"${state.detail ? "" : " disabled"}>
@@ -2103,6 +2156,7 @@ function selectAnnotationTarget(targetType, targetKey = null) {
   } else {
     return;
   }
+  state.labelPage = 1;
   syncJointSelectionUi();
   syncCameraSelectionUi();
   renderTargetContext();
@@ -2139,7 +2193,8 @@ function renderAnnotations() {
       annotationTargetName(annotation),
       severities.get(annotation.severity) || annotation.severity || "未分级",
     ].filter(Boolean).join(" · ");
-    return `<div class="annotation-item ${round.tone}" data-annotation-id="${escapeHtml(annotation.annotation_id)}"><i style="background:${escapeHtml(label.color || "#8c959f")}"></i><span><strong>${escapeHtml(label.name)}<em class="inherited-annotation-badge" title="${escapeHtml(badgeTitle)}">${escapeHtml(round.badge)}</em></strong><small title="${escapeHtml(details)}">${escapeHtml(details)}</small></span><time>${annotationTiming(annotation)}</time></div>`;
+    const fullTiming = annotationTiming(annotation);
+    return `<div class="annotation-item ${round.tone}" data-annotation-id="${escapeHtml(annotation.annotation_id)}"><i style="background:${escapeHtml(label.color || "#8c959f")}"></i><span class="annotation-copy"><span class="annotation-title-row"><strong>${escapeHtml(label.name)}</strong><em class="inherited-annotation-badge" title="${escapeHtml(badgeTitle)}">${escapeHtml(round.badge)}</em></span>${details ? `<small title="${escapeHtml(details)}">${escapeHtml(details)}</small>` : ""}<time title="${escapeHtml(fullTiming)}">${escapeHtml(annotationCardTiming(annotation))}</time></span></div>`;
   }).join("");
   renderAnnotationLanes(annotations, labels);
   const summary = summarizeAnnotationChanges(
@@ -2206,7 +2261,7 @@ function renderAiSegmentTrack(segments, labels) {
     const width = state.durationNs ? ((endNs - startNs) / state.durationNs) * 100 : 0;
     const grid = frameGridForCameras(state.cache?.cameras || [], annotation.target_type === "camera" ? annotation.target_key : state.selectedCameraId);
     const frameText = formatFrameRange(frameRangeForInterval(startNs, endNs, grid));
-    return `<button type="button" class="annotation-block ai-segment-block" data-annotation-id="${escapeHtml(annotation.annotation_id)}" data-display-start-ns="${startNs}" data-display-end-ns="${endNs}" aria-label="${escapeHtml(label.name)}，${escapeHtml(annotationTiming(annotation))}" title="${escapeHtml(label.name)} · ${escapeHtml(annotationTiming(annotation))}" style="--annotation-left:${left}%;--annotation-width:${width}%;--annotation-color:${escapeHtml(label.color || "#8c959f")}"><span class="ai-segment-name"><b>${escapeHtml(label.name)}</b><small>${escapeHtml(frameText || `${formatClock(startNs)}–${formatClock(endNs)}`)}</small></span></button>`;
+    return `<button type="button" class="annotation-block ai-segment-block" data-annotation-id="${escapeHtml(annotation.annotation_id)}" data-display-start-ns="${startNs}" data-display-end-ns="${endNs}" aria-label="${escapeHtml(label.name)}，${escapeHtml(annotationTiming(annotation))}；单击定位，双击编辑" title="${escapeHtml(label.name)} · ${escapeHtml(annotationTiming(annotation))} · 单击定位，双击编辑" style="--annotation-left:${left}%;--annotation-width:${width}%;--annotation-color:${escapeHtml(label.color || "#8c959f")}"><span class="ai-segment-name"><b>${escapeHtml(label.name)}</b><small>${escapeHtml(frameText || `${formatClock(startNs)}–${formatClock(endNs)}`)}</small></span></button>`;
   }).join("");
   const handles = segments.slice(1).map((right, index) => {
     const left = segments[index];
@@ -2234,6 +2289,25 @@ function annotationTiming(annotation) {
   }
   const frameText = formatFrameRange(frameRangeForInterval(annotation.start_offset_ns, annotation.end_offset_ns, grid));
   return `${frameText ? `${frameText} · ` : ""}${formatClock(annotation.start_offset_ns)}–${formatClock(annotation.end_offset_ns)} · ${formatSeconds(Number(annotation.end_offset_ns) - Number(annotation.start_offset_ns))}`;
+}
+
+function annotationCardTiming(annotation) {
+  const grid = frameGridForCameras(
+    state.cache?.cameras || [],
+    annotation.target_type === "camera" ? annotation.target_key : state.selectedCameraId,
+  );
+  if (annotation.scope === "episode") {
+    const end = Number(annotation.end_offset_ns || 0);
+    const frameText = formatFrameRange(frameRangeForInterval(0, end, grid));
+    return ["整条", frameText, formatSeconds(end)].filter(Boolean).join(" · ");
+  }
+  if (annotation.scope === "time_point") {
+    const frame = framePositionForTime(annotation.start_offset_ns, state.durationNs, grid);
+    return frame ? `${frame.exact ? "" : "≈"}F${frame.number}` : formatClock(annotation.start_offset_ns);
+  }
+  const frameText = formatFrameRange(frameRangeForInterval(annotation.start_offset_ns, annotation.end_offset_ns, grid));
+  const duration = formatSeconds(Number(annotation.end_offset_ns) - Number(annotation.start_offset_ns));
+  return [frameText, duration].filter(Boolean).join(" · ");
 }
 
 function currentReviewRound(episode = state.detail?.episode) {
@@ -2297,26 +2371,66 @@ function focusLabelAnnotations(labelCode) {
   window.setTimeout(() => lane.classList.remove("focused"), 1200);
 }
 
+function selectAnnotationScope(scope) {
+  if (!["time_range", "time_point", "episode"].includes(scope)) return;
+  state.scope = scope;
+  state.labelPage = 1;
+  els.scopeTabs.querySelectorAll("button").forEach((button) => {
+    button.classList.toggle("active", button.dataset.scope === scope);
+  });
+  renderLabels();
+}
+
+function currentAiSegmentDisplay(annotationId) {
+  if (state.timelineView !== "effective") return null;
+  const labels = new Map((state.labelSchema?.labels || []).map((item) => [item.code, item]));
+  return contiguousAiSegmentGroup(
+    state.detail?.annotations || [],
+    labels,
+    annotationDurationNs(state.detail?.episode),
+  ).find((annotation) => annotation.annotation_id === annotationId) || null;
+}
+
 function openAnnotationEditor(annotationId) {
   const annotation = state.detail?.annotations?.find((item) => item.annotation_id === annotationId);
   if (!annotation) return;
+  selectAnnotationScope(annotation.scope);
+  if (annotation.target_type === "camera") {
+    const camera = (state.cache?.cameras || []).find(
+      (item) => item.stream_id === annotation.target_key || item.topic === annotation.target_key,
+    );
+    if (camera) selectAnnotationTarget("camera", camera.stream_id);
+  }
+  const displayAnnotation = currentAiSegmentDisplay(annotationId) || annotation;
+  const timingLocked = displayAnnotation !== annotation;
+  const annotationLabel = (state.labelSchema?.labels || []).find(
+    (label) => label.code === annotation.label_code,
+  );
   els.editId.value = annotationId;
-  els.editStart.value = (annotation.start_offset_ns / 1e9).toFixed(9);
-  els.editEnd.value = (annotation.end_offset_ns / 1e9).toFixed(9);
+  els.editStart.value = (displayAnnotation.start_offset_ns / 1e9).toFixed(6);
+  els.editEnd.value = (displayAnnotation.end_offset_ns / 1e9).toFixed(6);
   for (const input of [els.editStart, els.editEnd]) {
     input.max = String(annotationDurationNs(state.detail?.episode) / 1e9);
     input.step = "any";
   }
-  els.editStart.disabled = annotation.scope === "episode";
-  els.editEnd.disabled = annotation.scope === "episode";
+  els.annotationEditor.dataset.timingLocked = String(timingLocked);
+  els.editStart.disabled = annotation.scope === "episode" || timingLocked;
+  els.editEnd.disabled = annotation.scope === "episode" || timingLocked;
+  els.editStartLabel.textContent = timingLocked ? "起点（由时间轴控制）" : "起点（秒，精调）";
+  els.editEndLabel.textContent = timingLocked ? "终点（由时间轴控制）" : "终点（秒，精调）";
+  els.editLabelName.textContent = annotationLabel?.name || annotation.label_name || annotation.label_code || "未命名标注";
+  els.editFrameRange.textContent = annotationTiming(displayAnnotation);
+  els.editTimingHelp.textContent = timingLocked
+    ? "动作分段时间请直接拖动时间轴上的白色分界线；系统会同步更新左右两段，避免重叠或空帧。"
+    : annotation.scope === "episode"
+      ? "整条标注覆盖完整 Episode，时间范围无需修改。"
+      : "帧号优先显示；秒数仅用于精确核对，也可以直接在时间轴拖动修改。";
+  els.annotationEditor.classList.toggle("timing-locked", timingLocked);
   fillSelect(els.editSeverity, state.labelSchema?.severity_levels || [], annotation.severity);
   fillSelect(els.editAction, state.labelSchema?.actions || [], annotation.action);
   els.editComment.value = annotation.comment || "";
   const ego = isEgoTask();
   const openMode = annotation.annotation_mode === "open" || isOpenAnnotationMode();
-  const annotationLabel = (state.labelSchema?.labels || []).find(
-    (label) => label.code === annotation.label_code,
-  );
   const semanticAnnotation = ego && !openMode && labelUsesEgoSemanticFields(annotationLabel);
   els.editEgoFields.hidden = !semanticAnnotation;
   els.editEgoStepField.hidden = !semanticAnnotation;
@@ -2384,8 +2498,12 @@ async function saveAnnotationEdit() {
     ...annotation,
     episode_id: annotation.episode_id,
     label_code: labelCode,
-    start_offset_ns: Math.round(Number(els.editStart.value) * 1e9),
-    end_offset_ns: Math.round(Number(els.editEnd.value) * 1e9),
+    start_offset_ns: els.annotationEditor.dataset.timingLocked === "true"
+      ? annotation.start_offset_ns
+      : Math.round(Number(els.editStart.value) * 1e9),
+    end_offset_ns: els.annotationEditor.dataset.timingLocked === "true"
+      ? annotation.end_offset_ns
+      : Math.round(Number(els.editEnd.value) * 1e9),
     severity: els.editSeverity.value,
     action: els.editAction.value,
     comment: els.editComment.value,

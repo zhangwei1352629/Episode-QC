@@ -106,13 +106,13 @@ export function boundaryGrabOffset(view,boundary,clientX,rect){
   return clientX-(rect.left+ratio*rect.width);
 }
 
-export function installIntervalTrack({container,getState,seek,pause,save,saveBoundary,notify}){
+export function installIntervalTrack({container,getState,seek,pause,save,saveBoundary,edit,notify}){
   const toolbar=document.createElement('div');toolbar.className='interval-track-tools';
   toolbar.innerHTML='<div class="interval-track-tool-group" role="group" aria-label="时间轴视图"><button type="button" data-view="in" title="以播放点为中心放大">放大</button><button type="button" data-view="out" title="缩小时间轴">缩小</button><button type="button" data-view="left" title="向前平移">前移</button><button type="button" data-view="right" title="向后平移">后移</button><button type="button" data-view="all" title="显示完整 Episode">适应全段</button></div><span class="interval-track-status" role="status"></span>';
   container.before(toolbar);
   const inspector=document.createElement('section');inspector.className='ai-boundary-inspector';inspector.hidden=true;
   inspector.setAttribute('aria-label','AI 分界点精调');
-  inspector.innerHTML='<div class="ai-boundary-pair"><small>选中边界</small><strong><span data-boundary-left-name></span><b>↔</b><span data-boundary-right-name></span></strong></div><div class="ai-boundary-time"><small>分界帧</small><div><button type="button" data-boundary-nudge="-1" aria-label="向前一帧" title="向前一帧">‹</button><strong data-boundary-frame>F--</strong><button type="button" data-boundary-nudge="1" aria-label="向后一帧" title="向后一帧">›</button><label title="对应精确时间"><input data-boundary-seconds type="number" min="0" step="0.001" inputmode="decimal" aria-label="分界时间（秒）"><em>s</em></label></div></div><div class="ai-boundary-snap"><small>定位方式</small><strong><i></i>吸附到帧</strong></div><div class="ai-boundary-durations"><small>相邻段帧数</small><div><span data-left-duration></span><b>→</b><span data-right-duration></span></div></div>';
+  inspector.innerHTML='<div class="ai-boundary-pair"><small>调整分界</small><strong><span data-boundary-left-name></span><b>→</b><span data-boundary-right-name></span></strong></div><div class="ai-boundary-time"><small>分界帧</small><div><button type="button" data-boundary-nudge="-1" aria-label="向前一帧" title="向前一帧">‹</button><strong data-boundary-frame>F--</strong><button type="button" data-boundary-nudge="1" aria-label="向后一帧" title="向后一帧">›</button></div></div><details class="ai-boundary-details"><summary>更多信息</summary><div><label title="对应精确时间"><span>精确时间</span><input data-boundary-seconds type="number" min="0" step="0.001" inputmode="decimal" aria-label="分界时间（秒）"><em>s</em></label><p class="ai-boundary-durations"><span data-left-duration></span><b>·</b><span data-right-duration></span></p><small>自动吸附到视频帧</small></div></details>';
   container.after(inspector);
   let episode=null,duration=0,view=[0,1],selected=null,selectedBoundary=null,drag=null,saving=false,suppressClick=false;
   const status=toolbar.querySelector('[role="status"]'),secondsInput=inspector.querySelector('[data-boundary-seconds]');
@@ -319,6 +319,12 @@ export function installIntervalTrack({container,getState,seek,pause,save,saveBou
     if(block&&block.closest('[data-ai-segment-track]')){selected=null;selectedBoundary=null;const surface=block.closest('.annotation-lane-surface');pause();seek(time(e,surface));render();}
     else if(block){selectedBoundary=null;selected=block.dataset.annotationId;const a=getState().annotations.find(a=>a.annotation_id===selected);if(a){pause();seek(a.start_offset_ns);}render();}
     else{const surface=e.target.closest('.annotation-lane-surface');if(surface){selectedBoundary=null;pause();seek(time(e,surface));render();}}
+  });
+  container.addEventListener('dblclick',e=>{
+    if(saving)return;
+    const block=e.target.closest('[data-annotation-id]');
+    if(!block||!edit)return;
+    e.preventDefault();e.stopImmediatePropagation();pause();edit(block.dataset.annotationId);
   });
   return {render,time,atRatio(ratio){return view[0]+Math.max(0,Math.min(1,ratio))*(view[1]-view[0]);},select(id){selected=id;render();}};
 }

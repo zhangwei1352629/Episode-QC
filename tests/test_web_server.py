@@ -646,7 +646,9 @@ def test_renderer_unifies_incremental_history_and_keeps_one_flow_submit_action()
     assert ".annotation-point" in styles
     assert ".review-footer" in styles
     assert ".annotations-section:not(.expanded)" in styles
-    assert "grid-template-rows: minmax(0, 1fr) auto auto" in styles
+    assert ".label-sidebar { container:label-sidebar / inline-size;" in styles
+    assert "display:flex; flex-direction:column; overflow:hidden; }" in styles
+    assert ".label-section-body { min-height: 0; flex: 1 1 auto; display: flex; flex-direction: column; overflow-y: auto;" in styles
 
 
 def test_existing_cached_job_refreshes_previous_review_from_flow_detail(

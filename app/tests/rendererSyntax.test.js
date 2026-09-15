@@ -121,7 +121,8 @@ test("Ego 身体部位表单在标签面板内滚动且不覆盖下方区域", (
   const css = fs.readFileSync(path.resolve(__dirname, "../renderer/styles.css"), "utf8");
 
   assert.match(renderer, /labelSection\?\.classList\.toggle\("ego-mode", ego\)/);
-  assert.match(css, /\.label-section\.ego-mode\s*\{[^}]*overflow-y:\s*auto/s);
+  assert.match(css, /\.label-section-body\s*\{[^}]*overflow-y:\s*auto/s);
+  assert.match(css, /\.label-section\.ego-mode\s*\{[^}]*overflow:\s*hidden/s);
   assert.match(css, /\.label-section\.ego-mode \.label-list\s*\{[^}]*flex:\s*0 0 auto/s);
   assert.match(css, /\.ego-fields-grid select\s*\{[^}]*color-scheme:\s*dark/s);
   assert.match(css, /\.ego-fields-grid select option\s*\{[^}]*color:\s*#eef3f6;[^}]*background-color:\s*#10151a/s);
@@ -154,6 +155,64 @@ test("Ego 质检编辑器可以修正固定步骤、人工语义和结构化属�
   assert.match(renderer, /function renderEditEgoFieldState\(\)/);
   assert.match(renderer, /label_code: labelCode/);
   assert.match(renderer, /attributes,/);
+});
+
+test("标注编辑器以帧为主并阻止单段破坏 AI 连续分段", () => {
+  const html = fs.readFileSync(path.resolve(__dirname, "../renderer/index.html"), "utf8");
+  const renderer = fs.readFileSync(path.resolve(__dirname, "../renderer/renderer.js"), "utf8");
+
+  assert.match(html, /id="edit-frame-range"/);
+  assert.match(html, /id="edit-timing-help"/);
+  assert.match(renderer, /function currentAiSegmentDisplay\(annotationId\)/);
+  assert.match(renderer, /dataset\.timingLocked/);
+  assert.match(renderer, /动作分段时间请直接拖动时间轴上的白色分界线/);
+  assert.match(renderer, /selectAnnotationScope\(annotation\.scope\)/);
+});
+
+test("右侧标注栏支持独立折叠和标签分页以避免信息被遮挡", () => {
+  const html = fs.readFileSync(path.resolve(__dirname, "../renderer/index.html"), "utf8");
+  const renderer = fs.readFileSync(path.resolve(__dirname, "../renderer/renderer.js"), "utf8");
+  const styles = fs.readFileSync(path.resolve(__dirname, "../renderer/styles.css"), "utf8");
+
+  assert.match(html, /id="toggle-label-section"[^>]+aria-controls="label-section-body"/);
+  assert.match(html, /id="label-pagination"[^>]+aria-label="标签分页"/);
+  assert.match(html, /id="toggle-decision-section"[^>]+aria-controls="decision-section-body"/);
+  assert.match(renderer, /const LABEL_PAGE_SIZE = 12/);
+  assert.match(renderer, /function labelPageItems\(labels\)/);
+  assert.match(renderer, /function setSidebarSectionExpanded\(section, expanded, persist = true\)/);
+  assert.match(styles, /\.label-section:not\(\.expanded\) \.label-section-body \{ display: none; \}/);
+  assert.match(styles, /\.decision-section:not\(\.expanded\) \.decision-section-body \{ display: none; \}/);
+  assert.match(styles, /\.label-copy strong\s*\{[^}]*font-size:\s*11px/s);
+  assert.match(styles, /\.annotation-item strong\s*\{[^}]*font-size:\s*11px/s);
+});
+
+test("AI 标注区只保留主要分界操作并将辅助信息折叠", () => {
+  const suggestions = fs.readFileSync(path.resolve(__dirname, "../renderer/ai-suggestions.mjs"), "utf8");
+  const intervalTrack = fs.readFileSync(path.resolve(__dirname, "../renderer/interval-track.mjs"), "utf8");
+  const styles = fs.readFileSync(path.resolve(__dirname, "../renderer/styles.css"), "utf8");
+
+  assert.match(suggestions, /title\.textContent='AI 标注'/);
+  assert.match(suggestions, /title\.textContent='AI 标注未缓存'/);
+  assert.match(suggestions, /已载入时间轴，可直接修改或补标/);
+  assert.doesNotMatch(suggestions, /刷新本地 AI 结果/);
+  assert.match(intervalTrack, /class="ai-boundary-details"/);
+  assert.match(intervalTrack, /<summary>更多信息<\/summary>/);
+  assert.match(styles, /\.ai-boundary-inspector\s*\{[^}]*grid-template-columns:minmax\(160px,1fr\) auto auto/s);
+});
+
+test("有效标注卡片纵向排列名称、来源和紧凑帧信息", () => {
+  const renderer = fs.readFileSync(path.resolve(__dirname, "../renderer/renderer.js"), "utf8");
+  const styles = fs.readFileSync(path.resolve(__dirname, "../renderer/styles.css"), "utf8");
+
+  assert.match(renderer, /class="annotation-copy"/);
+  assert.match(renderer, /class="annotation-title-row"/);
+  assert.match(renderer, /function annotationCardTiming\(annotation\)/);
+  assert.match(styles, /\.annotation-item\s*\{[^}]*grid-template-columns:4px minmax\(0,1fr\)/s);
+  assert.match(styles, /\.annotation-copy\s*\{[^}]*display:grid/s);
+  assert.match(styles, /\.annotation-item time\s*\{[^}]*justify-self:start/s);
+  assert.match(styles, /@container label-sidebar \(min-width:440px\)/);
+  assert.match(styles, /\.annotation-copy\s*\{[^}]*grid-template-columns:minmax\(130px,\.8fr\) minmax\(180px,1\.35fr\)/s);
+  assert.match(styles, /\.annotation-heading h3\s*\{[^}]*font-size:13px/s);
 });
 
 test("标签库菜单和本地任务历史管理入口完整", () => {
@@ -191,7 +250,8 @@ test("本条有效标注默认展开并保留手动收起能力", () => {
   assert.match(html, /id="toggle-current-annotations"[^>]*aria-expanded="true"/);
   assert.match(renderer, /function setCurrentAnnotationsExpanded\(expanded, persist = true\)/);
   assert.match(renderer, /episodeQcCurrentAnnotationsExpanded/);
-  assert.match(css, /\.label-sidebar\s*\{[^}]*grid-template-rows:\s*minmax\(0, 1fr\) auto auto/s);
+  assert.match(css, /\.label-sidebar\s*\{[^}]*display:\s*flex[^}]*flex-direction:\s*column/s);
+  assert.match(css, /\.annotations-section\.expanded\s*\{[^}]*flex:\s*0 1 240px/s);
   assert.match(css, /\.annotations-section:not\(\.expanded\)[^{]*\.annotation-list\s*\{\s*display:\s*none/s);
 });
 

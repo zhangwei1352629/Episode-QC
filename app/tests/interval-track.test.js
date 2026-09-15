@@ -128,6 +128,9 @@ test('boundary inspector supports frame nudging and exact time entry',()=>{
   assert.ok(text.includes('data-boundary-nudge="-1"'));
   assert.ok(text.includes('data-boundary-nudge="1"'));
   assert.ok(text.includes('data-boundary-seconds'));
+  assert.ok(text.includes('class="ai-boundary-details"'));
+  assert.ok(text.includes('<summary>更多信息</summary>'));
+  assert.ok(text.includes('自动吸附到视频帧'));
   assert.ok(text.includes("tick.textContent=position?`${position.exact?'':'≈'}F${position.number}`"));
   assert.ok(text.includes("[data-boundary-frame]').textContent=frameIndex>=0?`F${frameIndex+1}`"));
   assert.ok(text.includes("e.key==='ArrowLeft'||e.key==='ArrowRight'"));
@@ -141,4 +144,12 @@ test('clicking inside an AI segment seeks to the pointer instead of its start',(
   const click=text.slice(text.indexOf("container.addEventListener('click'"));
   assert.ok(click.includes("block.closest('[data-ai-segment-track]')"));
   assert.ok(click.includes('seek(time(e,surface))'));
+});
+test('double clicking an existing segment opens its editor without creating a new range',()=>{
+  const fs=require('node:fs'),path=require('node:path');
+  const text=fs.readFileSync(path.join(__dirname,'../renderer/interval-track.mjs'),'utf8');
+  const dblclick=text.slice(text.indexOf("container.addEventListener('dblclick'"));
+  assert.ok(dblclick.includes("e.target.closest('[data-annotation-id]')"));
+  assert.ok(dblclick.includes('edit(block.dataset.annotationId)'));
+  assert.ok(dblclick.includes('stopImmediatePropagation'));
 });

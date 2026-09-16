@@ -1067,6 +1067,74 @@ def test_cache_job_prefers_declared_qc_playback_package(tmp_path: Path):
     )
 
 
+def test_cache_job_accepts_mp4_range_package_with_multiple_files(tmp_path: Path):
+    asset_root = tmp_path / "nas" / "AST-STREAM"
+    package_episode = asset_root / "qc_playback/v2/fingerprint/episodes/episode_000001"
+    package_episode.mkdir(parents=True)
+    generated = {
+        "signals.mcap": b"signals",
+        "qc_stream/stream_manifest.json": b'{"schema_version":2,"transport":"mp4_range_v1"}',
+        "qc_stream/camera.mp4": b"mp4-video",
+    }
+    files = []
+    for relative, payload in generated.items():
+        target = package_episode / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(payload)
+        files.append({
+            "relative_path": f"episodes/episode_000001/{relative}",
+            "size_bytes": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        })
+    primary_sha = hashlib.sha256(generated["signals.mcap"]).hexdigest()
+    manifest = {
+        "schema_version": 1,
+        "asset_id": "AST-STREAM",
+        "episodes": [{
+            "episode_id": "AST-STREAM-EP0001",
+            "relative_path": "episodes/episode_000001",
+            "primary_file": "episode.mcap",
+            "checksum_sha256": "f" * 64,
+        }],
+        "qc_playback_package": {
+            "schema_version": 2,
+            "profile": "qc-mp4-range-v1",
+            "relative_path": "qc_playback/v2/fingerprint",
+            "episodes": [{
+                "episode_id": "AST-STREAM-EP0001",
+                "relative_path": "episodes/episode_000001",
+                "primary_file": "signals.mcap",
+                "checksum_sha256": primary_sha,
+                "manifest": {
+                    "schema_version": 2,
+                    "profile": "qc-mp4-range-v1",
+                    "stream_manifest": "qc_stream/stream_manifest.json",
+                    "files": files,
+                },
+            }],
+        },
+    }
+    (asset_root / "asset_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    job = {
+        "code": "QCJ-STREAM",
+        "asset_id": "AST-STREAM",
+        "source_uri": str(asset_root),
+        "episodes": manifest["episodes"],
+        "asset_manifest": manifest,
+        "asset_manifest_sha256": canonical_json_sha256(manifest),
+    }
+
+    cached = QualityCacheManager(tmp_path / "cache", reserve_bytes=0).cache_job(
+        FakeFlowClient(job), job,
+    )
+
+    cached_root = Path(cached["cache_dir"]) / "episodes/episode_000001"
+    assert (cached_root / "signals.mcap").read_bytes() == b"signals"
+    assert (cached_root / "qc_stream/camera.mp4").read_bytes() == b"mp4-video"
+    assert cached["total_bytes"] >= sum(len(payload) for payload in generated.values())
+    assert cached["job"]["asset_manifest"]["qc_playback_package"]["profile"] == "qc-mp4-range-v1"
+
+
 def test_cache_job_still_requires_published_manifest_for_non_ego_job(tmp_path: Path):
     asset_root = tmp_path / "nas" / "AST-ROBOT"
     episode_root = asset_root / "episode_000001"

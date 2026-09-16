@@ -27,7 +27,7 @@ from episode_qc.messagepack import decode_messagepack
 from episode_qc.workspace import _json, _now, connect_workspace, episode_detail
 
 
-PLAYBACK_CACHE_VERSION = 8
+PLAYBACK_CACHE_VERSION = 9
 MOTION_FRAME_ENCODING = "episode-qc-motion-f32-le-v1"
 ACTION_FRAME_ENCODING = "episode-qc-action-f32-le-v2"
 ACTION_ROOT_POSITION = 1
@@ -77,6 +77,55 @@ G1_MUJOCO_TO_ISAACLAB_INDICES = [
     12, 16, 20, 22, 24, 26, 28,
 ]
 ROBOT_ACTION_KEYS = frozenset(str(spec["key"]) for spec in ROBOT_ACTION_SPECS.values())
+
+
+def _load_prebuilt_stream_preview(episode_path: Path) -> dict[str, object] | None:
+    manifest_path = episode_path.parent / "qc_stream" / "stream_manifest.json"
+    if not manifest_path.is_file():
+        return None
+    try:
+        value = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"预生成流媒体清单不可读：{exc}") from exc
+    if value.get("transport") != "mp4_range_v1" or int(value.get("schema_version") or 0) != 2:
+        raise ValueError("预生成流媒体清单版本无效")
+    cameras = value.get("cameras")
+    if not isinstance(cameras, list) or not cameras:
+        raise ValueError("预生成流媒体清单缺少相机")
+    normalized = []
+    seen = set()
+    for camera in cameras:
+        if not isinstance(camera, dict):
+            raise ValueError("预生成流媒体相机项无效")
+        stream_id = str(camera.get("stream_id") or "")
+        relative = Path(str(camera.get("file") or ""))
+        offsets = camera.get("frame_offsets_ns")
+        indices = camera.get("frame_indices")
+        if (
+            not stream_id or stream_id in seen or relative.is_absolute()
+            or ".." in relative.parts or not isinstance(offsets, list) or not offsets
+            or not isinstance(indices, list) or len(indices) != len(offsets)
+        ):
+            raise ValueError("预生成流媒体相机映射无效")
+        target = (manifest_path.parent / relative).resolve()
+        if not target.is_relative_to(manifest_path.parent.resolve()) or not target.is_file():
+            raise ValueError(f"预生成流媒体视频不存在：{relative}")
+        seen.add(stream_id)
+        normalized.append({
+            "stream_id": stream_id,
+            "topic": str(camera.get("topic") or stream_id),
+            "display_name": str(camera.get("display_name") or camera.get("topic") or stream_id),
+            "file": relative.as_posix(),
+            "fps": int(camera.get("fps") or 30),
+            "frame_offsets_ns": [int(item) for item in offsets],
+            "frame_indices": [int(item) for item in indices],
+        })
+    return {
+        "schema_version": 2,
+        "transport": "mp4_range_v1",
+        "cameras": normalized,
+        "root": str(manifest_path.parent.resolve()),
+    }
 
 
 HUMAN_PARENT_NAMES = {
@@ -148,6 +197,8 @@ def prepare_episode_cache(
     episode_root.mkdir(parents=True, exist_ok=True)
     temp_dir = Path(tempfile.mkdtemp(prefix=".prepare-", dir=episode_root))
     _set_cache_status(db_path, episode_id, "preparing")
+    episode_path = Path(str(episode["mcap_path"]))
+    prebuilt_stream = _load_prebuilt_stream_preview(episode_path)
     all_camera_streams = [item for item in detail["streams"] if item["stream_type"] == "camera" and item["available"]]
     all_motion_streams = [item for item in detail["streams"] if item["stream_type"] == "mocap" and item["available"]]
     all_action_streams = [
@@ -183,6 +234,9 @@ def prepare_episode_cache(
         camera_streams = [item for item in all_camera_streams if item["topic"] not in reused_camera_topics]
         motion_streams = all_motion_streams
         action_streams = [item for item in all_action_streams if item["topic"] not in reused_action_topics]
+    if prebuilt_stream:
+        # Camera pixels are already encoded as MP4; only parse signals.mcap.
+        camera_streams = []
     selected_topics = [item["topic"] for item in camera_streams + motion_streams + action_streams]
     camera_by_topic = {item["topic"]: item for item in camera_streams}
     motion_topics = {item["topic"] for item in motion_streams}
@@ -228,7 +282,6 @@ def prepare_episode_cache(
                 action_files[key] = (actions_dir / f"{key}.frames").open("wb")
 
         start_ns = int(episode["start_time_ns"] or 0)
-        episode_path = Path(str(episode["mcap_path"]))
         if is_dohc_primary_file(episode_path):
             episode_directory = episode_path.parent
             for stream in camera_streams:
@@ -533,6 +586,22 @@ def prepare_episode_cache(
             "joint_names": G1_29_JOINT_NAMES,
             "sources": action_sources,
         }
+        if prebuilt_stream:
+            cameras = [
+                {
+                    "stream_id": item["stream_id"],
+                    "topic": item["topic"],
+                    "display_name": item["display_name"],
+                    "message_count": len(item["frame_offsets_ns"]),
+                    "index": [
+                        [offset, 0, 0, item["frame_indices"][index]]
+                        for index, offset in enumerate(item["frame_offsets_ns"])
+                    ],
+                    "first_offset_ns": item["frame_offsets_ns"][0],
+                    "last_offset_ns": item["frame_offsets_ns"][-1],
+                }
+                for item in prebuilt_stream["cameras"]
+            ]
         manifest = {
             "cache_version": PLAYBACK_CACHE_VERSION,
             "episode_id": episode_id,
@@ -549,6 +618,11 @@ def prepare_episode_cache(
             "robot_actions": robot_actions,
             "decode_errors": decode_errors,
         }
+        if prebuilt_stream:
+            manifest["prebuilt_stream_preview"] = {
+                key: value for key, value in prebuilt_stream.items() if key != "root"
+            }
+            manifest["prebuilt_stream_root"] = prebuilt_stream["root"]
         (temp_dir / "stream_index.json").write_text(json.dumps(manifest, ensure_ascii=False, separators=(",", ":")) + "\n", encoding="utf-8")
         if final_dir.exists():
             shutil.rmtree(final_dir)
@@ -1061,7 +1135,9 @@ def public_cache_manifest(manifest: dict[str, object]) -> dict[str, object]:
         {key: value for key, value in source.items() if key != "index"}
         for source in robot_actions.get("sources", [])
     ]
-    return {key: value for key, value in manifest.items() if key not in {"cameras", "motion", "robot_actions"}} | {
+    return {key: value for key, value in manifest.items() if key not in {
+        "cameras", "motion", "robot_actions", "prebuilt_stream_root"
+    }} | {
         "cameras": cameras,
         "motion": motion,
         "robot_actions": robot_actions,

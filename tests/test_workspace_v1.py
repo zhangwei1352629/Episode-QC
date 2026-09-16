@@ -886,6 +886,43 @@ def test_flow_incremental_history_is_editable_and_deleted_labels_do_not_return(
     assert episode_summary["incremental_preserved_count"] == 0
 
 
+def test_prebuilt_mp4_stream_is_used_without_reencoding_camera_frames(tmp_path: Path):
+    source_root = tmp_path / "stream-package"
+    mcap_path = _write_sample_episode(source_root / "episode_000001")
+    stream_root = mcap_path.parent / "qc_stream"
+    stream_root.mkdir()
+    video = stream_root / "camera-head.mp4"
+    video.write_bytes(b"mp4-range-payload")
+    offsets = [0, 33_000_000, 66_000_000]
+    (stream_root / "stream_manifest.json").write_text(json.dumps({
+        "schema_version": 2,
+        "transport": "mp4_range_v1",
+        "source_sha256": "a" * 64,
+        "cameras": [{
+            "stream_id": "str_" + "a" * 24,
+            "topic": "/camera/prebuilt/image/jpeg",
+            "display_name": "预生成相机",
+            "file": video.name,
+            "fps": 30,
+            "frame_offsets_ns": offsets,
+            "frame_indices": [10, 11, 12],
+        }],
+    }), encoding="utf-8")
+    db_path = tmp_path / "workspace.db"
+    indexed = scan_data_source(db_path, source_root)
+    episode_id = indexed["episodes"][0]["id"]
+
+    detail = episode_detail(db_path, episode_id)
+    assert any(item["adapter_id"] == "qc_mp4_range_v1" for item in detail["streams"])
+    manifest = prepare_episode_cache(db_path, episode_id, tmp_path / "cache")
+
+    assert manifest["prebuilt_stream_preview"]["transport"] == "mp4_range_v1"
+    assert manifest["prebuilt_stream_root"] == str(stream_root.resolve())
+    assert manifest["cameras"][0]["index"] == [
+        [0, 0, 0, 10], [33_000_000, 0, 0, 11], [66_000_000, 0, 0, 12],
+    ]
+
+
 def test_v1_import_playback_annotation_and_export_round_trip(tmp_path: Path):
     source_root = tmp_path / "含 空格的数据"
     mcap_path = _write_sample_episode(source_root / "episode_000001")
@@ -918,7 +955,7 @@ def test_v1_import_playback_annotation_and_export_round_trip(tmp_path: Path):
     assert len(manifest["cameras"]) == 1
     assert manifest["motion"]["available"] is True
     assert manifest["motion"]["joint_names"] == ["Hips", "Head"]
-    assert manifest["cache_version"] == 8
+    assert manifest["cache_version"] == 9
     assert manifest["motion"]["frame_encoding"] == "episode-qc-motion-f32-le-v1"
     assert manifest["robot_actions"]["default_source"] == "policy"
     assert {item["key"] for item in manifest["robot_actions"]["sources"] if item["available"]} == {

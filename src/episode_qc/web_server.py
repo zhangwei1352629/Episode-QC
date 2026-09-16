@@ -2169,10 +2169,31 @@ class EpisodeQcWebApplication:
         """Build a disposable MP4 view while retaining original frame mapping."""
         self.prepare_episode(episode_id)
         manifest_path, manifest = self.playback.manifest(episode_id)
+        prebuilt = manifest.get("prebuilt_stream_preview")
+        if isinstance(prebuilt, dict):
+            return prebuilt
         output_root = self.paths.cache_root / "streaming" / episode_id
         return build_stream_preview(manifest_path, manifest, output_root)
 
     def stream_preview_video(self, episode_id: str, stream_id: str) -> Path:
+        try:
+            _manifest_path, playback_manifest = self.playback.manifest(episode_id)
+        except KeyError:
+            playback_manifest = {}
+        prebuilt = playback_manifest.get("prebuilt_stream_preview")
+        prebuilt_root = playback_manifest.get("prebuilt_stream_root")
+        if isinstance(prebuilt, dict) and isinstance(prebuilt_root, str):
+            camera = next(
+                (item for item in prebuilt.get("cameras", []) if item.get("stream_id") == stream_id),
+                None,
+            )
+            if not isinstance(camera, dict):
+                raise KeyError("流媒体相机不存在")
+            root = Path(prebuilt_root).resolve()
+            path = (root / str(camera.get("file") or "")).resolve()
+            if not _is_relative_to(path, root) or path.suffix != ".mp4" or not path.is_file():
+                raise FileNotFoundError("流媒体文件不存在")
+            return path
         root = (self.paths.cache_root / "streaming" / episode_id).resolve()
         manifest_path = root / "stream_manifest.json"
         if not manifest_path.is_file():

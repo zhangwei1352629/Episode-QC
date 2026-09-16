@@ -2435,8 +2435,11 @@ class QualityCacheManager:
             return None, None
         if not isinstance(package, dict):
             raise QualityCacheError("QC 轻量播放包结构无效")
-        if int(package.get("schema_version") or 0) != 1:
+        package_schema = int(package.get("schema_version") or 0)
+        if package_schema not in {1, 2}:
             raise QualityCacheError("QC 轻量播放包版本无效")
+        if package_schema == 2 and package.get("profile") != "qc-mp4-range-v1":
+            raise QualityCacheError("QC MP4 播放包 profile 无效")
         package_root_relative = self._safe_relative_path(
             package.get("relative_path") or "qc_playback", "QC 轻量播放包目录"
         )

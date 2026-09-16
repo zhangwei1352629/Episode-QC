@@ -1376,6 +1376,40 @@ def _index_episode(
                             profile,
                         )
                     )
+            stream_manifest_path = mcap_path.parent / "qc_stream" / "stream_manifest.json"
+            if stream_manifest_path.is_file():
+                stream_manifest = json.loads(stream_manifest_path.read_text(encoding="utf-8"))
+                if (
+                    int(stream_manifest.get("schema_version") or 0) != 2
+                    or stream_manifest.get("transport") != "mp4_range_v1"
+                ):
+                    raise ValueError("预生成流媒体清单版本无效")
+                for camera in stream_manifest.get("cameras") or []:
+                    offsets = camera.get("frame_offsets_ns") or []
+                    topic = str(camera.get("topic") or "")
+                    video = mcap_path.parent / "qc_stream" / str(camera.get("file") or "")
+                    if not topic or not offsets or not video.is_file():
+                        raise ValueError("预生成流媒体相机映射不完整")
+                    streams.append({
+                        "id": _stable_id("str", episode_id, topic),
+                        "episode_id": episode_id,
+                        "topic": topic,
+                        "stream_key": "camera",
+                        "stream_type": "camera",
+                        "display_name": str(camera.get("display_name") or topic),
+                        "encoding": "h264/mp4",
+                        "schema_name": "episode_qc.Mp4RangePreview",
+                        "adapter_id": "qc_mp4_range_v1",
+                        "message_count": len(offsets),
+                        "first_time_ns": (start_ns or 0) + int(offsets[0]),
+                        "last_time_ns": (start_ns or 0) + int(offsets[-1]),
+                        "nominal_hz": float(camera.get("fps") or 30),
+                        "available": 1,
+                        "metadata_json": _json({
+                            "stream_id": camera.get("stream_id"),
+                            "file": camera.get("file"),
+                        }),
+                    })
     except Exception as exc:
         duration_ns = None
         error = f"{type(exc).__name__}: {exc}"

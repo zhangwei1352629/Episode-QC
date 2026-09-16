@@ -1251,6 +1251,10 @@ async function openEpisode(episodeId) {
     const cache = outcome.value;
     if (token !== state.loadToken) return;
     state.cache = cache;
+    if (cache.prebuilt_stream_preview) {
+      state.streamPreview = cache.prebuilt_stream_preview;
+      els.enableStreamPreview.textContent = "流预览已启用";
+    }
     syncInteractiveState();
     renderCameras();
     renderMotionAvailability();

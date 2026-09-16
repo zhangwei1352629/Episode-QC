@@ -449,8 +449,10 @@ class QualityCacheManager:
             files,
             asset_manifest_sha256,
             generated_manifest_payload,
+            cache_job,
         ) = self._manifest_file_specs(claimed, source)
-        episode_specs, manifest_file = self._episode_file_specs(claimed, files)
+        claimed_for_cache = {**claimed, **cache_job} if cache_job else claimed
+        episode_specs, manifest_file = self._episode_file_specs(claimed_for_cache, files)
         total_bytes = sum(int(item["size_bytes"]) for item in files)
         asset_directory = self._asset_directory_name(claimed)
         partial_job_root = self.cache_root / "downloading" / f"{job_code}.partial"
@@ -537,7 +539,7 @@ class QualityCacheManager:
             manifest_target = ready_root / manifest_file["relative_path"]
             if generated_manifest_payload is None:
                 copied_bytes = self._copy_resumable(
-                    source / manifest_file["relative_path"],
+                    source / str(manifest_file.get("source_relative_path") or manifest_file["relative_path"]),
                     manifest_target,
                     copied_bytes=copied_bytes,
                     total_bytes=total_bytes,
@@ -646,7 +648,7 @@ class QualityCacheManager:
                             target = partial_root / relative
                             target.parent.mkdir(parents=True, exist_ok=True)
                             copied_bytes = self._copy_resumable(
-                                source / relative,
+                                source / str(file_spec.get("source_relative_path") or relative.as_posix()),
                                 target,
                                 copied_bytes=copied_bytes,
                                 total_bytes=total_bytes,
@@ -2222,7 +2224,7 @@ class QualityCacheManager:
         self,
         job: dict,
         source_root: Path,
-    ) -> tuple[list[dict], str, bytes | None]:
+    ) -> tuple[list[dict], str, bytes | None, dict | None]:
         manifest = job.get("asset_manifest") or {}
         if not isinstance(manifest, dict) or not manifest.get("episodes"):
             raise QualityCacheError("Flow 任务缺少完整 asset_manifest，禁止下载")
@@ -2274,6 +2276,34 @@ class QualityCacheManager:
             and canonical_json_sha256(stored_manifest) != manifest_digest
         ):
             raise QualityCacheError("NAS 资产清单与 Flow 登记内容不一致")
+
+        playback_specs, playback_job = self._playback_package_file_specs(
+            job,
+            manifest,
+            source_root,
+            platform_episodes,
+            manifest_episodes,
+        )
+        if playback_specs is not None and playback_job is not None:
+            if generated_manifest_payload is None:
+                manifest_size = published_manifest.stat().st_size
+                manifest_file_sha256 = sha256_file(published_manifest)
+            else:
+                manifest_size = len(generated_manifest_payload)
+                manifest_file_sha256 = hashlib.sha256(generated_manifest_payload).hexdigest()
+            playback_specs.append(
+                {
+                    "relative_path": "asset_manifest.json",
+                    "size_bytes": manifest_size,
+                    "sha256": manifest_file_sha256,
+                }
+            )
+            return (
+                sorted(playback_specs, key=lambda item: item["relative_path"]),
+                manifest_digest,
+                generated_manifest_payload,
+                playback_job,
+            )
 
         specs = []
         seen = set()
@@ -2389,7 +2419,131 @@ class QualityCacheManager:
             sorted(specs, key=lambda item: item["relative_path"]),
             manifest_digest,
             generated_manifest_payload,
+            None,
         )
+
+    def _playback_package_file_specs(
+        self,
+        job: dict,
+        manifest: dict,
+        source_root: Path,
+        platform_episodes: dict[str, dict],
+        manifest_episodes: dict[str, dict],
+    ) -> tuple[list[dict] | None, dict | None]:
+        package = manifest.get("qc_playback_package")
+        if package is None:
+            return None, None
+        if not isinstance(package, dict):
+            raise QualityCacheError("QC 轻量播放包结构无效")
+        if int(package.get("schema_version") or 0) != 1:
+            raise QualityCacheError("QC 轻量播放包版本无效")
+        package_root_relative = self._safe_relative_path(
+            package.get("relative_path") or "qc_playback", "QC 轻量播放包目录"
+        )
+        package_root = source_root / package_root_relative
+        try:
+            package_root.resolve().relative_to(source_root.resolve())
+        except (OSError, ValueError) as exc:
+            raise QualityCacheError("QC 轻量播放包目录超出资产根目录") from exc
+        package_episodes = {
+            str(item.get("episode_id") or ""): item
+            for item in package.get("episodes") or []
+            if isinstance(item, dict)
+        }
+        if (
+            not package_episodes
+            or set(package_episodes) != set(platform_episodes)
+            or "" in package_episodes
+        ):
+            raise QualityCacheError("QC 轻量播放包与质检任务 Episode 范围不一致")
+
+        specs = []
+        cache_episodes = []
+        seen = set()
+        for episode_id in platform_episodes:
+            original_episode = manifest_episodes[episode_id]
+            package_episode = package_episodes[episode_id]
+            relative_path = self._safe_relative_path(
+                package_episode.get("relative_path"), "QC 轻量播放包 Episode 相对目录"
+            ).as_posix()
+            original_relative_path = self._safe_relative_path(
+                original_episode.get("relative_path"), "Episode 相对目录"
+            ).as_posix()
+            if relative_path != original_relative_path:
+                raise QualityCacheError(
+                    f"QC 轻量播放包 Episode {episode_id} 的相对目录与资产清单不一致"
+                )
+            primary_file = self._safe_relative_path(
+                package_episode.get("primary_file"), "QC 轻量播放包 Episode 主文件"
+            ).as_posix()
+            episode_manifest = package_episode.get("manifest") or {}
+            files = episode_manifest.get("files") or []
+            if not files:
+                raise QualityCacheError(f"QC 轻量播放包 Episode {episode_id} 缺少逐文件清单")
+            episode_file_specs = []
+            for item in files:
+                relative = self._safe_relative_path(
+                    item.get("relative_path"), "QC 轻量播放包文件路径"
+                )
+                normalized = relative.as_posix()
+                if not normalized.startswith(f"{relative_path}/"):
+                    raise QualityCacheError(
+                        f"QC 轻量播放包文件不属于 Episode {episode_id}: {normalized}"
+                    )
+                if normalized in seen:
+                    raise QualityCacheError(f"QC 轻量播放包包含重复文件：{normalized}")
+                seen.add(normalized)
+                try:
+                    expected_size = int(item["size_bytes"])
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise QualityCacheError(f"QC 轻量播放包文件大小无效：{normalized}") from exc
+                expected_sha256 = str(item.get("sha256") or "").lower()
+                if expected_size < 0 or not re.fullmatch(r"[a-f0-9]{64}", expected_sha256):
+                    raise QualityCacheError(f"QC 轻量播放包文件校验信息无效：{normalized}")
+                source_relative = package_root_relative / relative
+                source = source_root / source_relative
+                try:
+                    source.resolve().relative_to(package_root.resolve())
+                except (OSError, ValueError) as exc:
+                    raise QualityCacheError(
+                        f"QC 轻量播放包文件超出包目录：{normalized}"
+                    ) from exc
+                if not source.is_file():
+                    raise QualityCacheError(f"NAS 缺少 QC 轻量播放包文件：{normalized}")
+                if source.stat().st_size != expected_size:
+                    raise QualityCacheError(f"QC 轻量播放包文件大小与清单不一致：{normalized}")
+                episode_file_specs.append(
+                    {
+                        "relative_path": normalized,
+                        "source_relative_path": source_relative.as_posix(),
+                        "size_bytes": expected_size,
+                        "sha256": expected_sha256,
+                        "integrity_mode": "sha256",
+                    }
+                )
+            primary_path = (Path(relative_path) / primary_file).as_posix()
+            primary_spec = next(
+                (item for item in episode_file_specs if item["relative_path"] == primary_path),
+                None,
+            )
+            if primary_spec is None:
+                raise QualityCacheError(
+                    f"QC 轻量播放包 Episode {episode_id} 缺少主文件：{primary_path}"
+                )
+            declared_primary_sha256 = str(package_episode.get("checksum_sha256") or "")
+            if declared_primary_sha256 and declared_primary_sha256 != primary_spec["sha256"]:
+                raise QualityCacheError(
+                    f"QC 轻量播放包 Episode {episode_id} 主文件 SHA-256 不一致"
+                )
+            specs.extend(episode_file_specs)
+            cache_episodes.append(
+                {
+                    **platform_episodes[episode_id],
+                    "primary_file": primary_file,
+                    "checksum_sha256": primary_spec["sha256"],
+                }
+            )
+        return specs, {"episodes": cache_episodes, "qc_playback_package_used": True}
 
     @staticmethod
     def _verify_manifest_files(

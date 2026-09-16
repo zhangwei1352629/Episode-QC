@@ -38,6 +38,7 @@ from episode_qc.playback import (
 )
 from episode_qc.source_paths import resolve_source_directory
 from episode_qc.playback_queue import PlaybackQueue
+from episode_qc.stream_preview import build_stream_preview
 from episode_qc.isolated_work import IsolatedWork
 from episode_qc.resource_budget import DownloadBudget
 from episode_qc.workspace import (
@@ -438,6 +439,10 @@ class PlaybackRegistry:
         if value is None:
             raise KeyError("请先准备 Episode 播放缓存")
         return value
+
+    def manifest(self, episode_id: str) -> tuple[Path, dict[str, object]]:
+        """Expose only prepared local cache metadata to derived viewers."""
+        return self._get(episode_id)
 
 
 class PlatformCacheCleanup:
@@ -2160,6 +2165,27 @@ class EpisodeQcWebApplication:
             LOGGER.exception("Read-ahead unavailable; foreground playback remains ready")
         return public_cache_manifest(result)
 
+    def prepare_stream_preview(self, episode_id: str) -> dict[str, object]:
+        """Build a disposable MP4 view while retaining original frame mapping."""
+        self.prepare_episode(episode_id)
+        manifest_path, manifest = self.playback.manifest(episode_id)
+        output_root = self.paths.cache_root / "streaming" / episode_id
+        return build_stream_preview(manifest_path, manifest, output_root)
+
+    def stream_preview_video(self, episode_id: str, stream_id: str) -> Path:
+        root = (self.paths.cache_root / "streaming" / episode_id).resolve()
+        manifest_path = root / "stream_manifest.json"
+        if not manifest_path.is_file():
+            raise FileNotFoundError("请先生成流媒体预览")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        camera = next((item for item in manifest.get("cameras", []) if item.get("stream_id") == stream_id), None)
+        if not isinstance(camera, dict):
+            raise KeyError("流媒体相机不存在")
+        path = (root / str(camera.get("file") or "")).resolve()
+        if not _is_relative_to(path, root) or path.suffix != ".mp4" or not path.is_file():
+            raise FileNotFoundError("流媒体文件不存在")
+        return path
+
     def preview_labels(self, request: dict[str, object]) -> dict[str, object]:
         schema_path = request.get("schemaPath")
         if not isinstance(schema_path, str) or not schema_path.strip():
@@ -2302,7 +2328,7 @@ class EpisodeQcWebApplication:
 
     def _schedule_read_ahead(self, episode_id: str, *, finish_current: bool = False) -> None:
         rows = playback_window(self.paths.db_path, episode_id)
-        successors = [row for row in rows if row["id"] != episode_id][:1]
+        successors = [row for row in rows if row["id"] != episode_id][:2]
         jobs = [(row["id"], "priority") for row in successors if row["cache_status"] not in {"ready", "partial"}]
         if finish_current or any(row["id"] == self._foreground_episode_id and row["cache_status"] == "partial" for row in rows):
             jobs.append((episode_id, "full"))
@@ -2618,6 +2644,17 @@ class EpisodeQcRequestHandler(BaseHTTPRequestHandler):
             self._discard_body()
             self._send_json(app.prepare_episode(cache_match.group(1)))
             return
+        stream_match = re.fullmatch(r"/api/episodes/(ep_[a-f0-9]{24,32})/stream", path)
+        if method == "POST" and stream_match:
+            self._discard_body()
+            self._send_json(app.prepare_stream_preview(stream_match.group(1)))
+            return
+        stream_video_match = re.fullmatch(
+            r"/api/episodes/(ep_[a-f0-9]{24,32})/stream/cameras/(str_[a-f0-9]{24,32})/video", path,
+        )
+        if method == "GET" and stream_video_match:
+            self._send_file_range(app.stream_preview_video(*stream_video_match.groups()), "video/mp4")
+            return
         review_match = re.fullmatch(r"/api/episodes/(ep_[a-f0-9]{24,32})/review", path)
         if method == "POST" and review_match:
             self._send_json(app.update_review(review_match.group(1), self._json_body()))
@@ -2739,6 +2776,56 @@ class EpisodeQcRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    def _send_file_range(self, path: Path, content_type: str) -> None:
+        """Serve one derived local MP4 using browser Range requests."""
+        size = path.stat().st_size
+        start, end = 0, max(0, size - 1)
+        range_header = self.headers.get("Range", "")
+        status = HTTPStatus.OK
+        if range_header:
+            match = re.fullmatch(r"bytes=(\d*)-(\d*)", range_header.strip())
+            if not match:
+                self._send_range_not_satisfiable(size)
+                return
+            raw_start, raw_end = match.groups()
+            if raw_start:
+                start = int(raw_start)
+                end = int(raw_end) if raw_end else end
+            elif raw_end:
+                start = max(0, size - int(raw_end))
+            if start > end or start >= size:
+                self._send_range_not_satisfiable(size)
+                return
+            end = min(end, size - 1)
+            status = HTTPStatus.PARTIAL_CONTENT
+        length = end - start + 1
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Length", str(length))
+        if status == HTTPStatus.PARTIAL_CONTENT:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self._send_security_headers()
+        self.end_headers()
+        with path.open("rb") as source:
+            source.seek(start)
+            remaining = length
+            while remaining:
+                chunk = source.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                remaining -= len(chunk)
+
+    def _send_range_not_satisfiable(self, size: int) -> None:
+        self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+        self.send_header("Content-Range", f"bytes */{size}")
+        self.send_header("Content-Length", "0")
+        self._send_security_headers()
+        self.end_headers()
+
     def _send_empty(self, status: HTTPStatus) -> None:
         self.send_response(status)
         self.send_header("Content-Length", "0")
@@ -2754,7 +2841,7 @@ class EpisodeQcRequestHandler(BaseHTTPRequestHandler):
         self.send_header(
             "Content-Security-Policy",
             "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
-            "img-src 'self' blob: data:; connect-src 'self'; object-src 'none'; "
+            "img-src 'self' blob: data:; media-src 'self'; connect-src 'self'; object-src 'none'; "
             "base-uri 'none'; frame-ancestors 'none'",
         )
 

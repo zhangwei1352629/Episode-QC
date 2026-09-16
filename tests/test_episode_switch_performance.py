@@ -33,7 +33,7 @@ def test_schema_parse_cache_uses_content_version():
     assert _parsed_frozen_schema('{"version":1}') != _parsed_frozen_schema('{"version":2}')
 
 
-def test_read_ahead_only_queues_one_successor(monkeypatch):
+def test_read_ahead_queues_two_successors(monkeypatch):
     import threading
     from unittest.mock import Mock
     from types import SimpleNamespace
@@ -50,4 +50,4 @@ def test_read_ahead_only_queues_one_successor(monkeypatch):
         {'id': 'later', 'cache_status': 'missing'},
     ])
     app._schedule_read_ahead('current')
-    app._playback_queue.replace.assert_called_once_with([('next', 'priority')])
+    app._playback_queue.replace.assert_called_once_with([('next', 'priority'), ('later', 'priority')])

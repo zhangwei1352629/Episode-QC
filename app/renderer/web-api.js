@@ -135,6 +135,13 @@ function installWebApi() {
       cacheByEpisode.set(episodeId, cache);
       return cache;
     },
+    prepareStreamPreview: (episodeId) => request(
+      `/api/episodes/${encodeURIComponent(episodeId)}/stream`, { method: "POST", timeoutMs: 300000 },
+    ),
+    streamPreviewUrl: ({ episodeId, streamId }) => {
+      const path = `/api/episodes/${encodeURIComponent(episodeId)}/stream/cameras/${encodeURIComponent(streamId)}/video`;
+      return `${path}?token=${encodeURIComponent(token)}`;
+    },
     getCameraFrame: async ({ episodeId, streamId, timeNs }) => {
       const path = `/api/episodes/${encodeURIComponent(episodeId)}/cameras/${encodeURIComponent(streamId)}/frame?time_ns=${Math.round(timeNs)}`;
       const response = await request(path, { binary: true });

@@ -8,7 +8,7 @@ test('切换并行读取且旧条目迟到不能覆盖当前条目', async () =>
   const code = source.slice(source.indexOf('let nextEpisodeWarmup'), source.indexOf('async function reloadCurrentEpisode'));
   const detail = {}, prepare = {}, calls = [];
   const state = {currentEpisodeId:'old',episodes:[],loadToken:0};
-  const context = {state,performance:{now:()=>10},console:{info(){}},clearTimeout(){},setTimeout(){},requestAnimationFrame:f=>f(),calibration:null,
+  const context = {state,els:{enableStreamPreview:{textContent:''}},performance:{now:()=>10},console:{info(){}},clearTimeout(){},setTimeout(){},requestAnimationFrame:f=>f(),calibration:null,
     savePlayhead:()=>new Promise(()=>{}), refreshAI:async()=>{}, requestVisualFrames:async()=>{},
     window:{episodeQc:{cancelEpisodeReads(){},updateWorkspaceSettings:async()=>{},
       getEpisode:id=>{calls.push('detail-'+id);return new Promise(r=>detail[id]=r);},

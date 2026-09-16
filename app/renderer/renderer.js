@@ -50,7 +50,7 @@ const els = {
   episodeTotal: $("episode-total"), episodeDone: $("episode-done"), episodeErrors: $("episode-errors"),
   episodeSearch: $("episode-search"), statusFilter: $("status-filter"), episodeList: $("episode-list"),
   currentEpisode: $("current-episode"), episodeMeta: $("episode-meta"), previousEpisode: $("previous-episode"),
-  nextEpisode: $("next-episode"), togglePlay: $("toggle-play"), playbackRate: $("playback-rate"),
+  nextEpisode: $("next-episode"), togglePlay: $("toggle-play"), playbackRate: $("playback-rate"), enableStreamPreview: $("enable-stream-preview"),
   currentTime: $("current-time"), durationTime: $("duration-time"), framePosition: $("frame-position"), cacheStatus: $("cache-status"),
   motionCard: $("motion-card"), motionCanvas: $("motion-canvas"), motionEmpty: $("motion-empty"), jointLabelLayer: $("joint-label-layer"),
   motionViewerTitle: $("motion-viewer-title"), motionViewerBadge: $("motion-viewer-badge"), motionHint: $("motion-hint"),
@@ -123,6 +123,7 @@ const state = {
   durationNs: 0,
   playing: false,
   playbackRate: 1,
+  streamPreview: null,
   lastTick: performance.now(),
   lastVisualRequest: 0,
   visualPending: false,
@@ -328,6 +329,7 @@ function bindEvents() {
   els.previousEpisode.addEventListener("click", () => moveEpisode(-1));
   els.nextEpisode.addEventListener("click", () => moveEpisode(1));
   els.togglePlay.addEventListener("click", togglePlayback);
+  els.enableStreamPreview.addEventListener("click", enableStreamPreview);
   els.playbackRate.addEventListener("change", () => { state.playbackRate = Number(els.playbackRate.value); });
   els.timelineRange.addEventListener("input", () => {state.playing=false;updatePlaybackButton();const ratio=Number(els.timelineRange.value)/1_000_000;seekTo(calibration?calibration.atRatio(ratio):ratio*state.durationNs);});
   els.markIn.addEventListener("click", markSelectionStart);
@@ -1200,6 +1202,8 @@ async function openEpisode(episodeId) {
   if (state.currentEpisodeId) void savePlayhead();
   if (token !== state.loadToken) return;
   state.playing = false;
+  state.streamPreview = null;
+  els.enableStreamPreview.textContent = "流预览";
   state.cache = null;
   state.detail = null;
   state.playbackEpisodeId = null;
@@ -1344,6 +1348,7 @@ function syncInteractiveState() {
   els.nextEpisode.disabled = !state.filteredEpisodes.length || currentIndex < 0 || currentIndex >= state.filteredEpisodes.length - 1;
   els.togglePlay.disabled = !playbackReady;
   els.playbackRate.disabled = !playbackReady;
+  els.enableStreamPreview.disabled = !playbackReady || Boolean(state.streamPreview);
   els.timelineRange.disabled = !hasEpisode;
   els.markIn.disabled = !hasEpisode || !annotationDurationNs(state.detail?.episode);
   els.markOut.disabled = els.markIn.disabled;
@@ -1366,18 +1371,75 @@ function renderCameras() {
     renderLabels();
     return;
   }
-  els.cameraGrid.innerHTML = cameras.map((camera) => `
-    <article class="camera-card" data-camera-id="${escapeHtml(camera.stream_id)}" data-camera-topic="${escapeHtml(camera.topic)}" title="单击选择标注目标，双击放大">
+  const streamed = new Set((state.streamPreview?.cameras || []).map((item) => item.stream_id));
+  els.cameraGrid.innerHTML = cameras.map((camera) => {
+    const isStreamed = streamed.has(camera.stream_id);
+    const videoUrl = isStreamed ? window.episodeQc.streamPreviewUrl({ episodeId: state.currentEpisodeId, streamId: camera.stream_id }) : "";
+    return `
+    <article class="camera-card${isStreamed ? " streaming-active" : ""}" data-camera-id="${escapeHtml(camera.stream_id)}" data-camera-topic="${escapeHtml(camera.topic)}" title="单击选择标注目标，双击放大">
       <div class="camera-heading"><div><span class="status-dot"></span><strong>${escapeHtml(camera.display_name)}</strong></div><span class="camera-time">等待帧</span></div>
+      ${isStreamed ? `<video muted playsinline preload="metadata" src="${escapeHtml(videoUrl)}"></video>` : ""}
       <img alt="${escapeHtml(camera.display_name)}" />
-    </article>`).join("");
+    </article>`;
+  }).join("");
   els.cameraGrid.querySelectorAll(".camera-card").forEach((card) => {
     card.addEventListener("click", (event) => { if (event.detail === 1) selectCamera(card.dataset.cameraId); });
     card.addEventListener("dblclick", () => toggleCameraFullscreen(card.dataset.cameraId));
   });
   syncCameraSelectionUi();
+  els.cameraGrid.querySelectorAll("video").forEach((video) => video.addEventListener("loadedmetadata", () => syncStreamVideos()));
   renderTargetContext();
   renderLabels();
+}
+
+function nearestCameraFrameIndex(camera, timeNs) {
+  const offsets = camera.frame_offsets_ns || [];
+  if (!offsets.length) return 0;
+  let low = 0, high = offsets.length;
+  while (low < high) {
+    const middle = (low + high) >> 1;
+    if (Number(offsets[middle]) < timeNs) low = middle + 1;
+    else high = middle;
+  }
+  if (!low) return 0;
+  if (low >= offsets.length) return offsets.length - 1;
+  return Math.abs(Number(offsets[low]) - timeNs) < Math.abs(Number(offsets[low - 1]) - timeNs) ? low : low - 1;
+}
+
+function syncStreamVideos({ play = state.playing, forceSeek = false } = {}) {
+  if (!state.streamPreview || !state.cache) return;
+  const fpsByStream = new Map((state.streamPreview.cameras || []).map((item) => [item.stream_id, Number(item.fps || 30)]));
+  (state.cache.cameras || []).forEach((camera) => {
+    const video = els.cameraGrid.querySelector(`[data-camera-id="${camera.stream_id}"] video`);
+    if (!video || !video.readyState) return;
+    const target = nearestCameraFrameIndex(camera, state.playheadNs) / (fpsByStream.get(camera.stream_id) || 30);
+    if (forceSeek || !play || Math.abs(video.currentTime - target) > 0.12) video.currentTime = target;
+    video.playbackRate = state.playbackRate;
+    if (play) void video.play().catch(() => {});
+    else video.pause();
+  });
+}
+
+async function enableStreamPreview() {
+  if (!state.currentEpisodeId || !state.cache) return;
+  els.enableStreamPreview.disabled = true;
+  els.enableStreamPreview.textContent = "生成中…";
+  setCacheStatus("busy", "正在从本机播放缓存生成轻量视频流…");
+  try {
+    const preview = await window.episodeQc.prepareStreamPreview(state.currentEpisodeId);
+    if (state.currentEpisodeId !== state.playbackEpisodeId) return;
+    state.streamPreview = preview;
+    renderCameras();
+    syncStreamVideos({ forceSeek: true });
+    setCacheStatus("ready", "轻量视频流已就绪 · 标注仍映射原始帧时间戳");
+    els.enableStreamPreview.textContent = "流预览已启用";
+  } catch (error) {
+    setCacheStatus("error", "流媒体预览生成失败");
+    toast(error.message || String(error), "error", 8000);
+    els.enableStreamPreview.textContent = "流预览";
+  } finally {
+    els.enableStreamPreview.disabled = Boolean(state.streamPreview) || !state.cache;
+  }
 }
 
 function selectCamera(streamId) {
@@ -1461,7 +1523,9 @@ async function requestVisualFrames(force = false) {
   const playbackEpisodeId = state.playbackEpisodeId;
   const timeNs = Math.max(0, Math.min(state.durationNs, Math.round(state.playheadNs)));
   try {
-    const cameraRequests = (state.cache.cameras || []).map(async (camera) => {
+    const useStreamPreview = Boolean(state.streamPreview);
+    if (useStreamPreview) syncStreamVideos({ forceSeek: force || !state.playing });
+    const cameraRequests = (useStreamPreview ? [] : (state.cache.cameras || [])).map(async (camera) => {
       const frame = await window.episodeQc.getCameraFrame({
         episodeId: playbackEpisodeId,
         streamId: camera.stream_id,
@@ -1508,7 +1572,9 @@ async function requestVisualFrames(force = false) {
     await Promise.all([...cameraRequests, motionRequest, actionRequest]);
     if (episodeId === state.currentEpisodeId && generation === (state.visualGeneration || 0)) {
       state.visualReadyTime=timeNs;
-      setCacheStatus("ready", state.cache.reused ? "播放缓存已复用" : "播放缓存已就绪");
+      setCacheStatus("ready", state.streamPreview
+        ? "轻量视频流回放中 · 标注仍映射原始帧时间戳"
+        : (state.cache.reused ? "播放缓存已复用" : "播放缓存已就绪"));
     }
   } catch (error) {
     if (episodeId === state.currentEpisodeId && generation === (state.visualGeneration || 0)) setCacheStatus("error", `帧读取失败：${error.message || error}`);
@@ -1554,6 +1620,7 @@ async function togglePlayback() {
   state.playing = !state.playing;
   state.lastTick = performance.now();
   updatePlaybackButton();
+  syncStreamVideos({ forceSeek: true });
   if (state.playing && state.detail?.episode.review_status === "unreviewed") await setReviewStatus("in_progress", false);
   if (!state.playing) savePlayhead();
 }

@@ -991,6 +991,82 @@ def test_cache_job_materializes_flow_manifest_for_ego_without_writing_source(
     )
 
 
+def test_cache_job_prefers_declared_qc_playback_package(tmp_path: Path):
+    asset_root = tmp_path / "nas" / "AST-LIGHT"
+    episode_root = asset_root / "episodes" / "episode_000001"
+    playback_episode_root = (
+        asset_root / "qc_playback" / "v1" / "episodes" / "episode_000001"
+    )
+    episode_root.mkdir(parents=True)
+    playback_episode_root.mkdir(parents=True)
+    original_primary = episode_root / "episode.mcap"
+    playback_primary = playback_episode_root / "episode.mcap"
+    original_primary.write_bytes(b"large-original-payload" * 1024)
+    playback_primary.write_bytes(b"small-qc-playback-payload")
+    job = {
+        "code": "QCJ-LIGHT",
+        "asset_id": "AST-LIGHT",
+        "source_uri": str(asset_root),
+        "episodes": [
+            {
+                "episode_id": "AST-LIGHT-EP0001",
+                "relative_path": "episodes/episode_000001",
+                "primary_file": "episode.mcap",
+                "checksum_sha256": hashlib.sha256(original_primary.read_bytes()).hexdigest(),
+            }
+        ],
+    }
+    manifest = publish_asset_manifest(
+        asset_root,
+        job,
+        ["episodes/episode_000001/episode.mcap"],
+    )
+    playback_sha256 = hashlib.sha256(playback_primary.read_bytes()).hexdigest()
+    manifest["qc_playback_package"] = {
+        "schema_version": 1,
+        "relative_path": "qc_playback/v1",
+        "episodes": [
+            {
+                "episode_id": "AST-LIGHT-EP0001",
+                "relative_path": "episodes/episode_000001",
+                "primary_file": "episode.mcap",
+                "checksum_sha256": playback_sha256,
+                "manifest": {
+                    "schema_version": 1,
+                    "files": [
+                        {
+                            "relative_path": "episodes/episode_000001/episode.mcap",
+                            "size_bytes": playback_primary.stat().st_size,
+                            "sha256": playback_sha256,
+                        }
+                    ],
+                },
+            }
+        ],
+    }
+    (asset_root / "asset_manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    job["asset_manifest"] = manifest
+    job["asset_manifest_sha256"] = canonical_json_sha256(manifest)
+
+    cached = QualityCacheManager(tmp_path / "cache", reserve_bytes=0).cache_job(
+        FakeFlowClient(job),
+        job,
+    )
+
+    cached_primary = Path(cached["cache_dir"]) / "episodes" / "episode_000001" / "episode.mcap"
+    assert cached_primary.read_bytes() == playback_primary.read_bytes()
+    assert cached["total_bytes"] < original_primary.stat().st_size
+    state = json.loads(
+        (Path(cached["cache_dir"]).parent / ".qc-cache.json").read_text(encoding="utf-8")
+    )
+    assert state["episodes"][0]["files"][0]["source_relative_path"] == (
+        "qc_playback/v1/episodes/episode_000001/episode.mcap"
+    )
+
+
 def test_cache_job_still_requires_published_manifest_for_non_ego_job(tmp_path: Path):
     asset_root = tmp_path / "nas" / "AST-ROBOT"
     episode_root = asset_root / "episode_000001"

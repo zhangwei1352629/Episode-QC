@@ -54,7 +54,9 @@ test('gapless AI ranges become one segment track and ignore unrelated annotation
   const unrelated={annotation_id:'manual',scope:'time_point',start_offset_ns:50,end_offset_ns:50,attributes:{}};
   assert.deepEqual(contiguousAiSegments([ai('b',40,100),unrelated,ai('a',0,40)],100).map(a=>a.annotation_id),['a','b']);
   assert.deepEqual(contiguousAiSegments([ai('a',0,39),ai('b',40,100)],100),[]);
-  assert.deepEqual(contiguousAiSegments([ai('a',1,100)],100),[]);
+  assert.deepEqual(contiguousAiSegments([ai('a',1,90)],100).map(a=>a.annotation_id),['a']);
+  assert.deepEqual(contiguousAiSegments([ai('a',-1,90)],100),[]);
+  assert.deepEqual(contiguousAiSegments([ai('a',1,101)],100),[]);
 });
 test('primary AI phase row can be selected without swallowing overlapping AI quality layers',async()=>{
   const {contiguousAiSegments,contiguousAiSegmentGroup,isPrimaryAiSegment}=await import('../renderer/interval-track.mjs');
@@ -76,8 +78,21 @@ test('primary AI phase row can be selected without swallowing overlapping AI qua
     contiguousAiSegmentGroup(frameInclusiveValues,productionLabels,1_000_000_000).map(item=>[
       item.annotation_id,item.start_offset_ns,item.end_offset_ns,
     ]),
-    [['phase-a',0,400_000_000],['phase-b',400_000_000,1_000_000_000]],
+    [['phase-a',5_000_000,400_000_000],['phase-b',400_000_000,995_000_000]],
   );
+});
+test('outer AI boundaries can trim the first and last segment without crossing their ranges',async()=>{
+  const {outerBoundaryBounds,nearestValidOuterBoundary}=await import('../renderer/interval-track.mjs');
+  const first={episode_id:'ep',scope:'time_range',start_offset_ns:0,end_offset_ns:40};
+  const last={episode_id:'ep',scope:'time_range',start_offset_ns:40,end_offset_ns:100};
+  assert.deepEqual(outerBoundaryBounds(first,'start',10,100),{start_offset_ns:10,end_offset_ns:40});
+  assert.deepEqual(outerBoundaryBounds(last,'end',90,100),{start_offset_ns:40,end_offset_ns:90});
+  assert.throws(()=>outerBoundaryBounds(first,'start',40,100),/起点/);
+  assert.throws(()=>outerBoundaryBounds(last,'end',40,100),/终点/);
+  assert.equal(nearestValidOuterBoundary([0,20,40,60,80,100],13,first,'start',100),20);
+  assert.equal(nearestValidOuterBoundary([0,20,40,60,80,100],96,last,'end',100),100);
+  assert.equal(nearestValidOuterBoundary([12,20,40,60,80,96],1,first,'start',100),0);
+  assert.equal(nearestValidOuterBoundary([12,20,40,60,80,96],99,last,'end',100),100);
 });
 test('shared AI boundary updates both neighboring ranges without a gap',async()=>{
   const {sharedBoundaryBounds}=await import('../renderer/interval-track.mjs');
@@ -112,6 +127,8 @@ test('renderer exposes one labeled AI segment row with shared boundary handles',
   assert.ok(renderer.includes('function renderAiSegmentTrack('));
   assert.ok(renderer.includes('data-ai-segment-track'));
   assert.ok(renderer.includes('data-boundary-left-id'));
+  assert.ok(renderer.includes('data-outer-boundary-edge="start"'));
+  assert.ok(renderer.includes('data-outer-boundary-edge="end"'));
   assert.ok(renderer.includes('moveAiBoundary'));
   assert.ok(renderer.includes('annotation-layer-divider'));
   assert.ok(renderer.includes('附加标注'));

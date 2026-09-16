@@ -20,7 +20,8 @@ export function contiguousAiSegments(annotations,duration){
     const attributes=a?.attributes||{};
     return a?.scope==='time_range'&&(attributes.ai_provenance||attributes._incremental_source?.round_kind==='ai');
   }).sort((a,b)=>Number(a.start_offset_ns)-Number(b.start_offset_ns)||Number(a.end_offset_ns)-Number(b.end_offset_ns));
-  if(!limit||!values.length||Number(values[0].start_offset_ns)!==0||Number(values.at(-1).end_offset_ns)!==limit)return [];
+  if(!limit||!values.length||Number(values[0].start_offset_ns)<0||Number(values.at(-1).end_offset_ns)>limit)return [];
+  if(Number(values[0].start_offset_ns)>=Number(values[0].end_offset_ns)||Number(values.at(-1).start_offset_ns)>=Number(values.at(-1).end_offset_ns))return [];
   for(let i=1;i<values.length;i++)if(Number(values[i-1].end_offset_ns)!==Number(values[i].start_offset_ns))return [];
   return values;
 }
@@ -51,7 +52,8 @@ export function contiguousAiSegmentGroup(annotations,labels,duration){
     .map(values=>{
       const ordered=values.slice().sort((a,b)=>Number(a.start_offset_ns)-Number(b.start_offset_ns)||Number(a.end_offset_ns)-Number(b.end_offset_ns));
       if(!limit||ordered.length<2)return [];
-      let uncovered=Math.max(0,Number(ordered[0].start_offset_ns))+Math.max(0,limit-Number(ordered.at(-1).end_offset_ns));
+      if(Number(ordered[0].start_offset_ns)<0||Number(ordered.at(-1).end_offset_ns)>limit)return [];
+      let uncovered=0;
       for(let i=1;i<ordered.length;i++){
         const gap=Number(ordered[i].start_offset_ns)-Number(ordered[i-1].end_offset_ns);
         if(gap<0||gap>limit*.02)return [];
@@ -60,8 +62,8 @@ export function contiguousAiSegmentGroup(annotations,labels,duration){
       if(uncovered>limit*.03)return [];
       return ordered.map((annotation,index)=>({
         ...annotation,
-        start_offset_ns:index===0?0:Number(annotation.start_offset_ns),
-        end_offset_ns:index===ordered.length-1?limit:Number(ordered[index+1].start_offset_ns),
+        start_offset_ns:Number(annotation.start_offset_ns),
+        end_offset_ns:index===ordered.length-1?Number(annotation.end_offset_ns):Number(ordered[index+1].start_offset_ns),
       }));
     })
     .filter(values=>values.length)
@@ -77,6 +79,31 @@ export function sharedBoundaryBounds(left,right,value,limit){
     left:{start_offset_ns:Number(left.start_offset_ns),end_offset_ns:boundary},
     right:{start_offset_ns:boundary,end_offset_ns:Number(right.end_offset_ns)},
   };
+}
+
+export function outerBoundaryBounds(annotation,edge,value,limit){
+  if(annotation?.scope!=='time_range')throw new Error('首尾分界点仅支持区间标注');
+  const boundary=Math.round(Number(value)),maximum=Number(limit);
+  if(!Number.isFinite(boundary)||boundary<0||boundary>maximum)throw new Error('分界点超出数据范围');
+  if(edge==='start'){
+    if(boundary>=Number(annotation.end_offset_ns))throw new Error('首段起点必须早于该段终点');
+    return {start_offset_ns:boundary,end_offset_ns:Number(annotation.end_offset_ns)};
+  }
+  if(edge==='end'){
+    if(boundary<=Number(annotation.start_offset_ns))throw new Error('末段终点必须晚于该段起点');
+    return {start_offset_ns:Number(annotation.start_offset_ns),end_offset_ns:boundary};
+  }
+  throw new Error('未知的首尾分界点');
+}
+
+export function nearestValidOuterBoundary(offsets,value,annotation,edge,limit){
+  const hardEdge=edge==='start'?0:Number(limit);
+  const candidates=[...(offsets||[]).map(Number),hardEdge].filter((frame,index,values)=>values.indexOf(frame)===index).filter(frame=>{
+    if(!Number.isFinite(frame)||frame<0||frame>Number(limit))return false;
+    return edge==='start'?frame<Number(annotation.end_offset_ns):frame>Number(annotation.start_offset_ns);
+  });
+  if(!candidates.length)return null;
+  return candidates.reduce((best,frame)=>Math.abs(frame-Number(value))<Math.abs(best-Number(value))?frame:best,candidates[0]);
 }
 
 export function adjacentFrameBoundary(offsets,current,direction,left,right){
@@ -153,7 +180,7 @@ export function installIntervalTrack({container,getState,seek,pause,save,saveBou
   function render(){
     const s=getState();if(episode!==s.episodeId||duration!==s.duration)reset();
     toolbar.hidden=!s.episodeId||!s.duration;
-    const displayTime=drag?.kind==='boundary'?Number(drag.leftDraft.end_offset_ns):s.time;
+    const displayTime=drag?.kind==='boundary'?Number(drag.leftDraft.end_offset_ns):drag?.kind==='outer-boundary'?Number(drag.edge==='start'?drag.draft.start_offset_ns:drag.draft.end_offset_ns):s.time;
     // Reuse the original scrubber and its ticks with the same visible window.
     const scrubber=container.parentElement.querySelector('#timeline-range');
     if(scrubber)scrubber.value=String(Math.max(0,Math.min(1,(displayTime-view[0])/(view[1]-view[0])))*1e6);
@@ -170,6 +197,7 @@ export function installIntervalTrack({container,getState,seek,pause,save,saveBou
       let end=aiBlock&&Number.isFinite(displayEnd)?displayEnd:value.end_offset_ns;
       if(drag?.kind==='boundary'&&drag.leftId===a.annotation_id)end=drag.leftDraft.end_offset_ns;
       if(drag?.kind==='boundary'&&drag.rightId===a.annotation_id)start=drag.rightDraft.start_offset_ns;
+      if(drag?.kind==='outer-boundary'&&drag.id===a.annotation_id){start=drag.draft.start_offset_ns;end=drag.draft.end_offset_ns;}
       const width=view[1]-view[0];
       block.hidden=end<view[0]||start>view[1];
       block.style.setProperty('--annotation-left',`${100*(Math.max(start,view[0])-view[0])/width}%`);
@@ -195,15 +223,24 @@ export function installIntervalTrack({container,getState,seek,pause,save,saveBou
       handle.style.setProperty('--boundary-left',`${100*(boundary-view[0])/(view[1]-view[0])}%`);
       handle.classList.toggle('active',Boolean(selectedBoundary&&handle.dataset.boundaryLeftId===selectedBoundary.leftId&&handle.dataset.boundaryRightId===selectedBoundary.rightId));
     }
+    for(const handle of container.querySelectorAll('[data-outer-boundary-edge]')){
+      const annotation=drag?.kind==='outer-boundary'&&drag.id===handle.dataset.outerBoundaryAnnotationId?drag.draft:annotations.get(handle.dataset.outerBoundaryAnnotationId);
+      if(!annotation)continue;
+      const edge=handle.dataset.outerBoundaryEdge,boundary=Number(edge==='start'?annotation.start_offset_ns:annotation.end_offset_ns);
+      handle.hidden=saving||boundary<view[0]||boundary>view[1];
+      handle.style.setProperty('--boundary-left',`${100*(boundary-view[0])/(view[1]-view[0])}%`);
+      handle.classList.toggle('active',drag?.kind==='outer-boundary'&&drag.id===annotation.annotation_id&&drag.edge===edge);
+    }
     for(const surface of container.querySelectorAll('.annotation-lane-surface')){
       let head=surface.querySelector('.interval-playhead');if(!head){head=document.createElement('i');head.className='interval-playhead';surface.append(head);}
       head.hidden=displayTime<view[0]||displayTime>view[1];head.style.left=`${100*(displayTime-view[0])/(view[1]-view[0])}%`;
     }
-    const a=drag?.kind==='boundary'?null:(drag?.draft||annotations.get(selected));
+    const a=drag?.kind==='boundary'||drag?.kind==='outer-boundary'?null:(drag?.draft||annotations.get(selected));
     const offsets=s.grid?.exact?s.grid.frameOffsetsNs:null;
     const frame=t=>offsets?` F${offsets.indexOf(nearestFrame(offsets,t))+1}`:'';
     const boundaryDetail=drag?.kind==='boundary'?` · AI 分界点${frame(drag.leftDraft.end_offset_ns)} · ${(drag.leftDraft.end_offset_ns/1e9).toFixed(6)}s · 左右两段联动，松开保存，Esc取消`:'';
-    const detail=boundaryDetail||(a?.scope==='time_point'?` · 时间点 ${(a.start_offset_ns/1e9).toFixed(6)}s${frame(a.start_offset_ns)} · 拖动标记修改，松开保存，Esc取消`:a?` · ${(a.start_offset_ns/1e9).toFixed(6)}s${frame(a.start_offset_ns)} → ${(a.end_offset_ns/1e9).toFixed(6)}s${frame(a.end_offset_ns)} · 持续 ${((a.end_offset_ns-a.start_offset_ns)/1e9).toFixed(6)}s · 拖动两端修改，松开保存，Esc取消`:' · 点击标注选中');
+    const outerDetail=drag?.kind==='outer-boundary'?` · ${drag.edge==='start'?'首段起点':'末段终点'}${frame(drag.edge==='start'?drag.draft.start_offset_ns:drag.draft.end_offset_ns)} · ${((drag.edge==='start'?drag.draft.start_offset_ns:drag.draft.end_offset_ns)/1e9).toFixed(6)}s · 松开保存，Esc取消`:'';
+    const detail=boundaryDetail||outerDetail||(a?.scope==='time_point'?` · 时间点 ${(a.start_offset_ns/1e9).toFixed(6)}s${frame(a.start_offset_ns)} · 拖动标记修改，松开保存，Esc取消`:a?` · ${(a.start_offset_ns/1e9).toFixed(6)}s${frame(a.start_offset_ns)} → ${(a.end_offset_ns/1e9).toFixed(6)}s${frame(a.end_offset_ns)} · 持续 ${((a.end_offset_ns-a.start_offset_ns)/1e9).toFixed(6)}s · 拖动两端修改，松开保存，Esc取消`:' · 点击标注选中');
     const firstFrame=framePositionForTime(view[0],duration,s.grid),lastFrame=framePositionForTime(view[1],duration,s.grid);
     const viewLabel=firstFrame&&lastFrame?`${firstFrame.exact?'':'≈'}F${firstFrame.number}–F${lastFrame.number} · ${(view[0]/1e9).toFixed(3)}–${(view[1]/1e9).toFixed(3)}s`:`${(view[0]/1e9).toFixed(3)}–${(view[1]/1e9).toFixed(3)}s`;
     status.textContent=saving?'正在保存分界点…':`${viewLabel} · 滚轮缩放 · Shift+滚轮平移`+detail+` · ${s.grid?.displayName||'时间定位'} · I/O 设置区间`;
@@ -243,6 +280,16 @@ export function installIntervalTrack({container,getState,seek,pause,save,saveBou
   container.addEventListener('wheel',e=>{if(!getState().episodeId)return;e.preventDefault();const surface=e.target.closest('.annotation-lane-surface')||container.querySelector('.annotation-lane-surface');if(!surface)return;changeView(e.shiftKey?(e.deltaY<0?'left':'right'):(e.deltaY<0?'in':'out'),time(e,surface));},{passive:false});
   container.addEventListener('pointerdown',e=>{
     if(e.button!==0||saving)return;
+    const outerHandle=e.target.closest('[data-outer-boundary-edge]');
+    if(outerHandle){
+      const s=getState(),annotation=s.annotations.find(a=>a.annotation_id===outerHandle.dataset.outerBoundaryAnnotationId),edge=outerHandle.dataset.outerBoundaryEdge;
+      if(!annotation||!save)return;
+      const boundary=Number(edge==='start'?annotation.start_offset_ns:annotation.end_offset_ns);
+      e.preventDefault();e.stopImmediatePropagation();pause();selected=annotation.annotation_id;selectedBoundary=null;
+      const rect=outerHandle.closest('.annotation-lane-surface').getBoundingClientRect();
+      drag={kind:'outer-boundary',id:annotation.annotation_id,original:structuredClone(annotation),draft:{...annotation},edge,episode:s.episodeId,pointer:e.pointerId,surface:{getBoundingClientRect:()=>rect},grabOffsetX:boundaryGrabOffset(view,boundary,e.clientX,rect),changed:false};
+      container.setPointerCapture(e.pointerId);render();return;
+    }
     const boundaryHandle=e.target.closest('[data-boundary-left-id]');
     if(boundaryHandle){
       const s=getState(),left=s.annotations.find(a=>a.annotation_id===boundaryHandle.dataset.boundaryLeftId),right=s.annotations.find(a=>a.annotation_id===boundaryHandle.dataset.boundaryRightId);
@@ -267,7 +314,7 @@ export function installIntervalTrack({container,getState,seek,pause,save,saveBou
     if(!drag||e.pointerId!==drag.pointer)return;
     if(getState().episodeId!==drag.episode){cancel();return;}
     if(drag.edge==='point'&&!drag.changed&&Math.abs(e.clientX-drag.anchorX)<4)return;
-    const s=getState(),raw=time(e,drag.surface,drag.kind==='boundary'?drag.grabOffsetX:0);
+    const s=getState(),raw=time(e,drag.surface,drag.kind==='boundary'||drag.kind==='outer-boundary'?drag.grabOffsetX:0);
     if(drag.kind==='boundary'){
       const value=Math.round(raw);
       let bounds;try{bounds=sharedBoundaryBounds(drag.leftOriginal,drag.rightOriginal,value,s.limit);}catch{return;}
@@ -275,6 +322,12 @@ export function installIntervalTrack({container,getState,seek,pause,save,saveBou
       // Keep the pre-redesign manual calibration behaviour: the playhead,
       // cameras and robot data follow the pointer while only the final value
       // is persisted on pointerup. requestVisualFrames coalesces these seeks.
+      seek(value);render();return;
+    }
+    if(drag.kind==='outer-boundary'){
+      const value=Math.round(raw);
+      let bounds;try{bounds=outerBoundaryBounds(drag.original,drag.edge,value,s.limit);}catch{return;}
+      drag.draft={...drag.original,...bounds};drag.changed=value!==Number(drag.edge==='start'?drag.original.start_offset_ns:drag.original.end_offset_ns);
       seek(value);render();return;
     }
     const value=Math.round(nearestFrame(s.grid?.exact?s.grid.frameOffsetsNs:null,raw));
@@ -307,9 +360,19 @@ export function installIntervalTrack({container,getState,seek,pause,save,saveBou
       done.leftDraft={...done.leftOriginal,...bounds.left};done.rightDraft={...done.rightOriginal,...bounds.right};
       seek(boundary);
     }
+    if(done.kind==='outer-boundary'){
+      const s=getState(),offsets=s.grid?.exact?s.grid.frameOffsetsNs:null;
+      const current=Number(done.edge==='start'?done.draft.start_offset_ns:done.draft.end_offset_ns);
+      const snapped=offsets?.length?nearestValidOuterBoundary(offsets,current,done.original,done.edge,s.limit):null;
+      const boundary=Math.round(snapped??current),originalBoundary=Number(done.edge==='start'?done.original.start_offset_ns:done.original.end_offset_ns);
+      if(boundary===originalBoundary){seek(boundary);render();return;}
+      done.draft={...done.original,...outerBoundaryBounds(done.original,done.edge,boundary,s.limit)};
+      seek(boundary);
+    }
     saving=true;render();
     try{
       if(done.kind==='boundary')await saveBoundary(done.leftOriginal,done.rightOriginal,done.leftDraft.end_offset_ns);
+      else if(done.kind==='outer-boundary')await save(done.original,outerBoundaryBounds(done.original,done.edge,done.edge==='start'?done.draft.start_offset_ns:done.draft.end_offset_ns,getState().limit));
       else await save(done.original,calibrationBounds(done.original.scope,done.draft.start_offset_ns,done.draft.end_offset_ns,getState().limit));
     }
     catch(error){notify(error.message||'保存失败，已恢复原区间');}finally{saving=false;render();}

@@ -2270,7 +2270,14 @@ function renderAiSegmentTrack(segments, labels) {
     const rightName = labels.get(right.label_code)?.name || right.label_name || right.label_code;
     return `<button type="button" class="ai-segment-boundary" data-boundary-left-id="${escapeHtml(left.annotation_id)}" data-boundary-right-id="${escapeHtml(right.annotation_id)}" data-boundary-offset-ns="${Number(right.start_offset_ns)}" aria-label="拖动 ${escapeHtml(leftName)} 与 ${escapeHtml(rightName)} 的分界点" title="拖动分界点：${escapeHtml(leftName)} ↔ ${escapeHtml(rightName)}" style="--boundary-left:${position}%"></button>`;
   }).join("");
-  return `<div class="effective-annotation-lane ai-segment-track" data-ai-segment-track><div class="annotation-lane-label" title="AI 整段互斥动作标签"><i></i><span>动作标签</span></div><div class="annotation-lane-surface">${blocks}${handles}</div></div>`;
+  const first = segments[0], last = segments.at(-1);
+  const firstName = labels.get(first.label_code)?.name || first.label_name || first.label_code;
+  const lastName = labels.get(last.label_code)?.name || last.label_name || last.label_code;
+  const outerHandles = [
+    `<button type="button" class="ai-segment-boundary ai-segment-outer-boundary is-start" data-outer-boundary-edge="start" data-outer-boundary-annotation-id="${escapeHtml(first.annotation_id)}" aria-label="拖动首段起点：${escapeHtml(firstName)}" title="拖动首段起点（自动吸附到帧）" style="--boundary-left:${state.durationNs ? (Number(first.start_offset_ns) / state.durationNs) * 100 : 0}%"></button>`,
+    `<button type="button" class="ai-segment-boundary ai-segment-outer-boundary is-end" data-outer-boundary-edge="end" data-outer-boundary-annotation-id="${escapeHtml(last.annotation_id)}" aria-label="拖动末段终点：${escapeHtml(lastName)}" title="拖动末段终点（自动吸附到帧）" style="--boundary-left:${state.durationNs ? (Number(last.end_offset_ns) / state.durationNs) * 100 : 0}%"></button>`,
+  ].join("");
+  return `<div class="effective-annotation-lane ai-segment-track" data-ai-segment-track><div class="annotation-lane-label" title="AI 整段互斥动作标签"><i></i><span>动作标签</span></div><div class="annotation-lane-surface">${blocks}${handles}${outerHandles}</div></div>`;
 }
 
 function annotationTiming(annotation) {

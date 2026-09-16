@@ -304,6 +304,10 @@ body.episodes-collapsed .episode-sidebar, body.labels-collapsed .label-sidebar {
 .ai-segment-boundary::before { content:""; position:absolute; top:6px; bottom:6px; left:11px; width:9px; border:2px solid #11171c; border-radius:6px; background:#e9eef0; box-shadow:0 0 0 1px rgba(255,255,255,.48), 0 3px 10px rgba(0,0,0,.45); transition:background .15s ease, box-shadow .15s ease, transform .15s ease; }
 .ai-segment-boundary:hover::before, .ai-segment-boundary:focus-visible::before, .ai-segment-boundary.active::before { background:var(--accent); box-shadow:0 0 0 3px rgba(207,244,90,.18), 0 4px 12px rgba(0,0,0,.5); transform:scaleX(1.12); }
 .ai-segment-boundary:focus-visible { outline:1px solid var(--accent); outline-offset:1px; border-radius:7px; }
+.ai-segment-outer-boundary::before { background:var(--accent); border-color:#18200d; box-shadow:0 0 0 1px rgba(207,244,90,.62), 0 3px 10px rgba(0,0,0,.5); }
+.ai-segment-outer-boundary::after { content:""; position:absolute; top:3px; left:12px; width:7px; height:4px; border-radius:3px; background:var(--accent); box-shadow:0 38px 0 var(--accent); }
+.ai-segment-outer-boundary.is-start::after { transform:translateX(3px); }
+.ai-segment-outer-boundary.is-end::after { transform:translateX(-3px); }
 .ai-boundary-inspector { margin:9px 0 9px 90px; padding:9px 11px; display:grid; grid-template-columns:minmax(160px,1fr) auto auto; align-items:center; gap:14px; border:1px solid #2b363f; border-radius:9px; background:#10161b; box-shadow:0 8px 24px rgba(0,0,0,.16); }
 .ai-boundary-inspector > div { min-width:0; padding:0 14px; border-left:1px solid #273039; }
 .ai-boundary-inspector > div:first-child { padding-left:0; border-left:0; }
